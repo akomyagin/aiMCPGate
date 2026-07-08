@@ -152,7 +152,76 @@ SDK. Миграция на SDK остаётся открытой опцией в
 ## 7. Что осознанно НЕ делаем в MVP (Фаза 1)
 
 - Пере-агрегация каталога по `notifications/*/list_changed` — post-MVP.
-- Streamable HTTP / SSE транспорт и HTTP-upstream — Фаза 2 (Этап 5).
+- Streamable HTTP / SSE транспорт и HTTP-upstream — Фаза 2 (Этап 5, **реализовано**, см. §8).
 - Проксирование client-features (`sampling`, `roots`, `elicitation`) от upstream к
   клиенту — post-MVP; в MVP шлюз объявляет минимальные capabilities.
 - Авто-рестарт упавших upstream — post-MVP (в MVP — изоляция, см. §4.4 плана).
+
+## 8. Streamable HTTP — выверка и решения (Этап 5, Фаза 2)
+
+Сверено со спецификацией `2025-06-18` (Transports → Streamable HTTP,
+<https://modelcontextprotocol.io/specification/2025-06-18/basic/transports>).
+Транспорт заменяет устаревший HTTP+SSE из `2024-11-05`. Один HTTP-эндпоинт
+(«MCP endpoint», напр. `/mcp`) обслуживает POST и GET.
+
+**Дословно из спецификации (то, на что опирается код):**
+
+- Клиент шлёт **каждое** JSON-RPC сообщение отдельным HTTP **POST** на MCP endpoint.
+- Клиент **ОБЯЗАН** слать `Accept: application/json, text/event-stream` (оба типа).
+- Тело POST — **ровно одно** JSON-RPC сообщение (request / notification / response).
+- Если вход — *notification* или *response*: сервер отвечает **`202 Accepted` без
+  тела** (или HTTP-ошибку, если не принял).
+- Если вход — *request*: сервер отвечает **либо** `Content-Type: application/json`
+  (один JSON-объект), **либо** `Content-Type: text/event-stream` (открывает SSE-
+  стрим). Клиент **ОБЯЗАН** поддерживать оба варианта.
+- В SSE-стриме сервер **МОЖЕТ** слать промежуточные request/notification до
+  финального *response* на исходный запрос; ответ идентифицируется по совпадению
+  `id`. Полезная нагрузка события — в строках `data:`.
+- `Mcp-Session-Id`: сервер **МОЖЕТ** выдать его в заголовке ответа на `initialize`;
+  если выдан — клиент **ОБЯЗАН** слать его в заголовке на всех последующих запросах.
+- `MCP-Protocol-Version: <version>` — заголовок на всех запросах после
+  согласования версии; при отсутствии сервер предполагает `2025-03-26`.
+
+**Решения aiMCPGate (по аналогии с развилкой §1):**
+
+1. **Интерфейс `upstream.Conn` НЕ вводим** — «интерфейс на второй реализации» уже
+   удовлетворён существующим `registry.Upstream` (Этап 3), которому `StdioConn`
+   соответствует конкретным типом. Вторая реализация `HTTPConn`
+   (`internal/upstream/http.go`) просто удовлетворяет **тот же** `registry.Upstream`;
+   отдельный `upstream.Conn` был бы лишней абстракцией (анти-over-engineering,
+   SKILL §8). Выбор stdio vs HTTP — по `config.Upstream.ResolveKind()` (url → http)
+   в `registry.startUpstream`.
+2. **HTTP-upstream (шлюз как HTTP-клиент):** `HTTPConn` — request/response без
+   долгоживущей горутины-читателя (в отличие от `StdioConn`): HTTP round-trip сам
+   демультиплексирует ответ, разделять id-пространства для этого не нужно. Ответ
+   `text/event-stream` разбирается построчно (`data:`-кадры), берётся первое
+   сообщение-*response* с совпадающим `id`; промежуточные server→client сообщения
+   логируются на debug и пропускаются (проксирование client-features — post-MVP,
+   §7). `Mcp-Session-Id` захватывается из ответа на `initialize` и эхонится далее.
+3. **HTTP-сервер (шлюз как HTTP-сервер к клиенту):** `httpServer`
+   (`internal/transport/http.go`) на POST отдаёт **один `application/json`** ответ
+   на request и **`202`** на notification. SSE-стрим **сервер не открывает**: шлюз
+   в MVP не генерирует потоковых/серверных сообщений (нет проксирования
+   `sampling`/`roots`), а спецификация делает SSE на стороне сервера
+   **опциональным** — поэтому GET на `/mcp` отвечает `405`. Открытие SSE
+   понадобится только когда шлюз начнёт ретранслировать upstream→client трафик —
+   это post-MVP.
+4. **Общий диспетчер:** вся MCP-логика (`initialize`/`tools/list`/`tools/call`/
+   `resources/*`) вынесена в транспорт-независимый `dispatcher`
+   (`internal/transport/dispatch.go`), разделяемый `stdioServer` и `httpServer`;
+   каждый транспорт держит только своё обрамление (чтение/запись кадров, SSE vs
+   newline). Дублирования проксирующей логики между двумя транспортами нет.
+5. **Секреты HTTP-upstream:** статические заголовки авторизации задаются в конфиге
+   через env-expansion (`headers: { Authorization: "Bearer ${TOKEN}" }`), значение
+   приходит из окружения, не из файла под git, и **никогда не логируется** (SKILL
+   §6; покрыто тестом `TestHTTPAuthHeaderSentNotLogged`).
+6. **Пропущено осознанно (post-MVP):** DELETE-терминация сессии, GET-стрим
+   server→client, `Last-Event-ID`/резюмирование стрима, `Origin`-валидация и
+   привязка к localhost для локального HTTP-сервера (security §Streamable HTTP) —
+   актуально, когда HTTP-режим станет постоянным сетевым сервисом; помечено TODO
+   в коде.
+7. **Access policy (allow/deny инструментов по клиенту) — НЕ реализована.** План
+   помечает её «опционально»; она требует идентификации клиента (в stdio клиент
+   один и анонимен, в HTTP — нужен токен/заголовок для различения), что тянет за
+   собой аутентификацию клиента — это ближе к multi-client (явно вне MVP, PLAN §6).
+   Отложено в post-MVP; `CallRecord.Client` под неё уже зарезервирован.

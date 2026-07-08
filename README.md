@@ -6,8 +6,10 @@
 **агрегирует** их каталоги инструментов/ресурсов в один и **логирует** каждый
 вызов.
 
-> Статус: **Этап 0 (bootstrap)**. Скелет собирается и запускается как no-op;
-> протокольная логика реализуется с Этапа 1. Разбивка по этапам —
+> Статус: **MVP готов (Этапы 0–5)**. Фаза 1 — мультиплексирование stdio-upstream
+> за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт клиент↔шлюз,
+> HTTP-upstream, CLI-просмотрщик журнала (`aimcpgate logs`). Осталось: Этап 6
+> (релиз-пайплайн goreleaser). Разбивка по этапам —
 > [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) §8.
 
 ## Зачем
@@ -58,25 +60,46 @@ go test -race ./...
 go run ./cmd/aimcpgate version
 ```
 
-## Конфигурация (проектируется, Этап 1+)
+## Использование
 
-Список upstream-серверов задаётся в YAML; **секреты (токены) — через env/`.env`**,
-никогда не в конфиге под git:
+```bash
+# stdio-режим (клиент запускает шлюз как подпроцесс):
+aimcpgate serve --config ./config.yaml
+
+# http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp:
+aimcpgate serve --config ./config-http.yaml
+
+# просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
+aimcpgate logs --file ./logs/calls.jsonl --tail 50
+aimcpgate logs --config ./config.yaml --upstream github --status err
+```
+
+## Конфигурация
+
+Полный пример со всеми полями — [`config.example.yaml`](config.example.yaml).
+Список upstream-серверов задаётся в YAML; **секреты (токены) — через env/`.env`**
+(подстановка `${VAR}` при загрузке), никогда не в конфиге под git. На upstream
+указывается **ровно один** из `command` (stdio-подпроцесс) или `url`
+(HTTP-сервер, Streamable HTTP) — вид соединения выводится автоматически.
 
 ```yaml
 transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
+listen_addr: ":8080"        # только для transport: http
 log_file: ./logs/calls.jsonl
 upstreams:
-  - name: filesystem
-    kind: stdio
+  - name: filesystem        # stdio-upstream
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
     enabled: true
   - name: github
-    kind: stdio
     command: github-mcp-server
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}   # из окружения, не хардкод
+    enabled: true
+  - name: remote            # http-upstream (Фаза 2)
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer ${REMOTE_MCP_TOKEN}"   # секрет, не логируется
     enabled: true
 ```
 
