@@ -48,7 +48,13 @@ func run() error {
 	logger := logging.New(cfg.LogLevel, os.Stderr)
 	logger.Info("aimcpgate starting", "version", version)
 
-	reg := registry.New(cfg, logger)
+	callLog, err := logging.NewCallLog(cfg.LogFile)
+	if err != nil {
+		return fmt.Errorf("open call log: %w", err)
+	}
+	defer func() { _ = callLog.Close() }()
+
+	reg := registry.New(cfg, logger, callLog)
 	srv := transport.NewServer(cfg, reg, logger)
 
 	// Serve blocks until ctx is cancelled; stub returns nil until Этап 1.

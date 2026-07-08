@@ -8,6 +8,8 @@
 // are the intended surface, refine against docs/TECHNICAL_PLAN.md §Config).
 package config
 
+import "time"
+
 // Transport enumerates how the gateway speaks to its client.
 type Transport string
 
@@ -65,6 +67,22 @@ type Config struct {
 	LogFile string `yaml:"log_file"`
 	// LogLevel is the slog level: "debug" | "info" | "warn" | "error".
 	LogLevel string `yaml:"log_level"`
+
+	// CallTimeout bounds a single upstream request (handshake, list, or call).
+	// Zero selects DefaultCallTimeout.
+	CallTimeout time.Duration `yaml:"call_timeout"`
+}
+
+// DefaultCallTimeout bounds a single upstream request when the config leaves
+// CallTimeout unset.
+const DefaultCallTimeout = 30 * time.Second
+
+// EffectiveCallTimeout returns CallTimeout or DefaultCallTimeout if unset.
+func (c *Config) EffectiveCallTimeout() time.Duration {
+	if c.CallTimeout <= 0 {
+		return DefaultCallTimeout
+	}
+	return c.CallTimeout
 }
 
 // Load reads and validates configuration from path.
