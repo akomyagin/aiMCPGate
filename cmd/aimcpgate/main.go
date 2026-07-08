@@ -55,8 +55,9 @@ func run() error {
 	defer func() { _ = callLog.Close() }()
 
 	reg := registry.New(cfg, logger, callLog)
-	srv := transport.NewServer(cfg, reg, logger)
+	srv := transport.NewServer(cfg, reg, logger, version)
 
-	// Serve blocks until ctx is cancelled; stub returns nil until Этап 1.
+	// Serve starts the registry (upstream fan-out) and blocks handling client
+	// requests over stdio until ctx is cancelled or the client disconnects.
 	return srv.Serve(ctx)
 }
