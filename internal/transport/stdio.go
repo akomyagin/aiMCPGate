@@ -66,6 +66,12 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	// goroutine and feed decoded frames over a channel. This lets Serve select
 	// on ctx.Done() (Ctrl-C / SIGTERM) and return promptly instead of blocking
 	// forever on a client that has gone quiet without closing the pipe.
+	//
+	// The buffer of 1 matters: if Serve has already returned on ctx.Done() and
+	// readFrames was mid-Read, it must still be able to deposit that one
+	// in-flight frame without blocking on the send — an unbuffered channel
+	// would leak this goroutine forever in that race. readFrames then blocks
+	// on the next Read (harmless: reaped when the process exits on shutdown).
 	frames := make(chan readResult, 1)
 	go s.readFrames(frames)
 
