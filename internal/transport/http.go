@@ -29,6 +29,14 @@ import (
 // SSE is optional for the server — and keeps the transport simple; opening SSE
 // only becomes necessary if the gateway starts relaying upstream server→client
 // traffic, which is post-MVP.
+// maxRequestBodyBytes bounds a single client POST body. The gateway's own
+// listen_addr defaults to loopback, but a user who widens it to a network
+// interface (config.example.yaml) would otherwise let any unauthenticated
+// caller stream an unbounded body into memory (found by independent
+// /code-review on Этап 5). MCP tool-call arguments are small JSON payloads, so
+// this is generous, not tight.
+const maxRequestBodyBytes = 4 << 20 // 4 MiB
+
 type httpServer struct {
 	reg  *registry.Registry
 	log  *slog.Logger
@@ -110,6 +118,8 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 // it, and replies: 202 Accepted with no body for a notification (nothing to
 // answer), or a single application/json JSON-RPC response for a request.
 func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+
 	var msg mcp.Message
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&msg); err != nil {

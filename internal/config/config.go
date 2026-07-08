@@ -111,8 +111,13 @@ type Config struct {
 const DefaultCallTimeout = 30 * time.Second
 
 // DefaultListenAddr is the bind address used for TransportHTTP when the config
-// leaves ListenAddr unset.
-const DefaultListenAddr = ":8080"
+// leaves ListenAddr unset. Bound to loopback, not ":8080"/0.0.0.0: the HTTP
+// endpoint has no client authentication yet (access policy is post-MVP), so
+// defaulting to all interfaces would silently expose every aggregated
+// upstream tool — including ones backed by secret-bearing external APIs — to
+// the whole LAN. A user who genuinely wants network exposure can still set
+// listen_addr explicitly (found by independent /code-review on Этап 5).
+const DefaultListenAddr = "127.0.0.1:8080"
 
 // EffectiveCallTimeout returns CallTimeout or DefaultCallTimeout if unset.
 func (c *Config) EffectiveCallTimeout() time.Duration {

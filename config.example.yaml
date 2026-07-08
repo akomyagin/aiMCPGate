@@ -7,7 +7,11 @@
 # gateway. "stdio" (Фаза 1) launches the gateway as a subprocess; "http" (Фаза 2)
 # exposes a Streamable HTTP endpoint at http://<listen_addr>/mcp.
 transport: stdio            # stdio | http
-listen_addr: ":8080"        # only used when transport: http
+# Loopback-only by default: the HTTP endpoint has no client authentication
+# yet, so binding to all interfaces would expose every aggregated upstream
+# tool to the whole LAN. Only widen this (e.g. "0.0.0.0:8080") if you
+# specifically intend to serve the gateway over the network.
+listen_addr: "127.0.0.1:8080" # only used when transport: http
 
 # Where the JSON-lines tool-call log is written. Empty → stderr only.
 # `aimcpgate logs --file <this>` reads it back.

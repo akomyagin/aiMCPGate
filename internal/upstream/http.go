@@ -196,10 +196,14 @@ func (c *HTTPConn) call(ctx context.Context, method string, params json.RawMessa
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, httpResp.Body) // drain so the connection can be reused
-		_ = httpResp.Body.Close()
-	}()
+	// Close without draining: for the SSE branch below, the upstream is allowed
+	// to keep the stream open past the response we care about (the spec permits
+	// further server-initiated messages on it), so draining to EOF here would
+	// block until the call's timeout on a chatty upstream instead of returning
+	// immediately once our response is found. net/http.Response.Body.Close on an
+	// unread stream still tears the connection down cleanly, it just forgoes
+	// keep-alive reuse for this one request (found by independent /code-review).
+	defer func() { _ = httpResp.Body.Close() }()
 
 	// initialize may hand back a session id we must echo from now on.
 	if method == mcp.MethodInitialize {
