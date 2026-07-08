@@ -75,6 +75,17 @@ type Registry struct {
 	callLog logging.CallLog
 	start   upstreamStarter
 
+	// procCtx is the context each upstream CHILD PROCESS is launched under —
+	// deliberately independent of Start's errgroup context. errgroup.WithContext
+	// cancels its derived context the instant g.Wait() returns, which is right
+	// when Start() finishes; if child processes were bound to that context (as
+	// they originally were, see the bug this comment documents), every upstream
+	// would be killed immediately after "registry ready" logs, and every later
+	// CallTool would hit a dead connection. procCtx instead lives for the
+	// Registry's whole lifetime and is only cancelled by Close.
+	procCtx    context.Context
+	procCancel context.CancelFunc
+
 	mu        sync.RWMutex
 	conns     map[string]Upstream
 	tools     map[string]ToolDescriptor // namespaced name → descriptor
@@ -84,13 +95,16 @@ type Registry struct {
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
 func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog) *Registry {
+	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
-		cfg:       cfg,
-		log:       logger,
-		callLog:   callLog,
-		conns:     map[string]Upstream{},
-		tools:     map[string]ToolDescriptor{},
-		toolRoute: map[string]route{},
+		cfg:        cfg,
+		log:        logger,
+		callLog:    callLog,
+		conns:      map[string]Upstream{},
+		tools:      map[string]ToolDescriptor{},
+		toolRoute:  map[string]route{},
+		procCtx:    procCtx,
+		procCancel: procCancel,
 	}
 	r.start = r.startStdio
 	return r
@@ -135,10 +149,15 @@ func (r *Registry) Start(ctx context.Context) error {
 
 // bringUp starts one upstream, handshakes, and merges its catalog. All failures
 // are isolated: logged and the upstream skipped/torn down.
+//
+// ctx bounds only the handshake steps below (Initialize/ListTools/
+// ListResources) — the child process itself is launched under r.procCtx, a
+// long-lived context independent of Start's errgroup context. See the comment
+// on Registry.procCtx for why this distinction is load-bearing.
 func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 	timeout := r.cfg.EffectiveCallTimeout()
 
-	conn, err := r.start(ctx, u)
+	conn, err := r.start(r.procCtx, u)
 	if err != nil {
 		r.log.Warn("upstream failed to start", "upstream", u.Name, "err", err)
 		return
@@ -262,6 +281,11 @@ func (r *Registry) upstreamCount() int {
 
 // Close tears down all upstream connections/child processes, joining any errors.
 func (r *Registry) Close() error {
+	// Cancel the long-lived process context first: any upstream still mid-launch
+	// (e.g. blocked in cmd.Start or the handshake) unwinds, and it backstops each
+	// conn's own graceful Close below in case a child ignores stdin closing.
+	r.procCancel()
+
 	r.mu.Lock()
 	conns := r.conns
 	r.conns = map[string]Upstream{}

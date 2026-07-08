@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
@@ -28,6 +29,11 @@ import (
 // ErrConnClosed is returned by Call once the connection's reader has stopped
 // (child exited or Close was called).
 var ErrConnClosed = errors.New("upstream: connection closed")
+
+// closeGracePeriod bounds how long Close waits for a well-behaved upstream to
+// exit after its stdin is closed, before force-killing it. A misbehaving
+// upstream that keeps stdout open must not hang gateway shutdown forever.
+const closeGracePeriod = 5 * time.Second
 
 // StdioConn is a live connection to one stdio upstream MCP server.
 //
@@ -236,14 +242,30 @@ func (c *StdioConn) Close() error {
 		c.mu.Unlock()
 	}
 	// Closing stdin tells a well-behaved server to exit; the context bound via
-	// CommandContext kills it otherwise.
+	// CommandContext kills it otherwise. Either way, wait for the reader
+	// goroutine to see the child exit — but not forever: a misbehaving upstream
+	// that keeps stdout open despite stdin closing must not hang shutdown.
 	_ = c.stdin.Close()
-	<-c.done
+	select {
+	case <-c.done:
+	case <-time.After(closeGracePeriod):
+		c.log.Warn("upstream did not exit after stdin close, killing", "upstream", c.name)
+		_ = c.cmd.Process.Kill()
+		<-c.done // the kill forces stdout EOF, so readLoop returns promptly now
+	}
 	err := c.cmd.Wait()
-	// A killed/closed child commonly returns a non-nil exit error; treat it as
-	// benign for graceful shutdown.
+	// A killed/closed child commonly returns a non-nil error during shutdown:
+	// a plain *exec.ExitError (non-zero exit / killed by our own timeout-Kill
+	// above), or — because the child is launched under a context via
+	// exec.CommandContext (see StartStdio) — a context.Canceled/
+	// DeadlineExceeded wrapped error if that context's own cancellation is
+	// what ended the process. Both are the expected, benign shape of "the
+	// process is gone because we told it (or its context) to stop", not a
+	// real failure to report.
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if errors.As(err, &exitErr) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
 	return err
