@@ -5,9 +5,12 @@
 // Behaviour is controlled by environment variables so one binary can play
 // several roles:
 //
-//	FAKE_NAME    server name reported in serverInfo/initialize (default "fake")
-//	FAKE_TOOLS   comma-separated tool names to advertise in tools/list
-//	FAKE_ECHO    if "1", tools/call echoes back the received arguments as text
+//	FAKE_NAME        server name reported in serverInfo/initialize (default "fake")
+//	FAKE_TOOLS       comma-separated tool names to advertise in tools/list
+//	FAKE_ECHO        if "1", tools/call echoes back the received arguments as text
+//	FAKE_CALL_DELAY  Go duration (e.g. "2s") to sleep before answering tools/call;
+//	                 used to exercise the gateway's call-timeout path. Handshake
+//	                 and tools/list are never delayed.
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -19,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 type message struct {
@@ -42,6 +46,10 @@ func main() {
 		tools = strings.Split(raw, ",")
 	}
 	echo := os.Getenv("FAKE_ECHO") == "1"
+	var callDelay time.Duration
+	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
+		callDelay, _ = time.ParseDuration(raw)
+	}
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -79,6 +87,9 @@ func main() {
 		case "resources/list":
 			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})
 		case "tools/call":
+			if callDelay > 0 {
+				time.Sleep(callDelay)
+			}
 			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
 		default:
 			if len(req.ID) > 0 {
