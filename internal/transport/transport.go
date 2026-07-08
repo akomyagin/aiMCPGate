@@ -29,8 +29,8 @@ type Server interface {
 // it is threaded from main.go (which owns the -ldflags-injected value) rather
 // than hardcoded here, so the client always sees the real binary version.
 func NewServer(cfg *config.Config, reg *registry.Registry, logger *slog.Logger, version string) Server {
-	// Only stdio exists in Фаза 1; the httpServer branch lands in Этап 5. Per
-	// the project rule "interface on the second implementation", Server is the
-	// interface and stdioServer its single implementation for now.
+	if cfg.Transport == config.TransportHTTP {
+		return newHTTPServer(cfg, reg, logger, version)
+	}
 	return newStdioServer(cfg, reg, logger, version, os.Stdin, os.Stdout)
 }

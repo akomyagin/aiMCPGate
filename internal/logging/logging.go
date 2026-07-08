@@ -109,3 +109,30 @@ func (l *jsonCallLog) Close() error {
 	}
 	return nil
 }
+
+// ReadRecords decodes CallRecords from a JSON-lines stream (the format
+// NewCallLog writes). It is the read side consumed by the `aimcpgate logs`
+// command. A line that fails to decode is skipped rather than aborting the whole
+// read, so a partially-written trailing line (the writer crashed mid-append)
+// does not hide the records before it. CallRecord is the single shared shape
+// between writer and reader — no parallel struct.
+func ReadRecords(r io.Reader) ([]CallRecord, error) {
+	dec := json.NewDecoder(r)
+	var out []CallRecord
+	for {
+		var rec CallRecord
+		err := dec.Decode(&rec)
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			// Skip a malformed line and resynchronize by advancing the decoder to
+			// the next token; if that also fails the stream is unusable, so stop.
+			if _, derr := dec.Token(); derr != nil {
+				return out, nil
+			}
+			continue
+		}
+		out = append(out, rec)
+	}
+}

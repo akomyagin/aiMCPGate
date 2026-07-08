@@ -106,17 +106,40 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog) *Regi
 		procCtx:    procCtx,
 		procCancel: procCancel,
 	}
-	r.start = r.startStdio
+	r.start = r.startUpstream
 	return r
 }
 
-// startStdio is the production starter: it launches a stdio child process.
+// startUpstream is the production starter: it dispatches to the stdio or HTTP
+// implementation based on the upstream's resolved kind. Both return an Upstream
+// (StdioConn / HTTPConn), so the registry treats them uniformly from here on —
+// the "interface on the second implementation" rule is satisfied by the
+// existing Upstream interface, not a new upstream.Conn (docs/MCP_NOTES.md §8).
+func (r *Registry) startUpstream(ctx context.Context, u config.Upstream) (Upstream, error) {
+	switch u.ResolveKind() {
+	case config.UpstreamHTTP:
+		return r.startHTTP(u)
+	default:
+		return r.startStdio(ctx, u)
+	}
+}
+
+// startStdio launches a stdio child-process upstream.
 func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream, error) {
 	env := make([]string, 0, len(u.Env))
 	for k, v := range u.Env {
 		env = append(env, k+"="+v)
 	}
 	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env)
+}
+
+// startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
+// startStdio it does no network I/O here — the handshake runs in Initialize, so
+// StartHTTP never fails and a genuinely unreachable HTTP upstream is isolated at
+// the Initialize step in bringUp, exactly like a stdio upstream that fails its
+// handshake.
+func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
+	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil), nil
 }
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,
