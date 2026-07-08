@@ -1,0 +1,49 @@
+# goreleaser v2 configuration for aiMCPGate.
+# Docs: https://goreleaser.com
+version: 2
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: aimcpgate
+    main: ./cmd/aimcpgate
+    binary: aimcpgate
+    # modernc.org's pure-Go stdlib deps aside, aiMCPGate has no CGO dependency at
+    # all (no SQLite here) — CGO_ENABLED=0 is still stated explicitly so cross
+    # compilation to darwin/windows never silently depends on a C toolchain.
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+archives:
+  - id: aimcpgate
+    name_template: "aimcpgate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+changelog:
+  use: github
+
+release:
+  github:
+    owner: akomyagin
+    name: aiMCPGate

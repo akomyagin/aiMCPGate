@@ -6,11 +6,19 @@
 **агрегирует** их каталоги инструментов/ресурсов в один и **логирует** каждый
 вызов.
 
-> Статус: **MVP готов (Этапы 0–5)**. Фаза 1 — мультиплексирование stdio-upstream
-> за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт клиент↔шлюз,
-> HTTP-upstream, CLI-просмотрщик журнала (`aimcpgate logs`). Осталось: Этап 6
-> (релиз-пайплайн goreleaser). Разбивка по этапам —
+> Статус: **MVP завершён (Этапы 0–6)**. Фаза 1 — мультиплексирование
+> stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
+> клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`aimcpgate logs`);
+> релиз-пайплайн (`goreleaser`, кросс-компиляция linux/darwin/windows ×
+> amd64/arm64 без CGO). Разбивка по этапам —
 > [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) §8.
+
+## Релизы
+
+Кросс-платформенные бинарники собираются через [`goreleaser`](https://goreleaser.com)
+(`.goreleaser.yaml`): `linux`/`darwin`/`windows` × `amd64`/`arm64`, без CGO,
+версия вшивается через `-ldflags -X main.version=...`, чек-суммы в `SHA256SUMS`.
+Локальный прогон: `goreleaser release --snapshot --clean`.
 
 ## Зачем
 
