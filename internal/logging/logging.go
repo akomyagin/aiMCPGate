@@ -11,8 +11,12 @@
 package logging
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"sync"
 	"time"
 )
 
@@ -53,17 +57,55 @@ type CallRecord struct {
 // use — many upstream calls run on separate goroutines.
 type CallLog interface {
 	Record(r CallRecord)
+	io.Closer
 }
 
-// nopCallLog discards records. Замена реальной реализацией — Этап 1.
-type nopCallLog struct{}
-
-// NewCallLog returns a CallLog. For now it always returns a no-op sink; Этап 1
-// wires the JSON-lines file/stdout writer described in TECHNICAL_PLAN.md.
-func NewCallLog(_ string) (CallLog, error) {
-	// TODO(Этап 1): open logFile (append, JSON lines), guard with a mutex,
-	// fall back to stderr when logFile is empty.
-	return nopCallLog{}, nil
+// jsonCallLog writes one JSON object per line to an io.Writer, serialized by a
+// mutex. Secrets are never written: CallRecord carries only metadata (upstream,
+// method, tool name, latency, ok/error) — never the call arguments, which may
+// contain tokens (SKILL §6). The error string is expected to be sanitized by
+// the caller before being placed in CallRecord.Err.
+type jsonCallLog struct {
+	mu     sync.Mutex
+	w      io.Writer
+	closer io.Closer // non-nil only when we opened a file we own
 }
 
-func (nopCallLog) Record(CallRecord) {}
+// NewCallLog returns a CallLog writing JSON lines. An empty logFile writes to
+// stderr; otherwise the file is opened for append (created if missing).
+func NewCallLog(logFile string) (CallLog, error) {
+	if logFile == "" {
+		return &jsonCallLog{w: os.Stderr}, nil
+	}
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open call log %q: %w", logFile, err)
+	}
+	return &jsonCallLog{w: f, closer: f}, nil
+}
+
+// NewCallLogWriter builds a call log over an arbitrary writer (used in tests).
+func NewCallLogWriter(w io.Writer) CallLog {
+	return &jsonCallLog{w: w}
+}
+
+func (l *jsonCallLog) Record(r CallRecord) {
+	if r.Time.IsZero() {
+		r.Time = time.Now()
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return // a CallRecord is always marshalable; ignore defensively
+	}
+	b = append(b, '\n')
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = l.w.Write(b)
+}
+
+func (l *jsonCallLog) Close() error {
+	if l.closer != nil {
+		return l.closer.Close()
+	}
+	return nil
+}
