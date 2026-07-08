@@ -1,0 +1,27 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+go.work
+go.work.sum
+
+# Local state / logs
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+/logs/
+
+# Env / secrets — upstream MCP server credentials
+.env
+*.local.yaml
+
+# IDE
+.idea/
+.vscode/
