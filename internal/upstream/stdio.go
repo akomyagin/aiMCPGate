@@ -59,7 +59,8 @@ type StdioConn struct {
 	waiters map[string]chan *mcp.Message
 	closed  bool
 
-	done chan struct{} // closed when the reader goroutine exits
+	done       chan struct{} // closed when the reader goroutine exits
+	stderrDone chan struct{} // closed when the stderr-draining goroutine exits
 }
 
 // Name returns the upstream's stable identifier.
@@ -99,14 +100,15 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 	}
 
 	c := &StdioConn{
-		name:    name,
-		log:     log,
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  stdout,
-		w:       mcp.NewWriter(stdin),
-		waiters: make(map[string]chan *mcp.Message),
-		done:    make(chan struct{}),
+		name:       name,
+		log:        log,
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     stdout,
+		w:          mcp.NewWriter(stdin),
+		waiters:    make(map[string]chan *mcp.Message),
+		done:       make(chan struct{}),
+		stderrDone: make(chan struct{}),
 	}
 
 	go c.readLoop()
@@ -146,7 +148,14 @@ func (c *StdioConn) readLoop() {
 
 // drainStderr forwards the child's stderr to the operational log line by line,
 // prefixed with the upstream name. Never logged as protocol data.
+//
+// Close waits for stderrDone before calling cmd.Wait(): exec.Cmd's own docs
+// warn that Wait closes any pipe obtained via StderrPipe once it sees the
+// child exit, so reading from that pipe concurrently with (or after) Wait is
+// a race — "it is thus incorrect to call Wait before all reads from the pipe
+// have completed" (found by code review; done alone only tracked stdout).
 func (c *StdioConn) drainStderr(stderr io.Reader) {
+	defer close(c.stderrDone)
 	sc := bufio.NewScanner(stderr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -235,12 +244,8 @@ func (c *StdioConn) Notify(method string, params json.RawMessage) error {
 // lifecycle) and waits for it to exit. Safe to call more than once.
 func (c *StdioConn) Close() error {
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-	} else {
-		c.closed = true
-		c.mu.Unlock()
-	}
+	c.closed = true
+	c.mu.Unlock()
 	// Closing stdin tells a well-behaved server to exit; the context bound via
 	// CommandContext kills it otherwise. Either way, wait for the reader
 	// goroutine to see the child exit — but not forever: a misbehaving upstream
@@ -253,6 +258,7 @@ func (c *StdioConn) Close() error {
 		_ = c.cmd.Process.Kill()
 		<-c.done // the kill forces stdout EOF, so readLoop returns promptly now
 	}
+	<-c.stderrDone // see drainStderr: must finish before Wait touches the pipe
 	err := c.cmd.Wait()
 	// A killed/closed child commonly returns a non-nil error during shutdown:
 	// a plain *exec.ExitError (non-zero exit / killed by our own timeout-Kill

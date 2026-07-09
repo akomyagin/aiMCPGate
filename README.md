@@ -76,7 +76,24 @@ mcp-gate serve --config ./config-http.yaml
 # view the call log (last 50 records; filter by upstream/tool/status):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
+
+# generate a random auth token (for the HTTP transport) and see how to wire it in:
+mcp-gate token --generate
+# print the auth token currently set in the config:
+mcp-gate token --config ./config-http.yaml
+
+# print ready-to-paste MCP client config snippets (Claude Code / Cursor); requires
+# transport: http in the config, and includes the Bearer header when auth_token is set:
+mcp-gate client-config --config ./config-http.yaml
+
+# print a SKILL.md teaching an agent how to use the aggregated catalog
+# (built-in text by default; overridable via skill_file in the config):
+mcp-gate skill > .claude/skills/mcp-gate/SKILL.md
 ```
+
+All commands except `token --generate` and `skill` (which falls back to a built-in
+guide) load the config: pass `--config`, or drop a `config.yaml` next to the
+binary (see Configuration below).
 
 ## Configuration
 
@@ -88,6 +105,11 @@ errors explicitly instead of starting an empty gateway. Relative paths inside
 the config (`log_file`, `skill_file`) resolve against the **config file's own
 directory**, not the current working directory.
 
+> Note: the "next to the binary" lookup uses the path of the running executable.
+> Under `go run ./cmd ...` that executable is a throwaway build in a temp
+> directory, so the default lookup will not find your `config.yaml` — pass
+> `--config` explicitly when using `go run`, or run a built binary.
+
 Full example with every field — [`config.example.yaml`](config.example.yaml).
 The set of upstream servers is declared in YAML; **secrets (tokens) go through
 env/`.env`** (`${VAR}` expansion at load time), never committed in the config.
@@ -96,7 +118,8 @@ Each upstream sets **exactly one** of `command` (stdio subprocess) or `url`
 
 ```yaml
 transport: stdio            # stdio (Phase 1) | http (Phase 2)
-listen_addr: ":28080"        # only used for transport: http
+listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default
+# auth_token: ${AIMCPGATE_TOKEN}  # required if you widen listen_addr past loopback
 log_file: ./logs/calls.jsonl
 upstreams:
   - name: filesystem        # stdio upstream

@@ -5,9 +5,12 @@
 // and where tool-call logs are written.
 //
 // Secrets (upstream API keys / tokens) are never stored inline in the committed
-// YAML: string values are expanded with os.ExpandEnv, so a config carries
-// "${GITHUB_TOKEN}" and the real value comes from the environment / a local
-// .env, never from a file under git (SKILL §2/§6).
+// YAML: the values of auth_token and upstream env/headers entries are expanded
+// with os.ExpandEnv, so a config carries "${GITHUB_TOKEN}" and the real value
+// comes from the environment / a local .env, never from a file under git
+// (SKILL §2/§6). Expansion is scoped to exactly those fields — not the whole
+// file — so a literal '$' anywhere else (a URL, a password, a path) is never
+// misread as a variable reference.
 package config
 
 import (
@@ -169,8 +172,9 @@ func defaultConfigPath() (string, error) {
 // exist either, Load errors rather than silently starting an empty gateway
 // (found by user request).
 //
-// Once a path is settled, the file is read, has its string values expanded
-// against the environment (secrets), unmarshaled, and validated.
+// Once a path is settled, the file is read, unmarshaled, has its
+// secret-carrying fields (auth_token, upstream env/headers values) expanded
+// against the environment, and validated.
 func Load(path string) (*Config, error) {
 	usingDefault := false
 	if path == "" {
@@ -189,16 +193,23 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
-	// Expand ${VAR} / $VAR against the environment before parsing so secrets
-	// referenced in the YAML (tokens in env/headers) are resolved from the
-	// environment, never committed literally. os.ExpandEnv replaces unset
-	// variables with the empty string, which Validate then rejects where a
-	// value is required (e.g. an unset upstream command).
-	expanded := os.ExpandEnv(string(raw))
-
 	var cfg Config
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	// Expand ${VAR} / $VAR against the environment only in the fields
+	// documented as carrying secrets (auth_token, upstream env/headers
+	// values) — never across the whole file. Expanding the raw file text
+	// (the previous approach) silently mangled any literal '$' anywhere in
+	// the YAML — a password, a URL, a path — since os.ExpandEnv has no way
+	// to tell "meant as a variable" from "just a dollar sign" (found by code
+	// review). An unset variable silently becomes the empty string (nothing
+	// currently validates these fields as non-empty) — a genuinely unset
+	// secret surfaces later as an upstream auth failure, not a config error.
+	cfg.AuthToken = os.ExpandEnv(cfg.AuthToken)
+	for i := range cfg.Upstreams {
+		expandMapValues(cfg.Upstreams[i].Env)
+		expandMapValues(cfg.Upstreams[i].Headers)
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportStdio
@@ -218,6 +229,15 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config %q: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// expandMapValues expands ${VAR}/$VAR in each value of m against the
+// environment, in place. Keys (header/env-var names) are left untouched —
+// only values are meant to carry secrets.
+func expandMapValues(m map[string]string) {
+	for k, v := range m {
+		m[k] = os.ExpandEnv(v)
+	}
 }
 
 // resolveRelative joins path onto dir when path is relative and non-empty;

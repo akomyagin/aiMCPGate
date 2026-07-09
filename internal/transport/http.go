@@ -38,21 +38,57 @@ import (
 // this is generous, not tight.
 const maxRequestBodyBytes = 4 << 20 // 4 MiB
 
+// httpReadTimeout bounds how long reading a full request (headers + body) may
+// take. maxRequestBodyBytes already bounds its size; this bounds a
+// slow-body attacker (or a stalled connection) from holding a handler
+// goroutine open indefinitely regardless of size (found by code review —
+// only ReadHeaderTimeout was set, leaving the body-read phase and idle
+// connections unbounded).
+const httpReadTimeout = 30 * time.Second
+
+// httpIdleTimeout bounds how long a keep-alive connection may sit idle
+// between requests.
+const httpIdleTimeout = 120 * time.Second
+
+// httpWriteTimeoutSlack is added on top of the configured call_timeout to
+// size WriteTimeout: net/http.Server.WriteTimeout covers the whole handler,
+// not just the network write, so it must comfortably exceed the slowest
+// legitimate upstream call (bounded by call_timeout) plus the gateway's own
+// dispatch/auth overhead — otherwise a deliberately slow (but legitimate)
+// upstream tool call would be cut off before EffectiveCallTimeout ever fires.
+const httpWriteTimeoutSlack = 10 * time.Second
+
 type httpServer struct {
-	reg       *registry.Registry
-	log       *slog.Logger
-	d         *dispatcher
-	addr      string
-	authToken string
+	reg         *registry.Registry
+	log         *slog.Logger
+	d           *dispatcher
+	addr        string
+	authToken   string
+	callTimeout time.Duration
 }
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
 	return &httpServer{
-		reg:       reg,
-		log:       log,
-		d:         newDispatcher(reg, log, version),
-		addr:      cfg.EffectiveListenAddr(),
-		authToken: cfg.AuthToken,
+		reg:         reg,
+		log:         log,
+		d:           newDispatcher(reg, log, version),
+		addr:        cfg.EffectiveListenAddr(),
+		authToken:   cfg.AuthToken,
+		callTimeout: cfg.EffectiveCallTimeout(),
+	}
+}
+
+// buildServer assembles the *http.Server Serve runs, wired to mux. Split out
+// from Serve so its timeout configuration is unit-testable without binding a
+// real listener.
+func (s *httpServer) buildServer(mux http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              s.addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      s.callTimeout + httpWriteTimeoutSlack,
+		IdleTimeout:       httpIdleTimeout,
 	}
 }
 
@@ -67,12 +103,7 @@ func (s *httpServer) Serve(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", s.authMiddleware(http.HandlerFunc(s.handleMCP)))
-
-	srv := &http.Server{
-		Addr:              s.addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := s.buildServer(mux)
 
 	// Bind explicitly so a failed bind (port in use) surfaces here rather than
 	// asynchronously inside ListenAndServe, and so tests can learn the port.

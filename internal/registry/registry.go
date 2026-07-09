@@ -272,6 +272,15 @@ func (r *Registry) Tools() []ToolDescriptor {
 // name back to the upstream's original before forwarding. It records an audit
 // entry (metadata only — never the arguments). The returned *mcp.Message is the
 // raw upstream response (which may itself carry a JSON-RPC error).
+//
+// A routing/transport failure (as opposed to the upstream's own JSON-RPC
+// error, returned verbatim in resp) is logged here with full detail — upstream
+// name, underlying error — and returned to the caller as a short, sanitized
+// message that names only the tool the client itself already asked for.
+// dispatch.go forwards this error text to the client verbatim, so leaking the
+// upstream name or an internal transport error string here would leak the
+// gateway's topology/internals to whoever holds a valid auth_token (found by
+// code review — the previous message included both).
 func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
 	r.mu.RLock()
 	rt, ok := r.toolRoute[namespaced]
@@ -289,7 +298,11 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 	resp, err := conn.CallTool(callCtx, rt.original, arguments)
 	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
 	if err != nil {
-		return nil, fmt.Errorf("call %q on upstream %q: %w", namespaced, rt.upstream, err)
+		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("call %q timed out", namespaced)
+		}
+		return nil, fmt.Errorf("call %q failed", namespaced)
 	}
 	return resp, nil
 }

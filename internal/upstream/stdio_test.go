@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +180,43 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("call did not return after Close")
+	}
+}
+
+// TestStdioConnCloseWaitsForStderrDrain is a regression test: Close used to
+// wait only for the stdout reader (done) before calling cmd.Wait(), racing
+// against the still-running stderr-draining goroutine — exec.Cmd's own docs
+// warn that Wait closes a StderrPipe once it sees the child exit, so reading
+// concurrently with (or after) Wait is undefined (found by code review). The
+// fake server writes its stderr lines in the same window Close races
+// against: right as it sees stdin close (shutdown), just before exiting.
+func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx := context.Background()
+
+	const lines = 200
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&stringWriter{&logBuf}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	conn, err := upstream.StartStdio(ctx, logger, "z", bin, nil, []string{
+		"FAKE_TOOLS=t",
+		"FAKE_STDERR_LINES=" + strconv.Itoa(lines),
+	})
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got := strings.Count(logBuf.String(), "upstream stderr")
+	if got != lines {
+		t.Errorf("captured %d of %d stderr lines by the time Close returned; "+
+			"Close must wait for stderr to fully drain before reaping the process", got, lines)
 	}
 }
 

@@ -11,6 +11,10 @@
 //	FAKE_CALL_DELAY  Go duration (e.g. "2s") to sleep before answering tools/call;
 //	                 used to exercise the gateway's call-timeout path. Handshake
 //	                 and tools/list are never delayed.
+//	FAKE_STDERR_LINES  number of lines to write to stderr right as stdin closes
+//	                   (simulating shutdown diagnostics), before the process
+//	                   exits — used to test that Close() waits for stderr to
+//	                   fully drain before reaping the process.
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -21,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -95,6 +100,15 @@ func main() {
 			if len(req.ID) > 0 {
 				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}})
 			}
+		}
+	}
+
+	// stdin closed (EOF) — the client is shutting us down. Write shutdown
+	// diagnostics to stderr right before exiting, matching the real-world
+	// window Close() must not race against.
+	if n, _ := strconv.Atoi(os.Getenv("FAKE_STDERR_LINES")); n > 0 {
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(os.Stderr, "shutdown line %d\n", i)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package upstream_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -292,6 +293,35 @@ func TestHTTPAuthHeaderSentNotLogged(t *testing.T) {
 	}
 	if strings.Contains(logBuf.String(), "SUPER_SECRET_TOKEN") {
 		t.Fatalf("secret leaked into operational log:\n%s", logBuf.String())
+	}
+}
+
+// TestHTTPCallOversizedJSONResponseIsRejected is a regression test: the
+// application/json branch of call() used to decode with no size limit at all
+// (found by code review), unlike the SSE branch, which was already capped.
+// A misbehaving/malicious upstream sending a huge body must make the client
+// error out instead of buffering it without bound.
+func TestHTTPCallOversizedJSONResponseIsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"padding":"`)
+		chunk := bytes.Repeat([]byte("x"), 1<<20) // 1 MiB
+		for i := 0; i < 34; i++ {                 // 34 MiB, over the 32 MiB cap
+			_, _ = w.Write(chunk)
+		}
+		// Deliberately never closes the JSON string/object — irrelevant,
+		// the reader is cut off well before reaching here either way.
+	}))
+	defer srv.Close()
+
+	conn := upstream.StartHTTP(quietLogger(), "oversized", srv.URL, nil, srv.Client())
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.ListTools(ctx); err == nil {
+		t.Fatal("ListTools with a 34 MiB response body: want an error, got nil (unbounded read?)")
 	}
 }
 
