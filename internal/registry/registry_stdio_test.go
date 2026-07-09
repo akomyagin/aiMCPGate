@@ -27,7 +27,7 @@ func buildFakeServer(t *testing.T) string {
 }
 
 // TestRegistryStartDoesNotKillUpstreamsAfterReturning is a regression test for
-// the bug found by independent /code-review on Этап 1 (severity: blocks PR):
+// the bug found by independent /code-review on Stage 1 (severity: blocks PR):
 // upstream child processes were launched under Start's errgroup-derived
 // context (gctx), which errgroup cancels the instant g.Wait() returns — i.e.
 // the moment Start() itself returns. Every upstream died right after "registry

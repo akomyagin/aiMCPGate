@@ -2,8 +2,8 @@
 // MCP client connection (Claude Code and friends) and dispatches its JSON-RPC
 // requests against the aggregated registry.
 //
-// Фаза 1 implements the stdio transport (JSON-RPC 2.0 framed over stdin/stdout,
-// the same shape a client uses to launch a local MCP server). Фаза 2 adds an
+// Phase 1 implements the stdio transport (JSON-RPC 2.0 framed over stdin/stdout,
+// the same shape a client uses to launch a local MCP server). Phase 2 adds an
 // HTTP/SSE server behind the same Server interface.
 package transport
 

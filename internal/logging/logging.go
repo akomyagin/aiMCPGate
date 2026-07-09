@@ -7,7 +7,7 @@
 //     routed through the gateway (which upstream, what was called, latency,
 //     success/error), written as JSON lines for later inspection.
 //
-// Реализация — Этап 1+ (the call log currently discards records).
+// Implementation — Stage 1+ (the call log currently discards records).
 package logging
 
 import (
@@ -41,13 +41,13 @@ func New(level string, w io.Writer) *slog.Logger {
 }
 
 // CallRecord is one audit entry for a tool/resource call routed through the
-// gateway. This is the shape that Фаза 2's log viewer consumes.
+// gateway. This is the shape that Phase 2's log viewer consumes.
 type CallRecord struct {
 	Time     time.Time     `json:"time"`
 	Upstream string        `json:"upstream"` // which upstream served the call
 	Method   string        `json:"method"`   // JSON-RPC method, e.g. "tools/call"
 	Tool     string        `json:"tool"`     // tool/resource name, if applicable
-	Client   string        `json:"client"`   // client identity (Фаза 2 access policy)
+	Client   string        `json:"client"`   // client identity (Phase 2 access policy)
 	Duration time.Duration `json:"duration_ns"`
 	OK       bool          `json:"ok"`
 	Err      string        `json:"error,omitempty"` // sanitized error, no secrets

@@ -4,7 +4,7 @@
 # environment / a local .env at load time — never commit real secrets here.
 
 # Client-facing transport: how a client (Claude Code, Cursor, ...) reaches the
-# gateway. "stdio" (Фаза 1) launches the gateway as a subprocess; "http" (Фаза 2)
+# gateway. "stdio" (Phase 1) launches the gateway as a subprocess; "http" (Phase 2)
 # exposes a Streamable HTTP endpoint at http://<listen_addr>/mcp.
 transport: stdio            # stdio | http
 # Loopback-only by default. To serve over the network set a routable address
@@ -17,10 +17,17 @@ listen_addr: "127.0.0.1:28080" # only used when transport: http
 # auth_token: ${AIMCPGATE_TOKEN}
 
 # Where the JSON-lines tool-call log is written. Empty → stderr only.
-# `mcp-gate logs --file <this>` reads it back.
+# `mcp-gate logs --file <this>` reads it back. Relative paths (like this one)
+# resolve against THIS config file's directory, not the cwd mcp-gate was
+# launched from — so serve can be run from anywhere and still find its files.
 log_file: ./logs/calls.jsonl
 log_level: info             # debug | info | warn | error
 call_timeout: 30s           # bounds one upstream request (handshake/list/call)
+
+# `mcp-gate skill` prints a built-in deployment-independent guide by default.
+# Set this to override with your own file (org policy notes, translation, ...);
+# `mcp-gate skill` with no config gives you the default text as a starting point.
+# skill_file: ./skill.md
 
 upstreams:
   # stdio upstream: a local MCP server launched as a child process.
@@ -35,7 +42,7 @@ upstreams:
       GITHUB_TOKEN: ${GITHUB_TOKEN}         # from the environment, not hardcoded
     enabled: true
 
-  # http upstream (Фаза 2): an already-running MCP server reached over
+  # http upstream (Phase 2): an already-running MCP server reached over
   # Streamable HTTP. Set `url` instead of `command` (exactly one of the two).
   # `kind` is optional — it is inferred as http when a url is present.
   - name: remote

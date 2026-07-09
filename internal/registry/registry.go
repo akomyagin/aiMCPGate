@@ -10,7 +10,9 @@
 // Concurrency: the fan-out over upstreams runs in parallel (errgroup); the
 // aggregated catalog and routing table are guarded by a mutex. Upstream errors
 // are isolated — a failed upstream is logged and skipped, it does not bring the
-// gateway down (TECHNICAL_PLAN §4.4).
+// gateway down (TECHNICAL_PLAN §4.4) — UNLESS every upstream fails, in which
+// case Start itself errors: an aggregator with nothing to aggregate has no
+// reason to keep running (found by user request).
 package registry
 
 import (
@@ -20,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,6 +93,9 @@ type Registry struct {
 	conns     map[string]Upstream
 	tools     map[string]ToolDescriptor // namespaced name → descriptor
 	toolRoute map[string]route          // namespaced name → (upstream, original)
+
+	failMu   sync.Mutex
+	failures []string // "<upstream>: <reason>" for upstreams that never came up; unordered (parallel bringUp), sorted when reported
 }
 
 // New constructs a Registry from config. It does not start upstreams yet — call
@@ -144,8 +150,10 @@ func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,
 // lists tools/resources, and builds the aggregated namespaced catalog. A single
-// upstream failing does not fail Start — it is logged and skipped. Start returns
-// an error only if it cannot proceed at all (e.g. context cancelled).
+// upstream failing does not fail Start — it is logged and skipped. Start errors
+// if it cannot proceed at all (e.g. context cancelled), or if every upstream
+// failed (or none were enabled) leaving zero live connections — an empty
+// gateway is not a useful degraded mode, it is a misconfiguration.
 func (r *Registry) Start(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	for _, u := range r.cfg.Upstreams {
@@ -166,6 +174,15 @@ func (r *Registry) Start(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// A gateway with zero live upstreams has nothing to aggregate — every
+	// upstream configured either failed its handshake or none were enabled.
+	// Serving that (empty tools/list forever) is pointless, so fail loudly
+	// here instead of blocking with an empty catalog (found by user request).
+	// Per-upstream failures above are still isolated from each other; this is
+	// only the all-of-them-failed case.
+	if r.upstreamCount() == 0 {
+		return fmt.Errorf("no upstream MCP server is reachable:\n%s", r.failureSummary())
+	}
 	r.log.Info("registry ready", "upstreams", r.upstreamCount(), "tools", len(r.Tools()))
 	return nil
 }
@@ -183,6 +200,7 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 	conn, err := r.start(r.procCtx, u)
 	if err != nil {
 		r.log.Warn("upstream failed to start", "upstream", u.Name, "err", err)
+		r.recordFailure(u.Name, "failed to start: "+err.Error())
 		return
 	}
 
@@ -191,6 +209,7 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 	cancel()
 	if err != nil {
 		r.log.Warn("upstream handshake failed", "upstream", u.Name, "err", err)
+		r.recordFailure(u.Name, "handshake failed: "+err.Error())
 		_ = conn.Close()
 		return
 	}
@@ -201,6 +220,7 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 	cancel()
 	if err != nil {
 		r.log.Warn("upstream tools/list failed", "upstream", u.Name, "err", err)
+		r.recordFailure(u.Name, "tools/list failed: "+err.Error())
 		_ = conn.Close()
 		return
 	}
@@ -300,6 +320,36 @@ func (r *Registry) upstreamCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.conns)
+}
+
+// recordFailure notes why an upstream never came up, so Start can surface a
+// concrete cause if every upstream fails — not just "check the logs" (bringUp
+// runs upstreams in parallel, so failures are collected here rather than
+// threaded back through errgroup, which discards them by design).
+func (r *Registry) recordFailure(name, reason string) {
+	r.failMu.Lock()
+	defer r.failMu.Unlock()
+	r.failures = append(r.failures, name+": "+reason)
+}
+
+// failureSummary renders one "- upstream: reason" line per recorded failure,
+// sorted for deterministic output despite bringUp running upstreams in
+// parallel. Empty when no upstream was even enabled (config has none, or all
+// are disabled) — a distinct cause from every enabled one failing.
+func (r *Registry) failureSummary() string {
+	r.failMu.Lock()
+	reasons := append([]string(nil), r.failures...)
+	r.failMu.Unlock()
+
+	if len(reasons) == 0 {
+		return "  (no upstream is enabled in the config — nothing was even attempted)"
+	}
+	sort.Strings(reasons)
+	lines := make([]string, len(reasons))
+	for i, r := range reasons {
+		lines[i] = "  - " + r
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Close tears down all upstream connections/child processes, joining any errors.

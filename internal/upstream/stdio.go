@@ -1,12 +1,12 @@
 // Package upstream implements connections to individual upstream MCP servers.
 //
-// Этап 1 provides StdioConn: an upstream MCP server launched as a child process
+// Stage 1 provides StdioConn: an upstream MCP server launched as a child process
 // (os/exec) and spoken to over its stdin/stdout with JSON-RPC 2.0. A single
 // reader goroutine demultiplexes responses by JSON-RPC id and delivers them to
 // the goroutine that issued the matching Call.
 //
 // The upstream.Conn interface is intentionally NOT introduced yet — that lands
-// with the second implementation (httpConn, Фаза 2), per the project rule
+// with the second implementation (httpConn, Phase 2), per the project rule
 // "interface on the second implementation".
 package upstream
 

@@ -1,60 +1,62 @@
 # aiMCPGate
 
-Шлюз / прокси для **MCP-серверов** (Model Context Protocol) на Go. Presents
-себя MCP-клиенту (Claude Code, Cursor и др.) как **один** MCP-сервер, а под
-капотом **мультиплексирует** вызовы к нескольким upstream MCP-серверам,
-**агрегирует** их каталоги инструментов/ресурсов в один и **логирует** каждый
-вызов.
+*Русская версия — [README_RU.md](README_RU.md).*
 
-> Статус: **MVP завершён (Этапы 0–6)**. Фаза 1 — мультиплексирование
-> stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
-> клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`mcp-gate logs`);
-> релиз-пайплайн (`goreleaser`, кросс-компиляция linux/darwin/windows ×
-> amd64/arm64 без CGO).
+A gateway / proxy for **MCP servers** (Model Context Protocol) written in Go.
+It presents itself to an MCP client (Claude Code, Cursor, etc.) as **one**
+MCP server, while under the hood it **multiplexes** calls across several
+upstream MCP servers, **aggregates** their tool/resource catalogs into one,
+and **logs** every call.
 
-## Релизы
+> Status: **MVP complete (Stages 0–6)**. Phase 1 — multiplexing stdio
+> upstreams behind a stdio endpoint with a call log; Phase 2 — HTTP/SSE
+> client-facing transport, HTTP upstreams, a CLI log viewer (`mcp-gate
+> logs`); release pipeline (`goreleaser`, cross-compiled for
+> linux/darwin/windows × amd64/arm64, no CGO).
 
-Кросс-платформенные бинарники собираются через [`goreleaser`](https://goreleaser.com)
-(`.goreleaser.yaml`): `linux`/`darwin`/`windows` × `amd64`/`arm64`, без CGO,
-версия вшивается через `-ldflags -X main.version=...`, чек-суммы в `SHA256SUMS`.
-Локальный прогон: `goreleaser release --snapshot --clean`.
+## Releases
 
-## Зачем
+Cross-platform binaries are built via [`goreleaser`](https://goreleaser.com)
+(`.goreleaser.yaml`): `linux`/`darwin`/`windows` × `amd64`/`arm64`, no CGO,
+the version is baked in via `-ldflags -X main.version=...`, checksums land in
+`SHA256SUMS`. Local dry run: `goreleaser release --snapshot --clean`.
 
-У активного пользователя MCP подключено несколько серверов (filesystem, github,
-поиск, кастомные), и каждый прописан в конфиге каждого клиента по отдельности.
-`aiMCPGate` даёт:
+## Why
 
-- **Одну точку входа** — один MCP-эндпоинт вместо N в конфиге клиента.
-- **Единый каталог** — инструменты всех upstream-серверов сведены вместе (с
-  неймспейсингом `<upstream>__<tool>`, чтобы имена не сталкивались).
-- **Журнал вызовов** — какой upstream, что вызвано, когда, успех/ошибка. Это и
-  есть добавленная ценность поверх «просто прокси».
+An active MCP user typically has several servers configured (filesystem,
+GitHub, search, custom ones), each one duplicated in every client's own
+config. `aiMCPGate` gives you:
 
-Соло pet-проект: приоритет — обучение Go (конкурентность, `os/exec`,
-JSON-RPC 2.0, транспорты stdio и HTTP/SSE). Расходы — **$0/мес** по умолчанию
-(локальный процесс), без телеметрии.
+- **One entry point** — a single MCP endpoint instead of N entries in the
+  client config.
+- **One catalog** — every upstream server's tools merged together (namespaced
+  as `<upstream>__<tool>` so names never collide).
+- **A call log** — which upstream, which tool, when, success/failure. This is
+  the value added on top of "just a proxy".
 
-## Как это работает (кратко)
+Solo pet project: the priority is learning Go (concurrency, `os/exec`,
+JSON-RPC 2.0, the stdio and HTTP/SSE transports). Cost — **$0/month** by
+default (a local process), no telemetry.
+
+## How it works (short version)
 
 ```
-MCP-клиент ──stdio/HTTP──▶ aiMCPGate ──JSON-RPC──▶ upstream A (stdio)
+MCP client ──stdio/HTTP──▶ aiMCPGate ──JSON-RPC──▶ upstream A (stdio)
                               │        ├─────────▶ upstream B (stdio)
-                          журнал       └─────────▶ upstream C (http, Фаза 2)
-                          вызовов
+                          call log     └─────────▶ upstream C (http, Phase 2)
 ```
 
-## MVP (две фазы)
+## MVP (two phases)
 
-- **Фаза 1** — мультиплексирование 2+ **stdio** upstream за одним **stdio**
-  эндпоинтом (тот же транспорт, что видит Claude Code) + базовое логирование.
-- **Фаза 2** — **HTTP/SSE** транспорт, HTTP upstream-серверы, просмотрщик
-  журнала (CLI/веб), опционально политика доступа.
+- **Phase 1** — multiplexing 2+ **stdio** upstreams behind one **stdio**
+  endpoint (the same transport Claude Code speaks) plus basic logging.
+- **Phase 2** — **HTTP/SSE** transport, HTTP upstream servers, a log viewer
+  (CLI/web), optionally an access policy.
 
-## Сборка
+## Build
 
 ```bash
-export PATH="$HOME/sdk/go/bin:$PATH"   # если go не в PATH
+export PATH="$HOME/sdk/go/bin:$PATH"   # if go isn't already on PATH
 go build ./...
 go vet ./...
 go test -race ./...
@@ -62,49 +64,57 @@ go test -race ./...
 go run ./cmd version
 ```
 
-## Использование
+## Usage
 
 ```bash
-# stdio-режим (клиент запускает шлюз как подпроцесс):
+# stdio mode (the client launches the gateway as a subprocess):
 mcp-gate serve --config ./config.yaml
 
-# http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp:
+# http mode (transport: http in the config) — endpoint at http://<listen_addr>/mcp:
 mcp-gate serve --config ./config-http.yaml
 
-# просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
+# view the call log (last 50 records; filter by upstream/tool/status):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
 ```
 
-## Конфигурация
+## Configuration
 
-Полный пример со всеми полями — [`config.example.yaml`](config.example.yaml).
-Список upstream-серверов задаётся в YAML; **секреты (токены) — через env/`.env`**
-(подстановка `${VAR}` при загрузке), никогда не в конфиге под git. На upstream
-указывается **ровно один** из `command` (stdio-подпроцесс) или `url`
-(HTTP-сервер, Streamable HTTP) — вид соединения выводится автоматически.
+Without `--config`, the gateway looks for `config.yaml` **next to its own
+binary** (e.g. if `mcp-gate` is installed at `/etc/gate/`, it looks for
+`/etc/gate/config.yaml` — regardless of the working directory it was launched
+from). If that file doesn't exist and `--config` wasn't passed either, it
+errors explicitly instead of starting an empty gateway. Relative paths inside
+the config (`log_file`, `skill_file`) resolve against the **config file's own
+directory**, not the current working directory.
+
+Full example with every field — [`config.example.yaml`](config.example.yaml).
+The set of upstream servers is declared in YAML; **secrets (tokens) go through
+env/`.env`** (`${VAR}` expansion at load time), never committed in the config.
+Each upstream sets **exactly one** of `command` (stdio subprocess) or `url`
+(HTTP server, Streamable HTTP) — the connection kind is inferred automatically.
 
 ```yaml
-transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
-listen_addr: ":28080"        # только для transport: http
+transport: stdio            # stdio (Phase 1) | http (Phase 2)
+listen_addr: ":28080"        # only used for transport: http
 log_file: ./logs/calls.jsonl
 upstreams:
-  - name: filesystem        # stdio-upstream
+  - name: filesystem        # stdio upstream
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
     enabled: true
   - name: github
     command: github-mcp-server
     env:
-      GITHUB_TOKEN: ${GITHUB_TOKEN}   # из окружения, не хардкод
+      GITHUB_TOKEN: ${GITHUB_TOKEN}   # from the environment, not hardcoded
     enabled: true
-  - name: remote            # http-upstream (Фаза 2)
+  - name: remote            # http upstream (Phase 2)
     url: https://mcp.example.com/mcp
     headers:
-      Authorization: "Bearer ${REMOTE_MCP_TOKEN}"   # секрет, не логируется
+      Authorization: "Bearer ${REMOTE_MCP_TOKEN}"   # secret, never logged
     enabled: true
 ```
 
-## Лицензия
+## License
 
-MIT — см. [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).

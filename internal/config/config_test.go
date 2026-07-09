@@ -103,3 +103,62 @@ upstreams:
 		t.Errorf("auth header = %q, want env-expanded 'Bearer s3cr3t'", got)
 	}
 }
+
+func TestLoadResolvesFilePathsAgainstConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+transport: stdio
+log_file: ./logs/calls.jsonl
+skill_file: ./skill.md
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wantLog := filepath.Join(dir, "sub", "logs", "calls.jsonl")
+	if cfg.LogFile != wantLog {
+		t.Errorf("log_file = %q, want %q (resolved against config dir)", cfg.LogFile, wantLog)
+	}
+	wantSkill := filepath.Join(dir, "sub", "skill.md")
+	if cfg.SkillFile != wantSkill {
+		t.Errorf("skill_file = %q, want %q (resolved against config dir)", cfg.SkillFile, wantSkill)
+	}
+}
+
+// TestLoadEmptyPathErrorsWithoutDefaultConfig relies on there being no
+// config.yaml next to the compiled `go test` binary (in its temp build dir) —
+// true in every normal dev/CI environment. It documents that Load("") no
+// longer silently returns an empty-upstream default: it errors, so `serve`
+// never starts a pointless empty gateway (found by user request).
+func TestLoadEmptyPathErrorsWithoutDefaultConfig(t *testing.T) {
+	_, err := Load("")
+	if err == nil {
+		t.Fatal("Load(\"\") with no default config.yaml next to the binary should error, got nil")
+	}
+}
+
+func TestLoadKeepsAbsoluteFilePathsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	absLog := filepath.Join(dir, "elsewhere", "calls.jsonl")
+	yaml := "transport: stdio\nlog_file: " + absLog + "\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LogFile != absLog {
+		t.Errorf("log_file = %q, want unchanged absolute path %q", cfg.LogFile, absLog)
+	}
+}

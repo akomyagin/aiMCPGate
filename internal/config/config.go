@@ -1,7 +1,7 @@
 // Package config loads and validates aiMCPGate gateway configuration.
 //
 // The config describes the set of upstream MCP servers to aggregate, how the
-// gateway exposes itself to the client (stdio in Фаза 1, HTTP/SSE in Фаза 2),
+// gateway exposes itself to the client (stdio in Phase 1, HTTP/SSE in Phase 2),
 // and where tool-call logs are written.
 //
 // Secrets (upstream API keys / tokens) are never stored inline in the committed
@@ -13,6 +13,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -23,10 +24,10 @@ import (
 type Transport string
 
 const (
-	// TransportStdio serves the client over stdin/stdout (Фаза 1, the same
+	// TransportStdio serves the client over stdin/stdout (Phase 1, the same
 	// transport Claude Code uses to launch a local MCP server).
 	TransportStdio Transport = "stdio"
-	// TransportHTTP serves the client over HTTP + SSE (Фаза 2).
+	// TransportHTTP serves the client over HTTP + SSE (Phase 2).
 	TransportHTTP Transport = "http"
 )
 
@@ -89,7 +90,7 @@ func (u Upstream) ResolveKind() UpstreamKind {
 type Config struct {
 	// Transport selects the client-facing transport.
 	Transport Transport `yaml:"transport"`
-	// ListenAddr is the bind address for TransportHTTP (Фаза 2), e.g. ":28080".
+	// ListenAddr is the bind address for TransportHTTP (Phase 2), e.g. ":28080".
 	ListenAddr string `yaml:"listen_addr"`
 	// AuthToken, when non-empty, requires every incoming HTTP request to carry
 	// "Authorization: Bearer <token>". Use ${ENV_VAR} — never commit the value.
@@ -100,10 +101,18 @@ type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
 
 	// LogFile is where tool-call log records are written (JSON lines). Empty
-	// means stderr only.
+	// means stderr only. A relative path is resolved against the config
+	// file's directory, not the process's working directory (Load).
 	LogFile string `yaml:"log_file"`
 	// LogLevel is the slog level: "debug" | "info" | "warn" | "error".
 	LogLevel string `yaml:"log_level"`
+
+	// SkillFile, when set, points to a Markdown file that `mcp-gate skill`
+	// prints instead of the built-in deployment-independent guide — e.g. to
+	// add org-specific tool-usage policy or a translation. Unset uses the
+	// built-in text (internal/cli/skill.go), which needs no config to work.
+	// A relative path is resolved against the config file's directory (Load).
+	SkillFile string `yaml:"skill_file"`
 
 	// CallTimeout bounds a single upstream request (handshake, list, or call).
 	// Zero selects DefaultCallTimeout.
@@ -137,19 +146,47 @@ func (c *Config) EffectiveListenAddr() string {
 	return c.ListenAddr
 }
 
+// DefaultConfigName is the file Load looks for next to the running binary
+// when no --config path is given.
+const DefaultConfigName = "config.yaml"
+
+// defaultConfigPath returns <directory of the running binary>/config.yaml —
+// the location Load falls back to when path is empty.
+func defaultConfigPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate running binary to find its default config: %w", err)
+	}
+	return filepath.Join(filepath.Dir(exe), DefaultConfigName), nil
+}
+
 // Load reads and validates configuration from path.
 //
-// An empty path selects a minimal stdio default with no upstreams, so the
-// gateway can still start (and report an empty catalog) without a config file —
-// convenient for `version`/smoke runs. A non-empty path is read, has its string
-// values expanded against the environment (secrets), unmarshaled, and validated.
+// An empty path falls back to DefaultConfigName next to the running binary
+// (e.g. mcp-gate installed at /etc/gate/mcp-gate looks for
+// /etc/gate/config.yaml) — the gateway can be launched from any working
+// directory and still find its own config. If that default file does not
+// exist either, Load errors rather than silently starting an empty gateway
+// (found by user request).
+//
+// Once a path is settled, the file is read, has its string values expanded
+// against the environment (secrets), unmarshaled, and validated.
 func Load(path string) (*Config, error) {
+	usingDefault := false
 	if path == "" {
-		return &Config{Transport: TransportStdio, LogLevel: "info"}, nil
+		def, err := defaultConfigPath()
+		if err != nil {
+			return nil, err
+		}
+		path = def
+		usingDefault = true
 	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		if usingDefault {
+			return nil, fmt.Errorf("no --config given and no default config at %q: %w", path, err)
+		}
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 	// Expand ${VAR} / $VAR against the environment before parsing so secrets
@@ -169,10 +206,27 @@ func Load(path string) (*Config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	// Gateway-owned file paths (log, skill override) are relative to the
+	// config file's directory, not the process's working directory — the
+	// gateway can be launched from anywhere, but its config and the files it
+	// references live together (found by user request: avoids confusion when
+	// serve is run from a different cwd than the config lives in).
+	dir := filepath.Dir(path)
+	cfg.LogFile = resolveRelative(dir, cfg.LogFile)
+	cfg.SkillFile = resolveRelative(dir, cfg.SkillFile)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config %q: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// resolveRelative joins path onto dir when path is relative and non-empty;
+// absolute paths and the empty string pass through unchanged.
+func resolveRelative(dir, path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(dir, path)
 }
 
 // Validate checks invariants independent of I/O: known transport, unique and
