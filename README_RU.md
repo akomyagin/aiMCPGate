@@ -76,7 +76,24 @@ mcp-gate serve --config ./config-http.yaml
 # просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
+
+# сгенерировать случайный auth-токен (для HTTP-транспорта) и подсказку, куда его вписать:
+mcp-gate token --generate
+# показать auth-токен, заданный в конфиге:
+mcp-gate token --config ./config-http.yaml
+
+# напечатать готовые сниппеты конфига MCP-клиента (Claude Code / Cursor); требует
+# transport: http в конфиге, добавляет заголовок Bearer, если задан auth_token:
+mcp-gate client-config --config ./config-http.yaml
+
+# напечатать SKILL.md, обучающий агента работе с агрегированным каталогом
+# (по умолчанию встроенный текст; переопределяется через skill_file в конфиге):
+mcp-gate skill > .claude/skills/mcp-gate/SKILL.md
 ```
+
+Все команды, кроме `token --generate` и `skill` (та откатывается на встроенный
+текст), загружают конфиг: передайте `--config` или положите `config.yaml` рядом
+с бинарём (см. «Конфигурация» ниже).
 
 ## Конфигурация
 
@@ -87,6 +104,11 @@ mcp-gate logs --config ./config.yaml --upstream github --status err
 Относительные пути внутри конфига (`log_file`, `skill_file`) резолвятся
 относительно каталога **самого конфига**, не текущего рабочего каталога.
 
+> Примечание: поиск «рядом с бинарём» опирается на путь запущенного
+> исполняемого файла. При `go run ./cmd ...` это одноразовая сборка во временном
+> каталоге, поэтому дефолтный поиск `config.yaml` там не сработает — при `go run`
+> передавайте `--config` явно либо запускайте собранный бинарь.
+
 Полный пример со всеми полями — [`config.example.yaml`](config.example.yaml).
 Список upstream-серверов задаётся в YAML; **секреты (токены) — через env/`.env`**
 (подстановка `${VAR}` при загрузке), никогда не в конфиге под git. На upstream
@@ -95,7 +117,8 @@ mcp-gate logs --config ./config.yaml --upstream github --status err
 
 ```yaml
 transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
-listen_addr: ":28080"        # только для transport: http
+listen_addr: "127.0.0.1:28080"  # только для transport: http; по умолчанию loopback
+# auth_token: ${AIMCPGATE_TOKEN}  # обязателен, если listen_addr шире loopback
 log_file: ./logs/calls.jsonl
 upstreams:
   - name: filesystem        # stdio-upstream

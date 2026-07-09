@@ -6,8 +6,6 @@
 //   - CallRecord / CallLog: a structured record of every tool/resource call
 //     routed through the gateway (which upstream, what was called, latency,
 //     success/error), written as JSON lines for later inspection.
-//
-// Implementation — Stage 1+ (the call log currently discards records).
 package logging
 
 import (
