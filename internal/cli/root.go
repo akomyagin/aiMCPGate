@@ -1,5 +1,5 @@
 // Package cli assembles the aimcpgate command tree (cobra): serve, logs,
-// version. It is the thin seam between the process entry point (cmd/aimcpgate)
+// version. It is the thin seam between the process entry point (cmd/main.go)
 // and the gateway internals — main.go only builds the root command and executes
 // it (SKILL §1: one file per command, shared scaffold in root.go).
 package cli

@@ -8,7 +8,7 @@ before:
 
 builds:
   - id: aimcpgate
-    main: ./cmd/aimcpgate
+    main: ./cmd
     binary: aimcpgate
     # modernc.org's pure-Go stdlib deps aside, aiMCPGate has no CGO dependency at
     # all (no SQLite here) — CGO_ENABLED=0 is still stated explicitly so cross
