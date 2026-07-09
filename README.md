@@ -10,8 +10,7 @@
 > stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
 > клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`aimcpgate logs`);
 > релиз-пайплайн (`goreleaser`, кросс-компиляция linux/darwin/windows ×
-> amd64/arm64 без CGO). Разбивка по этапам —
-> [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) §8.
+> amd64/arm64 без CGO).
 
 ## Релизы
 
@@ -45,17 +44,12 @@ MCP-клиент ──stdio/HTTP──▶ aiMCPGate ──JSON-RPC──▶ ups
                           вызовов
 ```
 
-Подробнее — [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) §4.
-
 ## MVP (две фазы)
 
 - **Фаза 1** — мультиплексирование 2+ **stdio** upstream за одним **stdio**
   эндпоинтом (тот же транспорт, что видит Claude Code) + базовое логирование.
 - **Фаза 2** — **HTTP/SSE** транспорт, HTTP upstream-серверы, просмотрщик
   журнала (CLI/веб), опционально политика доступа.
-
-Границы — [`docs/PLAN.md`](docs/PLAN.md); за пределами MVP —
-[`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md).
 
 ## Сборка
 
@@ -110,14 +104,6 @@ upstreams:
       Authorization: "Bearer ${REMOTE_MCP_TOKEN}"   # секрет, не логируется
     enabled: true
 ```
-
-## Документация
-
-- [`docs/PLAN.md`](docs/PLAN.md) — продуктовое видение и границы MVP.
-- [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) — стек, архитектура
-  мультиплексора, разбивка по Этапам.
-- [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md) — идеи за пределами MVP.
-- [`CLAUDE.md`](CLAUDE.md) — инструкции и workflow для AI-сессий.
 
 ## Лицензия
 

@@ -25,3 +25,8 @@ go.work.sum
 # IDE
 .idea/
 .vscode/
+
+# Local-only docs and AI session files
+docs/
+CLAUDE.md
+.claude/
