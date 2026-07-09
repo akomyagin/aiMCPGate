@@ -116,9 +116,11 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 	resp, err := d.reg.CallTool(ctx, params.Name, params.Arguments)
 	if err != nil {
 		// Routing/transport failure (unknown tool, dead upstream, timeout):
-		// surface it as a JSON-RPC error under the client's id. The error string
-		// is a sanitized gateway message — it never contains the call arguments
-		// (which may hold secrets).
+		// surface it as a JSON-RPC error under the client's id. err.Error() is
+		// a sanitized gateway message (CallTool's job, not this dispatcher's)
+		// — never the call arguments (which may hold secrets), and never an
+		// upstream name or raw internal error string (gateway topology/
+		// internals), only the tool name the client itself already supplied.
 		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
 	}
 

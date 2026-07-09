@@ -24,6 +24,7 @@ type fakeUpstream struct {
 	tools     []string
 	initErr   error
 	listErr   error
+	callErr   error
 	nextID    atomic.Int64
 	lastArgs  json.RawMessage
 	lastNamed string
@@ -54,6 +55,9 @@ func (f *fakeUpstream) ListResources(context.Context) ([]mcp.Resource, error) { 
 func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
 	f.lastNamed = name
 	f.lastArgs = arguments
+	if f.callErr != nil {
+		return nil, f.callErr
+	}
 	// Use a private id counter to prove id spaces are separate from any other
 	// upstream / the registry.
 	id := mcp.IntID(f.nextID.Add(1))
@@ -167,6 +171,59 @@ func TestRegistryUnknownToolErrors(t *testing.T) {
 	defer r.Close()
 	if _, err := r.CallTool(context.Background(), "nope__nope", nil); err == nil {
 		t.Fatal("expected error for unknown tool")
+	}
+}
+
+// TestRegistryCallToolFailureSanitized is a regression test: CallTool's
+// returned error used to wrap the upstream name AGAIN (beyond what the
+// namespaced tool name already discloses) and the raw internal transport
+// error verbatim (`call %q on upstream %q: %w`) — since dispatch.go forwards
+// this error text straight to the client under CodeInternalError, that
+// leaked internal transport error strings (endpoints, connection details) to
+// anyone holding a valid auth_token (found by code review). The client only
+// ever gets back the tool name it itself supplied, matched exactly — proving
+// nothing beyond that survives.
+func TestRegistryCallToolFailureSanitized(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: true}}}
+	internal := errors.New("dial tcp 10.0.0.5:9443: connect: connection refused")
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
+		"secretname": {name: "secretname", tools: []string{"search"}, callErr: internal},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	_, err := r.CallTool(context.Background(), "secretname__search", nil)
+	if err == nil {
+		t.Fatal("expected error from failing upstream")
+	}
+	const want = `call "secretname__search" failed`
+	if err.Error() != want {
+		t.Errorf("error = %q, want exactly %q (no upstream-name clause or internal transport detail)", err.Error(), want)
+	}
+}
+
+// TestRegistryCallToolTimeoutSanitized confirms the one deliberate exception:
+// a timeout is reported as a timeout (useful, non-sensitive signal for the
+// caller), still with nothing beyond the client-supplied tool name.
+func TestRegistryCallToolTimeoutSanitized(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: true}}}
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
+		"secretname": {name: "secretname", tools: []string{"search"}, callErr: context.DeadlineExceeded},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	_, err := r.CallTool(context.Background(), "secretname__search", nil)
+	if err == nil {
+		t.Fatal("expected error from failing upstream")
+	}
+	const want = `call "secretname__search" timed out`
+	if err.Error() != want {
+		t.Errorf("error = %q, want exactly %q (no upstream-name clause)", err.Error(), want)
 	}
 }
 
