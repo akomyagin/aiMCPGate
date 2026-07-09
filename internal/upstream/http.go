@@ -16,6 +16,14 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
+// maxHTTPResponseBytes bounds a single upstream HTTP response body — the
+// application/json branch of call() used to decode with no limit at all
+// (found by code review) while the SSE branch already capped at this same
+// size, matching internal/mcp's line cap for the stdio side. A misbehaving
+// or malicious upstream could otherwise force the gateway to buffer an
+// unbounded response into memory.
+const maxHTTPResponseBytes = 32 << 20 // 32 MiB
+
 // HTTPConn is a live connection to one upstream MCP server reached over the
 // Streamable HTTP transport (MCP 2025-06-18). It is the second Upstream
 // implementation alongside StdioConn; both satisfy the registry.Upstream
@@ -225,7 +233,8 @@ func (c *HTTPConn) call(ctx context.Context, method string, params json.RawMessa
 	default:
 		// application/json (or unspecified): a single JSON-RPC object.
 		var msg mcp.Message
-		if err := json.NewDecoder(httpResp.Body).Decode(&msg); err != nil {
+		limited := io.LimitReader(httpResp.Body, maxHTTPResponseBytes+1)
+		if err := json.NewDecoder(limited).Decode(&msg); err != nil {
 			return nil, fmt.Errorf("upstream %q: %s: decode response: %w", c.name, method, err)
 		}
 		return &msg, nil
@@ -298,7 +307,7 @@ func (c *HTTPConn) post(ctx context.Context, msg *mcp.Message) (*http.Response, 
 // data payload as a Message.
 func (c *HTTPConn) readSSEResponse(body io.Reader, want json.RawMessage) (*mcp.Message, error) {
 	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 0, 64*1024), 32<<20) // match mcp codec's generous line cap
+	sc.Buffer(make([]byte, 0, 64*1024), maxHTTPResponseBytes)
 	for sc.Scan() {
 		line := sc.Text()
 		// Only data lines carry the JSON-RPC payload; event:/id:/retry:/comment
