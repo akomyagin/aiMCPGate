@@ -1,7 +1,7 @@
 // Package mcp implements the MCP JSON-RPC 2.0 message types and the stdio
 // framing codec used to talk to (and, later, as) MCP servers.
 //
-// Design decision (Этап 1, see docs/MCP_NOTES.md §1): aiMCPGate uses a thin
+// Design decision (Stage 1, see docs/MCP_NOTES.md §1): aiMCPGate uses a thin
 // hand-rolled JSON-RPC layer rather than the official Go SDK. The gateway is a
 // transparent multiplexer, so it must forward arbitrary — including unknown and
 // future — methods and fields without loss. To achieve that, Params/Result and

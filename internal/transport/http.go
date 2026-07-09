@@ -15,7 +15,7 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// httpServer is the Фаза 2 client-facing transport: it exposes the gateway as a
+// httpServer is the Phase 2 client-facing transport: it exposes the gateway as a
 // Streamable HTTP MCP endpoint (MCP 2025-06-18) so a client can reach it over
 // HTTP instead of launching it as a stdio subprocess. It is the second Server
 // implementation alongside stdioServer, sharing the same dispatcher for all MCP
@@ -34,7 +34,7 @@ import (
 // listen_addr defaults to loopback, but a user who widens it to a network
 // interface (config.example.yaml) would otherwise let any unauthenticated
 // caller stream an unbounded body into memory (found by independent
-// /code-review on Этап 5). MCP tool-call arguments are small JSON payloads, so
+// /code-review on Stage 5). MCP tool-call arguments are small JSON payloads, so
 // this is generous, not tight.
 const maxRequestBodyBytes = 4 << 20 // 4 MiB
 

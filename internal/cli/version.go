@@ -5,7 +5,7 @@ import (
 )
 
 // newVersionCmd prints the build version. The value is injected via -ldflags in
-// main (Этап 6 / goreleaser) and threaded through Build.
+// main (Stage 6 / goreleaser) and threaded through Build.
 func newVersionCmd(version string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",

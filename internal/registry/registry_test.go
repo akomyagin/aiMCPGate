@@ -194,6 +194,54 @@ func TestRegistryIsolatesFailedUpstream(t *testing.T) {
 	}
 }
 
+// An aggregator with nothing to aggregate has no reason to keep running: if
+// every configured upstream fails its handshake, Start must error instead of
+// leaving the gateway serving an empty catalog forever.
+func TestRegistryStartErrorsWhenAllUpstreamsFail(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "broken1", Enabled: true},
+		{Name: "broken2", Enabled: true},
+	}}
+	fakes := map[string]*fakeUpstream{
+		"broken1": {name: "broken1", initErr: errors.New("boom1")},
+		"broken2": {name: "broken2", initErr: errors.New("boom2")},
+	}
+	r := newTestRegistry(t, cfg, nil, fakes)
+	err := r.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start should error when every upstream fails, got nil")
+	}
+	defer r.Close()
+
+	// The error must name each upstream and its specific reason, not just
+	// point back at the logs — that's the whole point of collecting them.
+	for _, want := range []string{"broken1: handshake failed: boom1", "broken2: handshake failed: boom2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Start error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// Same reasoning applies with zero upstreams configured at all (or all
+// disabled): there is nothing to serve, so Start must error rather than
+// succeed with an empty catalog.
+func TestRegistryStartErrorsWithNoEnabledUpstreams(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "disabled", Enabled: false},
+	}}
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
+		"disabled": {name: "disabled", tools: []string{"x"}},
+	})
+	err := r.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start should error with zero enabled upstreams, got nil")
+	}
+	if !strings.Contains(err.Error(), "no upstream is enabled") {
+		t.Errorf("Start error = %q, want it to explain nothing was enabled", err)
+	}
+	defer r.Close()
+}
+
 // The call log must record metadata but never the arguments (which may hold
 // secrets like tokens).
 func TestRegistryCallLogHasNoSecrets(t *testing.T) {

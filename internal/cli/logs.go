@@ -14,9 +14,9 @@ import (
 )
 
 // newLogsCmd reads and filters the JSON-lines tool-call log written by the
-// gateway (logging.CallRecord). This is the Фаза 2 log viewer in its simplest
+// gateway (logging.CallRecord). This is the Phase 2 log viewer in its simplest
 // form — a terminal command, which the plan explicitly allows in lieu of a web
-// view ("CLI-команда истории ИЛИ минимальный веб-вью"). It only reads; it never
+// view ("a CLI history command OR a minimal web view"). It only reads; it never
 // touches the running gateway.
 func newLogsCmd() *cobra.Command {
 	var (
@@ -55,21 +55,19 @@ func newLogsCmd() *cobra.Command {
 }
 
 // resolveLogFile picks the log path: an explicit --file wins; otherwise the
-// log_file from --config. An empty result means the gateway logged to stderr,
-// which cannot be read back — reported as an actionable error.
+// log_file from --config (or the default config next to the binary, per
+// config.Load). An empty result means the gateway logged to stderr, which
+// cannot be read back — reported as an actionable error.
 func resolveLogFile(file, configPath string) (string, error) {
 	if file != "" {
 		return file, nil
-	}
-	if configPath == "" {
-		return "", fmt.Errorf("no log file: pass --file, or --config pointing at a config with log_file set")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return "", fmt.Errorf("load config: %w", err)
 	}
 	if cfg.LogFile == "" {
-		return "", fmt.Errorf("config %q has no log_file (the gateway logged to stderr, which cannot be read back)", configPath)
+		return "", fmt.Errorf("config has no log_file (the gateway logged to stderr, which cannot be read back)")
 	}
 	return cfg.LogFile, nil
 }

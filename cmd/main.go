@@ -18,7 +18,7 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/cli"
 )
 
-// version is overridden at build time via -ldflags (see Этап 6 / goreleaser).
+// version is overridden at build time via -ldflags (see Stage 6 / goreleaser).
 var version = "0.0.0-dev"
 
 func main() {

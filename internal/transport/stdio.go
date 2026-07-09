@@ -11,7 +11,7 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// stdioServer is the Фаза 1 client-facing transport: it serves exactly ONE MCP
+// stdioServer is the Phase 1 client-facing transport: it serves exactly ONE MCP
 // client over a stdin/stdout pipe pair (the way Claude Code launches a local
 // MCP server) and dispatches the client's JSON-RPC requests against the
 // aggregated registry.

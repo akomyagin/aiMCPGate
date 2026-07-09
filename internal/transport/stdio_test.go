@@ -262,7 +262,7 @@ func TestStdioResourcesListIsEmpty(t *testing.T) {
 		t.Fatalf("decode resources/list: %v", err)
 	}
 	if len(res.Resources) != 0 {
-		t.Errorf("resources/list should be empty in Фаза 1, got %d", len(res.Resources))
+		t.Errorf("resources/list should be empty in Phase 1, got %d", len(res.Resources))
 	}
 }
 
