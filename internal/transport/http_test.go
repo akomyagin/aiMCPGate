@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
@@ -299,5 +300,36 @@ func TestHTTPServerGETNotAllowed(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /mcp status = %d, want 405 (no SSE server-stream in MVP)", resp.StatusCode)
+	}
+}
+
+// TestHTTPServerTimeoutsConfigured is a regression test: the *http.Server
+// used to set only ReadHeaderTimeout, leaving the body-read phase and idle
+// keep-alive connections unbounded — a slow-body/slowloris-style DoS vector
+// once listen_addr is widened past loopback (found by code review).
+func TestHTTPServerTimeoutsConfigured(t *testing.T) {
+	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil), quietLogger(), "test")
+	srv := hs.buildServer(http.NewServeMux())
+
+	if srv.ReadHeaderTimeout <= 0 {
+		t.Error("ReadHeaderTimeout must be set")
+	}
+	if srv.ReadTimeout <= 0 {
+		t.Error("ReadTimeout must be set")
+	}
+	if srv.IdleTimeout <= 0 {
+		t.Error("IdleTimeout must be set")
+	}
+	// WriteTimeout covers the whole handler (net/http docs), not just the
+	// network write, so it must comfortably exceed the configured
+	// call_timeout — otherwise a legitimate slow upstream call gets cut off
+	// before EffectiveCallTimeout ever has a chance to fire.
+	wantWrite := cfg.CallTimeout + httpWriteTimeoutSlack
+	if srv.WriteTimeout != wantWrite {
+		t.Errorf("WriteTimeout = %v, want %v (call_timeout + slack)", srv.WriteTimeout, wantWrite)
+	}
+	if srv.WriteTimeout <= cfg.CallTimeout {
+		t.Errorf("WriteTimeout (%v) must exceed call_timeout (%v), or legitimate slow calls get cut off first", srv.WriteTimeout, cfg.CallTimeout)
 	}
 }
