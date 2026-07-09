@@ -104,6 +104,94 @@ upstreams:
 	}
 }
 
+// TestLoadExpandsOnlyAuthToken confirms auth_token (a top-level secret field)
+// is expanded the same way upstream env/headers are.
+func TestLoadExpandsOnlyAuthToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := "transport: http\nauth_token: ${TEST_AUTH_TOKEN}\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_AUTH_TOKEN", "t0ken")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthToken != "t0ken" {
+		t.Errorf("auth_token = %q, want env-expanded 't0ken'", cfg.AuthToken)
+	}
+}
+
+// TestLoadDoesNotMangleLiteralDollarSigns is a regression test: expansion
+// used to run over the entire raw file before parsing, so any literal '$' in
+// a URL, a command argument, or a path — not just in fields meant to carry
+// ${VAR} references — was silently corrupted by os.ExpandEnv (found by code
+// review; reproduced with a password containing '$' before the fix). Only
+// auth_token and upstream env/headers values are expanded; everything else
+// must survive byte-for-byte.
+func TestLoadDoesNotMangleLiteralDollarSigns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: local
+    command: /opt/tools$5/bin/mcp
+    args: ["--password=p$$w0rd", "https://user:p$$ss@host/mcp"]
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	u := cfg.Upstreams[0]
+	if u.Command != "/opt/tools$5/bin/mcp" {
+		t.Errorf("command = %q, want literal '$' preserved", u.Command)
+	}
+	wantArgs := []string{"--password=p$$w0rd", "https://user:p$$ss@host/mcp"}
+	for i, want := range wantArgs {
+		if u.Args[i] != want {
+			t.Errorf("args[%d] = %q, want literal %q", i, u.Args[i], want)
+		}
+	}
+}
+
+// TestLoadExpandsUpstreamEnvValues confirms per-upstream env map values
+// (e.g. GITHUB_TOKEN passed to a stdio child process) are expanded, matching
+// the documented secrets mechanism (config.example.yaml).
+func TestLoadExpandsUpstreamEnvValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: gh
+    command: github-mcp-server
+    env:
+      GITHUB_TOKEN: ${TEST_GITHUB_TOKEN}
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_GITHUB_TOKEN", "gh-s3cr3t")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Upstreams[0].Env["GITHUB_TOKEN"]
+	if got != "gh-s3cr3t" {
+		t.Errorf("env GITHUB_TOKEN = %q, want env-expanded 'gh-s3cr3t'", got)
+	}
+}
+
 func TestLoadResolvesFilePathsAgainstConfigDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "config.yaml")
