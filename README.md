@@ -86,7 +86,7 @@ aimcpgate logs --config ./config.yaml --upstream github --status err
 
 ```yaml
 transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
-listen_addr: ":8080"        # только для transport: http
+listen_addr: ":28080"        # только для transport: http
 log_file: ./logs/calls.jsonl
 upstreams:
   - name: filesystem        # stdio-upstream
