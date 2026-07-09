@@ -8,7 +8,7 @@
 
 > Статус: **MVP завершён (Этапы 0–6)**. Фаза 1 — мультиплексирование
 > stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
-> клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`aimcpgate logs`);
+> клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`mcp-gate logs`);
 > релиз-пайплайн (`goreleaser`, кросс-компиляция linux/darwin/windows ×
 > amd64/arm64 без CGO).
 
@@ -66,14 +66,14 @@ go run ./cmd version
 
 ```bash
 # stdio-режим (клиент запускает шлюз как подпроцесс):
-aimcpgate serve --config ./config.yaml
+mcp-gate serve --config ./config.yaml
 
 # http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp:
-aimcpgate serve --config ./config-http.yaml
+mcp-gate serve --config ./config-http.yaml
 
 # просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
-aimcpgate logs --file ./logs/calls.jsonl --tail 50
-aimcpgate logs --config ./config.yaml --upstream github --status err
+mcp-gate logs --file ./logs/calls.jsonl --tail 50
+mcp-gate logs --config ./config.yaml --upstream github --status err
 ```
 
 ## Конфигурация

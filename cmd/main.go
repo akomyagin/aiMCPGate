@@ -1,4 +1,4 @@
-// Command aimcpgate is the entry point for the aiMCPGate MCP gateway.
+// Command mcp-gate is the entry point for the aiMCPGate MCP gateway.
 //
 // aiMCPGate is a Model Context Protocol (MCP) gateway/proxy: it presents a
 // single MCP endpoint to a client (e.g. Claude Code) and multiplexes

@@ -200,6 +200,94 @@ func TestHTTPServerParseErrorReturns400(t *testing.T) {
 	}
 }
 
+// startHTTPGatewayWithAuth is like startHTTPGateway but configures an auth token.
+func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, func()) {
+	t.Helper()
+	bin := buildFakeServer(t)
+	cfg := &config.Config{
+		Transport: config.TransportHTTP,
+		AuthToken: token,
+		Upstreams: []config.Upstream{
+			{Name: "github", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_NAME":  "github",
+				"FAKE_TOOLS": "search",
+			}},
+		},
+	}
+	reg := registry.New(cfg, quietLogger(), nil)
+	if err := reg.Start(context.Background()); err != nil {
+		t.Fatalf("registry Start: %v", err)
+	}
+	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", hs.authMiddleware(http.HandlerFunc(hs.handleMCP)))
+	srv := httptest.NewServer(mux)
+	return srv, func() { srv.Close(); _ = reg.Close() }
+}
+
+// postWithAuth sends one JSON-RPC message with an Authorization header.
+func postWithAuth(t *testing.T, srv *httptest.Server, msg *mcp.Message, token string) *http.Response {
+	t.Helper()
+	body, err := mcp.Encode(msg)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	return resp
+}
+
+func TestHTTPServerAuthTokenRequired(t *testing.T) {
+	const token = "test-secret-token"
+	srv, cleanup := startHTTPGatewayWithAuth(t, token)
+	defer cleanup()
+
+	msg := mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil)
+
+	// No header → 401.
+	resp := postWithAuth(t, srv, msg, "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no auth header: status = %d, want 401", resp.StatusCode)
+	}
+
+	// Wrong token → 401.
+	resp = postWithAuth(t, srv, msg, "wrong-token")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status = %d, want 401", resp.StatusCode)
+	}
+
+	// Correct token → 200.
+	resp = postWithAuth(t, srv, msg, token)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("correct token: status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestHTTPServerNoAuthTokenAllowsAll(t *testing.T) {
+	srv, cleanup := startHTTPGateway(t) // no token configured
+	defer cleanup()
+
+	// Any request (even without Authorization header) must succeed.
+	resp := post(t, srv, mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("no-auth gateway: status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+}
+
 func TestHTTPServerGETNotAllowed(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()

@@ -43,7 +43,7 @@ func runServe(parent context.Context, configPath, version string) error {
 	}
 
 	logger := logging.New(cfg.LogLevel, os.Stderr)
-	logger.Info("aimcpgate starting", "version", version, "transport", cfg.Transport)
+	logger.Info("mcp-gate starting", "version", version, "transport", cfg.Transport)
 
 	callLog, err := logging.NewCallLog(cfg.LogFile)
 	if err != nil {

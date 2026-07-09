@@ -7,14 +7,17 @@
 # gateway. "stdio" (Фаза 1) launches the gateway as a subprocess; "http" (Фаза 2)
 # exposes a Streamable HTTP endpoint at http://<listen_addr>/mcp.
 transport: stdio            # stdio | http
-# Loopback-only by default: the HTTP endpoint has no client authentication
-# yet, so binding to all interfaces would expose every aggregated upstream
-# tool to the whole LAN. Only widen this (e.g. "0.0.0.0:28080") if you
-# specifically intend to serve the gateway over the network.
+# Loopback-only by default. To serve over the network set a routable address
+# AND set auth_token so the endpoint is not open to the whole LAN.
 listen_addr: "127.0.0.1:28080" # only used when transport: http
+# auth_token protects the HTTP endpoint: every request must carry
+# "Authorization: Bearer <token>". Use ${ENV_VAR} — never commit the value.
+# Omit (or leave empty) for loopback-only deployments where network auth is
+# unnecessary.
+# auth_token: ${AIMCPGATE_TOKEN}
 
 # Where the JSON-lines tool-call log is written. Empty → stderr only.
-# `aimcpgate logs --file <this>` reads it back.
+# `mcp-gate logs --file <this>` reads it back.
 log_file: ./logs/calls.jsonl
 log_level: info             # debug | info | warn | error
 call_timeout: 30s           # bounds one upstream request (handshake/list/call)

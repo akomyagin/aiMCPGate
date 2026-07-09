@@ -8,7 +8,7 @@ import (
 )
 
 // TestCallLogRoundTrip writes records through the JSON-lines writer and reads
-// them back with ReadRecords — the exact path `aimcpgate logs` uses.
+// them back with ReadRecords — the exact path `mcp-gate logs` uses.
 func TestCallLogRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	log := NewCallLogWriter(&buf)

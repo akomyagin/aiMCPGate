@@ -7,9 +7,9 @@ before:
     - go mod download
 
 builds:
-  - id: aimcpgate
+  - id: mcp-gate
     main: ./cmd
-    binary: aimcpgate
+    binary: mcp-gate
     # modernc.org's pure-Go stdlib deps aside, aiMCPGate has no CGO dependency at
     # all (no SQLite here) — CGO_ENABLED=0 is still stated explicitly so cross
     # compilation to darwin/windows never silently depends on a C toolchain.
@@ -27,8 +27,8 @@ builds:
       - -X main.version={{.Version}}
 
 archives:
-  - id: aimcpgate
-    name_template: "aimcpgate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: mcp-gate
+    name_template: "mcp-gate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats:
       - tar.gz
     format_overrides:

@@ -111,7 +111,7 @@ func (l *jsonCallLog) Close() error {
 }
 
 // ReadRecords decodes CallRecords from a JSON-lines stream (the format
-// NewCallLog writes). It is the read side consumed by the `aimcpgate logs`
+// NewCallLog writes). It is the read side consumed by the `mcp-gate logs`
 // command. A line that fails to decode is skipped rather than aborting the whole
 // read, so a partially-written trailing line (the writer crashed mid-append)
 // does not hide the records before it. CallRecord is the single shared shape

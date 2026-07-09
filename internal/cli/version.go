@@ -9,7 +9,7 @@ import (
 func newVersionCmd(version string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
-		Short: "Print the aimcpgate build version",
+		Short: "Print the mcp-gate build version",
 		Run: func(cmd *cobra.Command, _ []string) {
 			cmd.Println(version)
 		},

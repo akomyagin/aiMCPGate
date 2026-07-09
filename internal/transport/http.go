@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -38,18 +39,20 @@ import (
 const maxRequestBodyBytes = 4 << 20 // 4 MiB
 
 type httpServer struct {
-	reg  *registry.Registry
-	log  *slog.Logger
-	d    *dispatcher
-	addr string
+	reg       *registry.Registry
+	log       *slog.Logger
+	d         *dispatcher
+	addr      string
+	authToken string
 }
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
 	return &httpServer{
-		reg:  reg,
-		log:  log,
-		d:    newDispatcher(reg, log, version),
-		addr: cfg.EffectiveListenAddr(),
+		reg:       reg,
+		log:       log,
+		d:         newDispatcher(reg, log, version),
+		addr:      cfg.EffectiveListenAddr(),
+		authToken: cfg.AuthToken,
 	}
 }
 
@@ -63,7 +66,7 @@ func (s *httpServer) Serve(ctx context.Context) error {
 	defer func() { _ = s.reg.Close() }()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", s.handleMCP)
+	mux.Handle("/mcp", s.authMiddleware(http.HandlerFunc(s.handleMCP)))
 
 	srv := &http.Server{
 		Addr:              s.addr,
@@ -136,6 +139,26 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, reply)
+}
+
+// authMiddleware rejects requests without a valid "Authorization: Bearer <token>"
+// header when AuthToken is configured. Skipped entirely when AuthToken is empty
+// (loopback-only deployments). Uses constant-time comparison to prevent timing
+// attacks even though tokens are not cryptographic secrets in practice.
+func (s *httpServer) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		want := "Bearer " + s.authToken
+		got := r.Header.Get("Authorization")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // writeJSON encodes a single MCP message as an application/json response. Errors
