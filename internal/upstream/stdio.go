@@ -62,6 +62,17 @@ type StdioConn struct {
 	done       chan struct{} // closed when the reader goroutine exits
 	stderrDone chan struct{} // closed when the stderr-draining goroutine exits
 
+	// closeOnce guards the actual teardown so Close is safe for CONCURRENT
+	// calls, not just repeated sequential ones: Stage 7 introduced the first
+	// callers that can race to close the same connection (the auto-restart
+	// supervisor reaping a crashed process vs. hot-reload retiring the same
+	// upstream). cmd.Wait must not be called twice concurrently — it mutates
+	// *exec.Cmd's internal state without synchronization for that case — so
+	// every caller after the first must get the same cached result instead of
+	// re-running the teardown (found by independent review).
+	closeOnce sync.Once
+	closeErr  error
+
 	// onNotify, when set, is invoked by readLoop for each notification method
 	// received from the upstream (e.g. notifications/tools/list_changed). The
 	// registry sets it to react to a catalog change (Stage 7b). It is set once,
@@ -267,8 +278,18 @@ func (c *StdioConn) Notify(method string, params json.RawMessage) error {
 }
 
 // Close closes the child's stdin (signalling shutdown per the MCP stdio
-// lifecycle) and waits for it to exit. Safe to call more than once.
+// lifecycle) and waits for it to exit. Safe to call more than once, including
+// CONCURRENTLY from multiple goroutines: the actual teardown runs exactly
+// once (closeOnce); every caller gets the same result.
 func (c *StdioConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.closeAndWait()
+	})
+	return c.closeErr
+}
+
+// closeAndWait is Close's one-time body.
+func (c *StdioConn) closeAndWait() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()

@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +98,88 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 	// racing the exact instant between a crash and the next relaunch.
 	if !callSucceedsWithin(r, "crasher__ping", 5*time.Second) {
 		t.Fatal("restarted upstream never answered a call within the deadline")
+	}
+}
+
+// countZombieChildren scans /proc for zombie (state Z) processes whose parent
+// is the CURRENT test process — i.e. a stdio-upstream child this test spawned
+// that exited but was never reaped via wait() (cmd.Wait, which only runs
+// inside StdioConn.Close). Skips (not fails) if /proc is unavailable.
+func countZombieChildren(t *testing.T) int {
+	t.Helper()
+	myPID := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Skipf("cannot read /proc (non-Linux?): %v", err)
+	}
+	count := 0
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// Format: "pid (comm) state ppid ...". comm may itself contain
+		// spaces/parens, so split on the LAST ')' before reading state/ppid.
+		close := strings.LastIndex(string(data), ")")
+		if close < 0 {
+			continue
+		}
+		fields := strings.Fields(string(data)[close+1:])
+		if len(fields) < 2 || fields[0] != "Z" {
+			continue
+		}
+		if ppid, err := strconv.Atoi(fields[1]); err == nil && ppid == myPID {
+			count++
+		}
+	}
+	return count
+}
+
+// TestSupervisorReapsCrashedProcess is a regression test: the auto-restart
+// supervisor used to relaunch a crashed upstream via replaceUpstream WITHOUT
+// ever closing the OLD (dead) connection — nothing else held a reference to
+// it once the registry's map entry was overwritten, so cmd.Wait() was never
+// called for it. On Linux that leaves the exited child as a permanent zombie
+// (and leaks this side's pipe fds) for the rest of the gateway's lifetime,
+// once per crash-restart cycle (found by independent review; confirmed via
+// /proc before the fix, 1 new zombie per cycle).
+func TestSupervisorReapsCrashedProcess(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			MaxAttempts:    5,
+		},
+		Upstreams: []config.Upstream{
+			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":      "ping",
+				"FAKE_ECHO":       "1",
+				"FAKE_EXIT_AFTER": "1",
+			}},
+		},
+	}
+	r := New(cfg, quietLogger(), nil)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	before := countZombieChildren(t)
+
+	// Trigger the crash (fakeserver exits after answering, FAKE_EXIT_AFTER=1)
+	// and wait for the supervisor to relaunch it.
+	if _, err := r.CallTool(context.Background(), "crasher__ping", nil); err != nil {
+		t.Fatalf("first CallTool: %v", err)
+	}
+	waitForTool(t, r, "crasher__ping", 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let the reap (cmd.Wait) actually land
+
+	after := countZombieChildren(t)
+	if after > before {
+		t.Errorf("crashed upstream process was not reaped: %d new zombie(s) after one restart cycle (before=%d, after=%d)",
+			after-before, before, after)
 	}
 }
 

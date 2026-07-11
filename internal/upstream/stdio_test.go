@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,6 +218,44 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 	if got != lines {
 		t.Errorf("captured %d of %d stderr lines by the time Close returned; "+
 			"Close must wait for stderr to fully drain before reaping the process", got, lines)
+	}
+}
+
+// TestStdioConnCloseIsSafeForConcurrentCallers is a regression test: Stage 7
+// introduced the first callers that can race to Close the SAME connection
+// (the auto-restart supervisor reaping a crash vs. hot-reload retiring the
+// same upstream). cmd.Wait mutates *exec.Cmd's internal state and is not
+// documented safe to call concurrently from two goroutines, so every caller
+// after the first must observe the SAME result rather than re-running the
+// teardown (found by independent review). Run with -race: without the
+// closeOnce guard this reliably races on cmd.Wait's internal state.
+func TestStdioConnCloseIsSafeForConcurrentCallers(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx := context.Background()
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"})
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	const callers = 10
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = conn.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != errs[0] {
+			t.Errorf("Close() call %d returned %v, want the same cached result as call 0 (%v)", i, err, errs[0])
+		}
 	}
 }
 

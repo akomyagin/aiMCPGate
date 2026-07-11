@@ -360,7 +360,7 @@ func (r *Registry) superviseUpstream(u config.Upstream, conn Upstream) {
 	r.supervisors.Add(1)
 	go func() {
 		defer r.supervisors.Done()
-		r.supervise(u, done, stop, policy)
+		r.supervise(u, conn, done, stop, policy)
 	}()
 }
 
@@ -383,7 +383,14 @@ func (r *Registry) stopSupervisor(name string) {
 // NEW connection's done channel; each failure backs off (exponentially, capped
 // at MaxBackoff) and retries up to MaxAttempts (0 = unlimited). Exhausting the
 // attempts leaves the upstream out of the catalog — the MVP terminal state.
-func (r *Registry) supervise(u config.Upstream, done <-chan struct{}, stop <-chan struct{}, policy config.RestartPolicy) {
+//
+// conn is tracked (not just its done channel) so a confirmed real crash can be
+// reaped via conn.Close() before relaunching — otherwise cmd.Wait() is never
+// called for the dead process and it leaks as a zombie plus its pipe fds
+// forever, since nothing else holds a reference to it once replaceUpstream
+// overwrites the registry's map entry (found by independent review;
+// reproduced with a /proc zombie-count check).
+func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struct{}, stop <-chan struct{}, policy config.RestartPolicy) {
 	for {
 		select {
 		case <-r.procCtx.Done():
@@ -393,16 +400,27 @@ func (r *Registry) supervise(u config.Upstream, done <-chan struct{}, stop <-cha
 		case <-done:
 			// The process died. If procCtx is also done, it died BECAUSE we are
 			// shutting down; if stop is closed, reload deliberately Closed it.
-			// Either way, do not restart — just exit.
+			// Either way, do not restart — just exit. In both cases some other
+			// path (Registry.Close's own loop, or retireAndClose) already owns
+			// (or will own) closing conn, so we must NOT close it here too —
+			// that would double-close via a different goroutine, which
+			// StdioConn.Close's sync.Once now tolerates safely, but touching a
+			// connection this code no longer owns is still the wrong call to
+			// make.
 			if r.procCtx.Err() != nil || isClosed(stop) {
 				return
 			}
+			// A genuine crash, not a deliberate shutdown/retire: reap it before
+			// attempting to relaunch.
+			if err := conn.Close(); err != nil {
+				r.log.Debug("close crashed upstream", "upstream", u.Name, "err", err)
+			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
-			newDone, ok := r.restart(u, stop, policy)
+			newConn, newDone, ok := r.restart(u, stop, policy)
 			if !ok {
 				return // restart gave up (attempts exhausted), retired, or shutting down.
 			}
-			done = newDone // watch the freshly-restarted connection.
+			conn, done = newConn, newDone // watch the freshly-restarted connection.
 		}
 	}
 }
@@ -419,13 +437,15 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
-// restart re-launches a dead stdio upstream with exponential backoff, returning
-// the new connection's done channel on success. It returns ok=false when the
-// attempt budget is exhausted (upstream left out of the catalog), the upstream
-// was retired by reload (stop), or the gateway is shutting down. On each
-// successful relaunch it swaps the connection and catalog atomically via
-// replaceUpstream so a client never sees a torn catalog.
-func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy config.RestartPolicy) (<-chan struct{}, bool) {
+// restart re-launches a dead stdio upstream with exponential backoff,
+// returning the new connection and its done channel on success — the caller
+// (supervise) must keep the returned conn to close it on the NEXT crash. It
+// returns ok=false when the attempt budget is exhausted (upstream left out of
+// the catalog), the upstream was retired by reload (stop), or the gateway is
+// shutting down. On each successful relaunch it swaps the connection and
+// catalog atomically via replaceUpstream so a client never sees a torn
+// catalog.
+func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy config.RestartPolicy) (Upstream, <-chan struct{}, bool) {
 	backoff := policy.InitialBackoff
 	for attempt := 1; policy.MaxAttempts == 0 || attempt <= policy.MaxAttempts; attempt++ {
 		// Wait out the backoff, but abandon it immediately on shutdown or retire.
@@ -433,10 +453,10 @@ func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy confi
 		select {
 		case <-r.procCtx.Done():
 			timer.Stop()
-			return nil, false
+			return nil, nil, false
 		case <-stop:
 			timer.Stop()
-			return nil, false
+			return nil, nil, false
 		case <-timer.C:
 		}
 
@@ -457,18 +477,18 @@ func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy confi
 			// Guard anyway so a future non-stdio path cannot silently spin.
 			_ = conn.Close()
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
-			return nil, false
+			return nil, nil, false
 		}
 		r.replaceUpstream(u.Name, conn, tools)
 		r.notifyCatalogChanged()
 		r.log.Info("stdio upstream restarted", "upstream", u.Name, "attempt", attempt, "tools", len(tools))
-		return newDone, true
+		return conn, newDone, true
 	}
 	r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
 		"upstream", u.Name, "max_attempts", policy.MaxAttempts)
 	r.dropUpstream(u.Name)
 	r.notifyCatalogChanged()
-	return nil, false
+	return nil, nil, false
 }
 
 // onUpstreamNotification handles a notification pushed by a stdio upstream
