@@ -243,3 +243,94 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 		t.Fatal("Close did not return; supervisor likely not stopped")
 	}
 }
+
+// TestUpstreamListChangedRefreshesCatalog is the Stage 7b test: a stdio upstream
+// sends notifications/tools/list_changed and changes its advertised tool set;
+// the registry must re-list that upstream and update the aggregated catalog. The
+// fakeserver reads its tools from FAKE_TOOLS_FILE on every tools/list and emits
+// a list_changed when FAKE_NOTIFY_FILE becomes non-empty.
+func TestUpstreamListChangedRefreshesCatalog(t *testing.T) {
+	bin := buildFakeServer(t)
+	dir := t.TempDir()
+	toolsFile := filepath.Join(dir, "tools")
+	notifyFile := filepath.Join(dir, "notify")
+	if err := os.WriteFile(toolsFile, []byte("ping"), 0o600); err != nil {
+		t.Fatalf("seed tools file: %v", err)
+	}
+
+	cfg := &config.Config{
+		// Disable restart so the only catalog change under test is the list_changed
+		// re-list, not a spurious auto-restart.
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			{Name: "dyn", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS_FILE":  toolsFile,
+				"FAKE_NOTIFY_FILE": notifyFile,
+			}},
+		},
+	}
+	r := New(cfg, quietLogger(), nil)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	// Initially only ping is advertised.
+	waitForTool(t, r, "dyn__ping", 2*time.Second)
+
+	// Change the tool set, then poke the notify file so the upstream emits
+	// list_changed. The registry must re-list and pick up the new tool.
+	if err := os.WriteFile(toolsFile, []byte("ping,pong"), 0o600); err != nil {
+		t.Fatalf("update tools file: %v", err)
+	}
+	if err := os.WriteFile(notifyFile, []byte("go"), 0o600); err != nil {
+		t.Fatalf("touch notify file: %v", err)
+	}
+
+	waitForTool(t, r, "dyn__pong", 5*time.Second)
+}
+
+// TestUpstreamListChangedNotifiesSubscribers checks that a re-list driven by an
+// upstream list_changed also fans out a catalog-change signal to subscribers
+// (the client-facing transport), so the client is told to re-list too.
+func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
+	bin := buildFakeServer(t)
+	dir := t.TempDir()
+	toolsFile := filepath.Join(dir, "tools")
+	notifyFile := filepath.Join(dir, "notify")
+	if err := os.WriteFile(toolsFile, []byte("ping"), 0o600); err != nil {
+		t.Fatalf("seed tools file: %v", err)
+	}
+
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			{Name: "dyn", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS_FILE":  toolsFile,
+				"FAKE_NOTIFY_FILE": notifyFile,
+			}},
+		},
+	}
+	r := New(cfg, quietLogger(), nil)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	sub, unsub := r.Subscribe()
+	defer unsub()
+
+	if err := os.WriteFile(toolsFile, []byte("ping,pong"), 0o600); err != nil {
+		t.Fatalf("update tools file: %v", err)
+	}
+	if err := os.WriteFile(notifyFile, []byte("go"), 0o600); err != nil {
+		t.Fatalf("touch notify file: %v", err)
+	}
+
+	select {
+	case <-sub:
+		// success: subscriber was signalled about the catalog change.
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber not signalled after upstream list_changed re-list")
+	}
+}

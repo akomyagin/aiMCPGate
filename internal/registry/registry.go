@@ -113,22 +113,35 @@ type Registry struct {
 	subMu       sync.Mutex
 	subscribers map[int]chan struct{}
 	nextSubID   int
+
+	// relistMu guards relistTimers, the per-upstream debounce timers for
+	// tools/list_changed notifications (Stage 7b). A "noisy" upstream firing a
+	// burst of list_changed must not trigger a re-list storm, so each
+	// notification (re)arms a short timer and only its expiry runs the re-list.
+	relistMu     sync.Mutex
+	relistTimers map[string]*time.Timer
 }
+
+// relistDebounce is how long the registry waits after the last tools/list_
+// changed from an upstream before re-listing it. Short enough to feel live,
+// long enough to collapse a rapid burst into a single re-list (Stage 7b).
+const relistDebounce = 200 * time.Millisecond
 
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
 func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
-		cfg:         cfg,
-		log:         logger,
-		callLog:     callLog,
-		conns:       map[string]Upstream{},
-		tools:       map[string]ToolDescriptor{},
-		toolRoute:   map[string]route{},
-		subscribers: map[int]chan struct{}{},
-		procCtx:     procCtx,
-		procCancel:  procCancel,
+		cfg:          cfg,
+		log:          logger,
+		callLog:      callLog,
+		conns:        map[string]Upstream{},
+		tools:        map[string]ToolDescriptor{},
+		toolRoute:    map[string]route{},
+		subscribers:  map[int]chan struct{}{},
+		relistTimers: map[string]*time.Timer{},
+		procCtx:      procCtx,
+		procCancel:   procCancel,
 	}
 	r.start = r.startUpstream
 	return r
@@ -247,6 +260,15 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	conn, err := r.start(r.procCtx, u)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start: %w", err)
+	}
+
+	// Wire up upstream→registry notifications (Stage 7b) before the handshake,
+	// so a list_changed that arrives immediately is not missed. Only stdio
+	// upstreams push notifications (HTTP has no long-lived reader — documented
+	// limitation), so this is a type-assertion, like Done()/doneChan.
+	if n, ok := conn.(interface{ OnNotification(func(string)) }); ok {
+		name := u.Name
+		n.OnNotification(func(method string) { r.onUpstreamNotification(name, method) })
 	}
 
 	initCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -387,6 +409,60 @@ func (r *Registry) restart(u config.Upstream, policy config.RestartPolicy) (<-ch
 	r.dropUpstream(u.Name)
 	r.notifyCatalogChanged()
 	return nil, false
+}
+
+// onUpstreamNotification handles a notification pushed by a stdio upstream
+// (Stage 7b). It runs on that upstream's single reader goroutine, so it must
+// not block or re-enter the connection: for tools/list_changed it only (re)arms
+// a debounce timer whose expiry does the actual re-list on a fresh goroutine.
+// Other notification methods are ignored (resources are not aggregated yet).
+func (r *Registry) onUpstreamNotification(name, method string) {
+	if method != mcp.NotifToolsListChanged {
+		return
+	}
+	r.relistMu.Lock()
+	defer r.relistMu.Unlock()
+	if t, ok := r.relistTimers[name]; ok {
+		t.Reset(relistDebounce)
+		return
+	}
+	// AfterFunc fires on its own goroutine, so relistUpstream (which does
+	// blocking RPCs) never runs on the reader goroutine.
+	r.relistTimers[name] = time.AfterFunc(relistDebounce, func() {
+		r.relistMu.Lock()
+		delete(r.relistTimers, name)
+		r.relistMu.Unlock()
+		r.relistUpstream(name)
+	})
+}
+
+// relistUpstream re-fetches one upstream's tools after it announced a change,
+// swaps its catalog atomically (replaceUpstream), and tells the client
+// (notifyCatalogChanged). It runs off the debounce timer, bounded by the call
+// timeout and abandoned if the gateway is shutting down. The connection is read
+// under the lock (it may have been replaced/dropped by a concurrent restart);
+// if the upstream is gone, there is nothing to re-list.
+func (r *Registry) relistUpstream(name string) {
+	if r.procCtx.Err() != nil {
+		return // shutting down
+	}
+	r.mu.RLock()
+	conn := r.conns[name]
+	r.mu.RUnlock()
+	if conn == nil {
+		return // upstream was dropped (e.g. by a failed restart) — nothing to do
+	}
+
+	ctx, cancel := context.WithTimeout(r.procCtx, r.cfg.EffectiveCallTimeout())
+	tools, err := conn.ListTools(ctx)
+	cancel()
+	if err != nil {
+		r.log.Warn("re-list after upstream list_changed failed", "upstream", name, "err", err)
+		return
+	}
+	r.replaceUpstream(name, conn, tools)
+	r.notifyCatalogChanged()
+	r.log.Info("upstream catalog refreshed after list_changed", "upstream", name, "tools", len(tools))
 }
 
 // merge namespaces an upstream's tools and adds them to the aggregated catalog
@@ -622,6 +698,16 @@ func (r *Registry) Close() error {
 	// leak) and racing the map access. procCancel above makes them all exit
 	// promptly (their selects and backoff timers watch procCtx).
 	r.supervisors.Wait()
+
+	// Stop any pending re-list debounce timers so none fires after shutdown.
+	// A timer that already fired is harmless (relistUpstream bails on procCtx
+	// cancellation), this just avoids a needless late wakeup.
+	r.relistMu.Lock()
+	for _, t := range r.relistTimers {
+		t.Stop()
+	}
+	r.relistTimers = map[string]*time.Timer{}
+	r.relistMu.Unlock()
 
 	r.mu.Lock()
 	conns := r.conns
