@@ -15,6 +15,21 @@
 //	                   (simulating shutdown diagnostics), before the process
 //	                   exits — used to test that Close() waits for stderr to
 //	                   fully drain before reaping the process.
+//	FAKE_EXIT_AFTER  if > 0, the process exits (os.Exit(1)) after answering this
+//	                   many tools/call requests — simulates a stdio upstream that
+//	                   crashes mid-run, exercising the registry's auto-restart
+//	                   supervisor (Stage 7a).
+//	FAKE_TOOLS_FILE  path to a file whose first line, if present, OVERRIDES
+//	                   FAKE_TOOLS for tools/list; re-read on every tools/list so a
+//	                   test can change the advertised catalog at runtime. When the
+//	                   file is set but empty/absent, FAKE_TOOLS is used. Paired
+//	                   with FAKE_NOTIFY_FILE this lets a test drive a live catalog
+//	                   change (Stage 7b).
+//	FAKE_NOTIFY_FILE  path to a file the server polls; when it appears (is
+//	                   non-empty) the server emits one notifications/tools/
+//	                   list_changed to stdout, then truncates the file so it fires
+//	                   once per touch — used to test the gateway's reaction to an
+//	                   upstream list_changed (Stage 7b).
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -27,6 +42,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +71,9 @@ func main() {
 	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
 		callDelay, _ = time.ParseDuration(raw)
 	}
+	exitAfter, _ := strconv.Atoi(os.Getenv("FAKE_EXIT_AFTER"))
+	toolsFile := os.Getenv("FAKE_TOOLS_FILE")
+	notifyFile := os.Getenv("FAKE_NOTIFY_FILE")
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -62,14 +81,39 @@ func main() {
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 
+	// writes to stdout are serialized: the main request loop and the (optional)
+	// notify poller goroutine below both write framed messages, and interleaving
+	// their bytes would corrupt the stream — the same "serialize writes" rule the
+	// gateway itself follows for upstream stdin.
+	var writeMu sync.Mutex
 	write := func(m message) {
 		m.JSONRPC = "2.0"
 		b, _ := json.Marshal(m)
+		writeMu.Lock()
 		out.Write(b)
 		out.WriteByte('\n')
 		out.Flush()
+		writeMu.Unlock()
 	}
 
+	// notify poller: when notifyFile becomes non-empty, emit one
+	// notifications/tools/list_changed and truncate it so each "touch" fires
+	// exactly once (Stage 7b test hook).
+	if notifyFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Millisecond)
+				data, err := os.ReadFile(notifyFile)
+				if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+					continue
+				}
+				_ = os.WriteFile(notifyFile, nil, 0o600)
+				write(message{Method: "notifications/tools/list_changed"})
+			}
+		}()
+	}
+
+	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -88,7 +132,7 @@ func main() {
 		case "notifications/initialized":
 			// no response
 		case "tools/list":
-			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(tools))})
+			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(currentTools(toolsFile, tools)))})
 		case "resources/list":
 			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})
 		case "tools/call":
@@ -96,6 +140,13 @@ func main() {
 				time.Sleep(callDelay)
 			}
 			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
+			callCount++
+			if exitAfter > 0 && callCount >= exitAfter {
+				// Simulate a crash right after answering: flush is inside write,
+				// so the reply is already on the wire. os.Exit skips deferred
+				// flushes, but there is nothing left to flush.
+				os.Exit(1)
+			}
 		default:
 			if len(req.ID) > 0 {
 				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}})
@@ -111,6 +162,25 @@ func main() {
 			fmt.Fprintf(os.Stderr, "shutdown line %d\n", i)
 		}
 	}
+}
+
+// currentTools returns the tool set to advertise: the first line of toolsFile
+// (comma-separated) when that file is set and non-empty, else the static tools
+// from FAKE_TOOLS. Re-read per tools/list so a test can change the catalog at
+// runtime (Stage 7b).
+func currentTools(toolsFile string, static []string) []string {
+	if toolsFile == "" {
+		return static
+	}
+	data, err := os.ReadFile(toolsFile)
+	if err != nil {
+		return static
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		return static
+	}
+	return strings.Split(line, ",")
 }
 
 func toolsListResult(tools []string) string {

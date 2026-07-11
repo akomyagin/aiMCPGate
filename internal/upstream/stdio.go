@@ -66,6 +66,14 @@ type StdioConn struct {
 // Name returns the upstream's stable identifier.
 func (c *StdioConn) Name() string { return c.name }
 
+// Done returns a channel closed when this connection's reader goroutine exits —
+// i.e. when the child process has died (its stdout reached EOF) or Close was
+// called. The registry's per-upstream supervisor selects on it to detect a
+// crashed stdio upstream and trigger an auto-restart (Stage 7a). Only stdio
+// upstreams expose this; the registry reaches it by type-assertion so the HTTP
+// upstream (which has no long-lived process to watch) need not implement it.
+func (c *StdioConn) Done() <-chan struct{} { return c.done }
+
 // StartStdio launches command with args/env as a child process and starts the
 // reader goroutine. It does NOT perform the MCP handshake — call Initialize.
 //
