@@ -37,7 +37,7 @@ func newStdioServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger
 	return &stdioServer{
 		reg: reg,
 		log: log,
-		d:   newDispatcher(reg, log, version),
+		d:   newDispatcher(reg, log, version, true), // stdio can push server→client list_changed
 		r:   mcp.NewReader(in),
 		w:   mcp.NewWriter(out),
 	}
@@ -53,6 +53,14 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	defer func() { _ = s.reg.Close() }()
 
 	s.log.Info("stdio transport ready", "tools", len(s.reg.Tools()))
+
+	// Subscribe to runtime catalog changes (Stage 7c): whenever an upstream is
+	// auto-restarted, sends its own list_changed, or the config is reloaded, the
+	// registry signals here and we push notifications/tools/list_changed to the
+	// client so it re-lists. stdio is the same single pipe the client already
+	// reads, so this server→client notification needs no extra channel.
+	catalogChanged, unsubscribe := s.reg.Subscribe()
+	defer unsubscribe()
 
 	// mcp.Reader.Read blocks and is not context-aware, so run it in its own
 	// goroutine and feed decoded frames over a channel. This lets Serve select
@@ -72,6 +80,15 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			s.log.Info("shutting down")
 			return nil
+		case <-catalogChanged:
+			// The aggregated catalog changed at runtime — tell the client to
+			// re-list. Writes to s.w are serialized by mcp.Writer's own mutex, so
+			// this is safe alongside the reply writes below. A write failure means
+			// the client pipe is gone, so stop serving (same as a failed reply).
+			if err := s.w.Write(mcp.NewNotification(mcp.NotifToolsListChanged, nil)); err != nil {
+				s.log.Warn("write list_changed failed", "err", err)
+				return nil
+			}
 		case fr, ok := <-frames:
 			if !ok {
 				s.log.Info("client disconnected")

@@ -167,6 +167,77 @@ func TestStdioInitializeHandshake(t *testing.T) {
 	}
 }
 
+// TestStdioAdvertisesListChanged verifies the Stage 7c capability change: over
+// stdio the gateway declares tools.listChanged=true, because it CAN push a
+// server→client notification over the same pipe when the live catalog changes.
+func TestStdioAdvertisesListChanged(t *testing.T) {
+	c, cancel, done := startServer(t, false)
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	resp := c.readResponse()
+	var res mcp.InitializeResult
+	if err := json.Unmarshal(resp.Result, &res); err != nil {
+		t.Fatalf("decode initialize result: %v", err)
+	}
+	if !strings.Contains(string(res.Capabilities), `"listChanged":true`) {
+		t.Errorf("stdio capabilities = %s, want tools.listChanged:true", res.Capabilities)
+	}
+}
+
+// TestStdioPushesListChangedOnCatalogChange proves the server→client path: when
+// an upstream crashes and is auto-restarted (Stage 7a), the registry signals a
+// catalog change and the stdio transport pushes notifications/tools/list_changed
+// to the client (Stage 7c). The fakeserver crashes after one call, so triggering
+// the restart is a single tools/call.
+func TestStdioPushesListChangedOnCatalogChange(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			MaxAttempts:    5,
+		},
+		Upstreams: []config.Upstream{
+			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":      "ping",
+				"FAKE_ECHO":       "1",
+				"FAKE_EXIT_AFTER": "1",
+			}},
+		},
+	}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	// One call crashes the upstream; its reply comes back first.
+	callID := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "crasher__ping"}))
+	callResp := c.readResponse()
+	if string(callResp.ID) != string(callID) {
+		t.Fatalf("first message was not the call reply (id=%s want %s)", callResp.ID, callID)
+	}
+
+	// The next server→client message must be the list_changed notification the
+	// auto-restart triggered. Read until we see it (there should be nothing else
+	// on the stream, but be robust to ordering).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("did not receive notifications/tools/list_changed after auto-restart")
+		}
+		msg := c.readResponse()
+		if msg.IsNotification() && msg.Method == mcp.NotifToolsListChanged {
+			return // success
+		}
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 func TestStdioToolsListAggregatesNamespaced(t *testing.T) {
 	c, cancel, done := startServer(t, true)
 	defer func() { cancel(); <-done }()

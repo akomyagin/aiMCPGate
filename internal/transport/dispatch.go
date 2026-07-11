@@ -9,12 +9,24 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// gatewayCapabilities is what the gateway advertises to the client on
-// initialize. The gateway aggregates upstream TOOLS in the MVP; resources are
-// not yet aggregated (see handleResourcesList), so only the tools capability is
-// declared. It is a raw JSON literal because the gateway does not otherwise
-// interpret its own capability object.
-var gatewayCapabilities = json.RawMessage(`{"tools":{"listChanged":false}}`)
+// Gateway capability objects advertised to the client on initialize. Resources
+// are not aggregated in the MVP (see handleResourcesList), so only the tools
+// capability is declared. They are raw JSON literals because the gateway does
+// not otherwise interpret its own capability object.
+//
+// listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
+// catalog is dynamic (auto-restart, upstream list_changed, reload), so the
+// gateway CAN emit notifications/tools/list_changed — but only over a transport
+// with a server→client channel. stdio has one (the same pipe), so it advertises
+// listChanged:true and pushes the notification. The HTTP transport is POST-only
+// here (no GET SSE stream, MCP_NOTES §8 п.3), so it CANNOT push server→client
+// notifications; it truthfully advertises listChanged:false and clients simply
+// see the updated catalog on their next tools/list. Building the GET SSE channel
+// is deferred future work.
+var (
+	gatewayCapabilitiesListChanged   = json.RawMessage(`{"tools":{"listChanged":true}}`)
+	gatewayCapabilitiesNoListChanged = json.RawMessage(`{"tools":{"listChanged":false}}`)
+)
 
 // dispatcher is the transport-agnostic core of the client-facing gateway: given
 // one decoded client message it produces the reply (or nil, for a notification
@@ -30,10 +42,22 @@ type dispatcher struct {
 	reg     *registry.Registry
 	log     *slog.Logger
 	version string
+	// capabilities is what handleInitialize advertises. It is chosen per
+	// transport (Stage 7c): stdio can push server→client notifications so it
+	// declares listChanged:true, HTTP (POST-only) cannot so it declares false.
+	capabilities json.RawMessage
 }
 
-func newDispatcher(reg *registry.Registry, log *slog.Logger, version string) *dispatcher {
-	return &dispatcher{reg: reg, log: log, version: version}
+// newDispatcher builds the shared method-handling core. listChanged tells it
+// which tools capability to advertise: true only for a transport that can push
+// a server→client notifications/tools/list_changed (stdio), false otherwise
+// (HTTP POST-only). See gatewayCapabilities* for the reasoning.
+func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
+	caps := gatewayCapabilitiesNoListChanged
+	if listChanged {
+		caps = gatewayCapabilitiesListChanged
+	}
+	return &dispatcher{reg: reg, log: log, version: version, capabilities: caps}
 }
 
 // dispatch handles one client message and returns the reply to send back, or
@@ -73,7 +97,7 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    gatewayCapabilities,
+		Capabilities:    d.capabilities,
 		ServerInfo: mcp.Implementation{
 			Name:    "aiMCPGate",
 			Version: d.version,

@@ -40,19 +40,27 @@ tool from a previous session still exists, or that a tool the user mentions is
 present. The set of upstreams is operator-configured and varies between
 deployments and over time.
 
-## The catalog is a startup snapshot
+## The catalog is live and can change while you work
 
-mcp-gate builds its aggregated catalog once, when it starts (it advertises
-` + "`listChanged: false`" + `). An upstream that is down at that moment is silently
-absent from the catalog — there is no broken/disabled entry to filter out, it
-simply isn't there. Conversely, if the operator adds or starts a new upstream
-server *after* mcp-gate is already running, it will NOT appear until mcp-gate
-itself is restarted (` + "`mcp-gate serve`" + `).
+mcp-gate's aggregated catalog is NOT a frozen startup snapshot. It changes at
+runtime: an upstream that crashes is auto-restarted and its tools come back; an
+upstream that announces new tools has them re-listed; and the operator can
+reload the config (add/remove/change upstreams) without restarting mcp-gate. An
+upstream that is down at a given moment is simply absent — there is no
+broken/disabled placeholder to filter out.
 
-So: if a tool you expect is missing, first re-check ` + "`tools/list`" + ` (maybe it's
-under a different upstream prefix than you assumed). If it's still missing and
-the operator says they just enabled that server, tell them mcp-gate needs a
-restart to pick it up — don't just retry tools/list in a loop.
+Over stdio, mcp-gate advertises ` + "`listChanged: true`" + ` and sends you a
+` + "`notifications/tools/list_changed`" + ` whenever the catalog changes — call
+` + "`tools/list`" + ` again when you receive one to refresh what you know. Over the
+HTTP transport there is no server→client channel, so you will NOT get that
+notification; instead just re-run ` + "`tools/list`" + ` when a tool you expect is
+missing.
+
+So: if a tool you expect is missing, re-check ` + "`tools/list`" + ` first (it may be
+under a different upstream prefix than you assumed, or a just-crashed upstream
+may be mid-restart — give it a moment and list again). Don't assume a missing
+tool is gone forever, and don't tell the operator to restart mcp-gate just to
+pick up a newly enabled server — a config reload (SIGHUP) does that live.
 
 ## Picking between upstreams with overlapping capabilities
 
