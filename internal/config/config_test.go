@@ -309,3 +309,47 @@ func TestValidateRejectsNegativeRestartValues(t *testing.T) {
 		}
 	}
 }
+
+// TestSameLaunch checks the reload diff's "changed?" predicate.
+func TestSameLaunch(t *testing.T) {
+	base := Upstream{Name: "x", Command: "cmd", Args: []string{"a", "b"}, Env: map[string]string{"K": "v"}}
+	tests := []struct {
+		name string
+		mod  func(Upstream) Upstream
+		same bool
+	}{
+		{"identical", func(u Upstream) Upstream { return u }, true},
+		{"enabled differs only", func(u Upstream) Upstream { u.Enabled = !u.Enabled; return u }, true},
+		{"command differs", func(u Upstream) Upstream { u.Command = "other"; return u }, false},
+		{"args differ", func(u Upstream) Upstream { u.Args = []string{"a"}; return u }, false},
+		{"env value differs", func(u Upstream) Upstream { u.Env = map[string]string{"K": "w"}; return u }, false},
+		{"env key added", func(u Upstream) Upstream { u.Env = map[string]string{"K": "v", "K2": "z"}; return u }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := tt.mod(Upstream{
+				Name: base.Name, Command: base.Command,
+				Args: append([]string(nil), base.Args...),
+				Env:  map[string]string{"K": "v"},
+			})
+			if got := base.SameLaunch(other); got != tt.same {
+				t.Errorf("SameLaunch = %v, want %v", got, tt.same)
+			}
+		})
+	}
+}
+
+// TestSameLaunchHTTP checks url/headers are compared for http upstreams.
+func TestSameLaunchHTTP(t *testing.T) {
+	a := Upstream{Name: "h", URL: "https://x/mcp", Headers: map[string]string{"Authorization": "Bearer a"}}
+	b := a
+	b.Headers = map[string]string{"Authorization": "Bearer b"}
+	if a.SameLaunch(b) {
+		t.Error("http upstreams with different headers must not be SameLaunch")
+	}
+	c := a
+	c.Headers = map[string]string{"Authorization": "Bearer a"}
+	if !a.SameLaunch(c) {
+		t.Error("http upstreams with identical url/headers must be SameLaunch")
+	}
+}

@@ -77,6 +77,48 @@ type Upstream struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// SameLaunch reports whether two upstreams would launch identically — same
+// transport and every field that affects how the upstream is reached. Used by
+// hot-reload (Stage 7d) to tell an unchanged upstream (leave running) from a
+// changed one (Close + relaunch). Name is assumed equal by the caller (it is the
+// match key); Enabled is intentionally NOT compared here — enable/disable is
+// handled as add/remove by the reload diff, not as a "changed launch".
+func (u Upstream) SameLaunch(other Upstream) bool {
+	if u.ResolveKind() != other.ResolveKind() ||
+		u.Command != other.Command ||
+		u.URL != other.URL ||
+		!equalStringSlice(u.Args, other.Args) ||
+		!equalStringMap(u.Env, other.Env) ||
+		!equalStringMap(u.Headers, other.Headers) {
+		return false
+	}
+	return true
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 // ResolveKind returns the effective kind: the explicit Kind if set, otherwise
 // inferred from which fields are populated (url → http, else stdio).
 func (u Upstream) ResolveKind() UpstreamKind {
