@@ -73,7 +73,7 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 // upstream name.
 func newTestRegistry(t *testing.T, cfg *config.Config, callLog logging.CallLog, fakes map[string]*fakeUpstream) *Registry {
 	t.Helper()
-	r := New(cfg, quietLogger(), callLog)
+	r := New(cfg, quietLogger(), callLog, true)
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		f, ok := fakes[u.Name]
 		if !ok {

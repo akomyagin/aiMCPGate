@@ -52,7 +52,7 @@ func runServe(parent context.Context, configPath, version string) error {
 	}
 	defer func() { _ = callLog.Close() }()
 
-	reg := registry.New(cfg, logger, callLog)
+	reg := registry.New(cfg, logger, callLog, true)
 	srv := transport.NewServer(cfg, reg, logger, version)
 
 	// Live config reload on SIGHUP (Stage 7d): reload runs in its own goroutine

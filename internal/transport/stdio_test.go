@@ -80,7 +80,7 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 // custom config or a call log.
 func startServerWithConfig(t *testing.T, cfg *config.Config, callLog logging.CallLog) (*fakeClient, context.CancelFunc, <-chan error) {
 	t.Helper()
-	reg := registry.New(cfg, quietLogger(), callLog)
+	reg := registry.New(cfg, quietLogger(), callLog, true)
 
 	clientToSrv, srvIn := io.Pipe() // client writes to srvIn side... (see below)
 	srvOut, clientFromSrv := io.Pipe()
