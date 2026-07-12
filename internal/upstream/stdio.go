@@ -61,10 +61,42 @@ type StdioConn struct {
 
 	done       chan struct{} // closed when the reader goroutine exits
 	stderrDone chan struct{} // closed when the stderr-draining goroutine exits
+
+	// closeOnce guards the actual teardown so Close is safe for CONCURRENT
+	// calls, not just repeated sequential ones: Stage 7 introduced the first
+	// callers that can race to close the same connection (the auto-restart
+	// supervisor reaping a crashed process vs. hot-reload retiring the same
+	// upstream). cmd.Wait must not be called twice concurrently — it mutates
+	// *exec.Cmd's internal state without synchronization for that case — so
+	// every caller after the first must get the same cached result instead of
+	// re-running the teardown (found by independent review).
+	closeOnce sync.Once
+	closeErr  error
+
+	// onNotify, when set, is invoked by readLoop for each notification method
+	// received from the upstream (e.g. notifications/tools/list_changed). The
+	// registry sets it to react to a catalog change (Stage 7b). It is set once,
+	// right after StartStdio and before any traffic, so it needs no lock.
+	onNotify func(method string)
 }
+
+// OnNotification registers a callback invoked (from the reader goroutine) for
+// each notification the upstream sends. Set it before the handshake; it must
+// not block or call back into the connection synchronously, as it runs on the
+// single reader goroutine that also delivers responses (Stage 7b). A nil fn
+// clears it.
+func (c *StdioConn) OnNotification(fn func(method string)) { c.onNotify = fn }
 
 // Name returns the upstream's stable identifier.
 func (c *StdioConn) Name() string { return c.name }
+
+// Done returns a channel closed when this connection's reader goroutine exits —
+// i.e. when the child process has died (its stdout reached EOF) or Close was
+// called. The registry's per-upstream supervisor selects on it to detect a
+// crashed stdio upstream and trigger an auto-restart (Stage 7a). Only stdio
+// upstreams expose this; the registry reaches it by type-assertion so the HTTP
+// upstream (which has no long-lived process to watch) need not implement it.
+func (c *StdioConn) Done() <-chan struct{} { return c.done }
 
 // StartStdio launches command with args/env as a child process and starts the
 // reader goroutine. It does NOT perform the MCP handshake — call Initialize.
@@ -136,9 +168,14 @@ func (c *StdioConn) readLoop() {
 		case msg.IsResponse():
 			c.deliver(msg)
 		case msg.IsNotification():
-			// MVP: notifications (e.g. tools/list_changed) are logged but not
-			// acted upon — catalog re-aggregation is post-MVP (MCP_NOTES §7).
 			c.log.Debug("upstream notification", "upstream", c.name, "method", msg.Method)
+			// Deliver to the registry's handler (Stage 7b) so it can react to a
+			// catalog change (tools/list_changed). The callback must be cheap and
+			// non-blocking — it runs on this single reader goroutine — so the
+			// registry only kicks a debounce timer here, never re-lists inline.
+			if c.onNotify != nil {
+				c.onNotify(msg.Method)
+			}
 		default:
 			// A request FROM an upstream (e.g. sampling) — not handled in MVP.
 			c.log.Debug("upstream request ignored", "upstream", c.name, "method", msg.Method)
@@ -241,8 +278,18 @@ func (c *StdioConn) Notify(method string, params json.RawMessage) error {
 }
 
 // Close closes the child's stdin (signalling shutdown per the MCP stdio
-// lifecycle) and waits for it to exit. Safe to call more than once.
+// lifecycle) and waits for it to exit. Safe to call more than once, including
+// CONCURRENTLY from multiple goroutines: the actual teardown runs exactly
+// once (closeOnce); every caller gets the same result.
 func (c *StdioConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.closeAndWait()
+	})
+	return c.closeErr
+}
+
+// closeAndWait is Close's one-time body.
+func (c *StdioConn) closeAndWait() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()

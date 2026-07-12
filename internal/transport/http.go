@@ -71,7 +71,7 @@ func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger,
 	return &httpServer{
 		reg:         reg,
 		log:         log,
-		d:           newDispatcher(reg, log, version),
+		d:           newDispatcher(reg, log, version, false), // HTTP is POST-only: no server→client channel
 		addr:        cfg.EffectiveListenAddr(),
 		authToken:   cfg.AuthToken,
 		callTimeout: cfg.EffectiveCallTimeout(),

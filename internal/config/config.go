@@ -77,6 +77,48 @@ type Upstream struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// SameLaunch reports whether two upstreams would launch identically — same
+// transport and every field that affects how the upstream is reached. Used by
+// hot-reload (Stage 7d) to tell an unchanged upstream (leave running) from a
+// changed one (Close + relaunch). Name is assumed equal by the caller (it is the
+// match key); Enabled is intentionally NOT compared here — enable/disable is
+// handled as add/remove by the reload diff, not as a "changed launch".
+func (u Upstream) SameLaunch(other Upstream) bool {
+	if u.ResolveKind() != other.ResolveKind() ||
+		u.Command != other.Command ||
+		u.URL != other.URL ||
+		!equalStringSlice(u.Args, other.Args) ||
+		!equalStringMap(u.Env, other.Env) ||
+		!equalStringMap(u.Headers, other.Headers) {
+		return false
+	}
+	return true
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 // ResolveKind returns the effective kind: the explicit Kind if set, otherwise
 // inferred from which fields are populated (url → http, else stdio).
 func (u Upstream) ResolveKind() UpstreamKind {
@@ -120,11 +162,59 @@ type Config struct {
 	// CallTimeout bounds a single upstream request (handshake, list, or call).
 	// Zero selects DefaultCallTimeout.
 	CallTimeout time.Duration `yaml:"call_timeout"`
+
+	// Restart is the GLOBAL policy for automatically restarting a stdio upstream
+	// whose child process dies while the gateway is running (Stage 7a). It is a
+	// single policy, not per-upstream: the granularity was deliberately kept
+	// global (decided 2026-07-09) — a restart always replays the very same
+	// config.Upstream the upstream was first launched with, so there is nothing
+	// per-upstream to tune here. HTTP upstreams have no process that "dies"
+	// between calls, so this policy applies to stdio upstreams only.
+	Restart RestartPolicy `yaml:"restart"`
+}
+
+// RestartPolicy controls exponential-backoff auto-restart of stdio upstreams.
+//
+// Defaults (via Effective*) are chosen so an operator who never mentions
+// `restart:` still gets sensible resilience: enabled, 1s→30s backoff, 5 tries.
+// Set MaxAttempts to 0 for unlimited retries.
+type RestartPolicy struct {
+	// Enabled turns auto-restart on. A pointer so an unset key defaults to
+	// enabled (nil → true in EffectiveRestart) while an explicit `enabled: false`
+	// is honoured — a plain bool could not tell "unset" from "false".
+	Enabled *bool `yaml:"enabled"`
+	// InitialBackoff is the delay before the first restart attempt. Zero selects
+	// DefaultRestartInitialBackoff.
+	InitialBackoff time.Duration `yaml:"initial_backoff"`
+	// MaxBackoff caps the exponentially growing delay. Zero selects
+	// DefaultRestartMaxBackoff.
+	MaxBackoff time.Duration `yaml:"max_backoff"`
+	// MaxAttempts bounds how many consecutive restarts are attempted before the
+	// upstream is left out for good. Zero means unlimited. Negative is rejected
+	// by Validate. When unset via YAML it is 0 (unlimited) unless the whole
+	// policy is defaulted — see DefaultRestartMaxAttempts / EffectiveRestart.
+	MaxAttempts int `yaml:"max_attempts"`
 }
 
 // DefaultCallTimeout bounds a single upstream request when the config leaves
 // CallTimeout unset.
 const DefaultCallTimeout = 30 * time.Second
+
+// Restart-policy defaults, applied field-by-field by EffectiveRestart when the
+// config leaves a field unset.
+const (
+	DefaultRestartInitialBackoff = 1 * time.Second
+	DefaultRestartMaxBackoff     = 30 * time.Second
+	// DefaultRestartMaxAttempts is applied only when the WHOLE restart policy is
+	// left unset (its zero value): an operator who never writes `restart:` gets a
+	// bounded 5 attempts, but one who explicitly writes `max_attempts: 0` means
+	// unlimited and that 0 is honoured verbatim (see EffectiveRestart).
+	DefaultRestartMaxAttempts = 5
+	// RestartBackoffFactor is the fixed exponential multiplier between attempts.
+	// Not configurable: a single knob (initial→max) is enough to reason about,
+	// and a tunable factor adds a config surface with no demonstrated need.
+	RestartBackoffFactor = 2
+)
 
 // DefaultListenAddr is the bind address used for TransportHTTP when the config
 // leaves ListenAddr unset. Bound to loopback, not ":28080"/0.0.0.0: without
@@ -147,6 +237,43 @@ func (c *Config) EffectiveListenAddr() string {
 		return DefaultListenAddr
 	}
 	return c.ListenAddr
+}
+
+// EffectiveRestart returns the restart policy with every unset field filled in
+// from its default, so callers (the registry supervisor) never have to reason
+// about zero values. Enabled defaults to true when the key is absent; the
+// backoff bounds default to 1s/30s; MaxAttempts defaults to 5 ONLY when the
+// entire policy was left unset (its zero value) — an explicit `max_attempts: 0`
+// under an otherwise-populated policy is preserved as "unlimited".
+func (c *Config) EffectiveRestart() RestartPolicy {
+	p := c.Restart
+	zeroPolicy := p == (RestartPolicy{})
+
+	enabled := true
+	if p.Enabled != nil {
+		enabled = *p.Enabled
+	}
+	initial := p.InitialBackoff
+	if initial <= 0 {
+		initial = DefaultRestartInitialBackoff
+	}
+	maxB := p.MaxBackoff
+	if maxB <= 0 {
+		maxB = DefaultRestartMaxBackoff
+	}
+	if maxB < initial {
+		maxB = initial
+	}
+	attempts := p.MaxAttempts
+	if zeroPolicy {
+		attempts = DefaultRestartMaxAttempts
+	}
+	return RestartPolicy{
+		Enabled:        &enabled,
+		InitialBackoff: initial,
+		MaxBackoff:     maxB,
+		MaxAttempts:    attempts,
+	}
 }
 
 // DefaultConfigName is the file Load looks for next to the running binary
@@ -260,6 +387,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("unknown transport %q (want %q or %q)", c.Transport, TransportStdio, TransportHTTP)
 	}
 
+	if err := c.Restart.validate(); err != nil {
+		return err
+	}
+
 	seen := make(map[string]bool, len(c.Upstreams))
 	for i, u := range c.Upstreams {
 		if u.Name == "" {
@@ -276,6 +407,22 @@ func (c *Config) Validate() error {
 		if err := validateUpstreamTransport(u); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validate rejects a nonsensical restart policy. Unset fields are fine (they
+// default via EffectiveRestart); only actively-wrong values are rejected —
+// negative durations or a negative attempt count.
+func (p RestartPolicy) validate() error {
+	if p.InitialBackoff < 0 {
+		return fmt.Errorf("restart.initial_backoff must not be negative")
+	}
+	if p.MaxBackoff < 0 {
+		return fmt.Errorf("restart.max_backoff must not be negative")
+	}
+	if p.MaxAttempts < 0 {
+		return fmt.Errorf("restart.max_attempts must not be negative (0 means unlimited)")
 	}
 	return nil
 }

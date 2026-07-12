@@ -24,6 +24,16 @@ log_file: ./logs/calls.jsonl
 log_level: info             # debug | info | warn | error
 call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 
+# Auto-restart policy for stdio upstreams whose child process dies while the
+# gateway runs (a single GLOBAL policy — every upstream restart replays the exact
+# config it was first launched with). HTTP upstreams have no process to restart.
+# Defaults if omitted: enabled, 1s→30s exponential backoff, 5 attempts.
+# restart:
+#   enabled: true
+#   initial_backoff: 1s
+#   max_backoff: 30s
+#   max_attempts: 5           # 0 = retry forever
+
 # `mcp-gate skill` prints a built-in deployment-independent guide by default.
 # Set this to override with your own file (org policy notes, translation, ...);
 # `mcp-gate skill` with no config gives you the default text as a starting point.

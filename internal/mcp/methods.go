@@ -15,6 +15,12 @@ const (
 
 	// NotifInitialized is sent by a client after a successful initialize.
 	NotifInitialized = "notifications/initialized"
+
+	// NotifToolsListChanged tells the peer the tool catalog changed and should be
+	// re-listed. The gateway both RECEIVES it from a stdio upstream (Stage 7b,
+	// triggering a re-list of that upstream) and SENDS it to its own client
+	// (Stage 7c, when the aggregated catalog changes at runtime).
+	NotifToolsListChanged = "notifications/tools/list_changed"
 )
 
 // Implementation identifies a client or server (clientInfo / serverInfo).

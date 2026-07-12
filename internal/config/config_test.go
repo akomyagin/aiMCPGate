@@ -250,3 +250,106 @@ func TestLoadKeepsAbsoluteFilePathsUnchanged(t *testing.T) {
 		t.Errorf("log_file = %q, want unchanged absolute path %q", cfg.LogFile, absLog)
 	}
 }
+
+// TestEffectiveRestartDefaults checks the default-fill behaviour: a config that
+// never mentions `restart:` gets enabled auto-restart with the documented 1s/30s
+// backoff bounds and a bounded 5 attempts.
+func TestEffectiveRestartDefaults(t *testing.T) {
+	c := &Config{}
+	p := c.EffectiveRestart()
+	if p.Enabled == nil || !*p.Enabled {
+		t.Errorf("unset policy should default to enabled=true, got %+v", p.Enabled)
+	}
+	if p.InitialBackoff != DefaultRestartInitialBackoff {
+		t.Errorf("initial_backoff = %s, want default %s", p.InitialBackoff, DefaultRestartInitialBackoff)
+	}
+	if p.MaxBackoff != DefaultRestartMaxBackoff {
+		t.Errorf("max_backoff = %s, want default %s", p.MaxBackoff, DefaultRestartMaxBackoff)
+	}
+	if p.MaxAttempts != DefaultRestartMaxAttempts {
+		t.Errorf("max_attempts = %d, want default %d", p.MaxAttempts, DefaultRestartMaxAttempts)
+	}
+}
+
+// TestEffectiveRestartHonoursExplicitZeroAttempts is the subtle case: an
+// explicit max_attempts:0 under an otherwise-populated policy means "unlimited"
+// and must NOT be silently overwritten by the default-5, unlike a wholly-unset
+// policy.
+func TestEffectiveRestartHonoursExplicitZeroAttempts(t *testing.T) {
+	yes := true
+	c := &Config{Restart: RestartPolicy{Enabled: &yes, MaxAttempts: 0, InitialBackoff: 2}}
+	p := c.EffectiveRestart()
+	if p.MaxAttempts != 0 {
+		t.Errorf("explicit max_attempts:0 (unlimited) was overwritten to %d", p.MaxAttempts)
+	}
+}
+
+// TestEffectiveRestartCanBeDisabled confirms an explicit enabled:false survives
+// (a plain bool could not distinguish this from "unset").
+func TestEffectiveRestartCanBeDisabled(t *testing.T) {
+	no := false
+	c := &Config{Restart: RestartPolicy{Enabled: &no}}
+	p := c.EffectiveRestart()
+	if p.Enabled == nil || *p.Enabled {
+		t.Errorf("explicit enabled:false should be honoured, got %+v", p.Enabled)
+	}
+}
+
+// TestValidateRejectsNegativeRestartValues checks the guardrails.
+func TestValidateRejectsNegativeRestartValues(t *testing.T) {
+	cases := []RestartPolicy{
+		{InitialBackoff: -1},
+		{MaxBackoff: -1},
+		{MaxAttempts: -1},
+	}
+	for i, rp := range cases {
+		c := &Config{Transport: TransportStdio, Restart: rp}
+		if err := c.Validate(); err == nil {
+			t.Errorf("case %d: expected Validate to reject %+v", i, rp)
+		}
+	}
+}
+
+// TestSameLaunch checks the reload diff's "changed?" predicate.
+func TestSameLaunch(t *testing.T) {
+	base := Upstream{Name: "x", Command: "cmd", Args: []string{"a", "b"}, Env: map[string]string{"K": "v"}}
+	tests := []struct {
+		name string
+		mod  func(Upstream) Upstream
+		same bool
+	}{
+		{"identical", func(u Upstream) Upstream { return u }, true},
+		{"enabled differs only", func(u Upstream) Upstream { u.Enabled = !u.Enabled; return u }, true},
+		{"command differs", func(u Upstream) Upstream { u.Command = "other"; return u }, false},
+		{"args differ", func(u Upstream) Upstream { u.Args = []string{"a"}; return u }, false},
+		{"env value differs", func(u Upstream) Upstream { u.Env = map[string]string{"K": "w"}; return u }, false},
+		{"env key added", func(u Upstream) Upstream { u.Env = map[string]string{"K": "v", "K2": "z"}; return u }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := tt.mod(Upstream{
+				Name: base.Name, Command: base.Command,
+				Args: append([]string(nil), base.Args...),
+				Env:  map[string]string{"K": "v"},
+			})
+			if got := base.SameLaunch(other); got != tt.same {
+				t.Errorf("SameLaunch = %v, want %v", got, tt.same)
+			}
+		})
+	}
+}
+
+// TestSameLaunchHTTP checks url/headers are compared for http upstreams.
+func TestSameLaunchHTTP(t *testing.T) {
+	a := Upstream{Name: "h", URL: "https://x/mcp", Headers: map[string]string{"Authorization": "Bearer a"}}
+	b := a
+	b.Headers = map[string]string{"Authorization": "Bearer b"}
+	if a.SameLaunch(b) {
+		t.Error("http upstreams with different headers must not be SameLaunch")
+	}
+	c := a
+	c.Headers = map[string]string{"Authorization": "Bearer a"}
+	if !a.SameLaunch(c) {
+		t.Error("http upstreams with identical url/headers must be SameLaunch")
+	}
+}
