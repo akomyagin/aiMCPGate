@@ -8,6 +8,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
 // buildFakeServer compiles the shared internal/upstream/testdata/fakeserver
@@ -136,6 +140,74 @@ upstreams:
 	row := doctorRow(t, out.String(), "solo")
 	if !strings.Contains(row, "OK") {
 		t.Errorf("solo row = %q, want OK", row)
+	}
+}
+
+// TestPrintDoctorReportSanitizesReason (regression, found by code review): the
+// failure reason comes from an arbitrary err.Error() — possibly text relayed
+// verbatim from the upstream — so it can contain tabs and newlines. Raw, a tab
+// opens a phantom tabwriter column and a newline orphans the tail of the reason
+// onto its own column-less line, wrecking the alignment of every row AFTER the
+// broken one too. The report must stay one line per upstream, all aligned.
+func TestPrintDoctorReportSanitizesReason(t *testing.T) {
+	report := []registry.UpstreamStatus{
+		{Name: "broken", Err: "handshake failed: upstream reported error\twith\ttabs\nand a newline"},
+		{Name: "next-row", OK: true, Tools: 5},
+	}
+
+	cmd := &cobra.Command{}
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	printDoctorReport(cmd, report)
+
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("table has %d lines, want 3 (header + 2 rows) — a newline in the reason leaked through:\n%s", len(lines), out.String())
+	}
+	brokenRow := doctorRow(t, out.String(), "broken")
+	if !strings.Contains(brokenRow, "and a newline") {
+		t.Errorf("broken row = %q, want the whole reason kept on one line", brokenRow)
+	}
+	// tabwriter aligns columns across the whole block, so STATUS/FAIL/OK must
+	// start at the same offset; a leaked tab or newline breaks the block and
+	// shifts the rows that follow.
+	header, nextRow := lines[0], doctorRow(t, out.String(), "next-row")
+	if col := strings.Index(header, "STATUS"); strings.Index(brokenRow, "FAIL") != col || strings.Index(nextRow, "OK") != col {
+		t.Errorf("STATUS column misaligned:\n%s", out.String())
+	}
+}
+
+// TestDoctorNoEnabledUpstreamsExitsNonZero: with nothing enabled there is no
+// row to print FAIL for, so the table alone would look deceptively fine —
+// doctor must still exit non-zero and say WHY nothing was attempted.
+func TestDoctorNoEnabledUpstreamsExitsNonZero(t *testing.T) {
+	cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: disabled-one
+    command: /bin/true
+    enabled: false
+`)
+
+	root := Build("test")
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"doctor", "-c", cfgPath})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("doctor must return an error when no upstream is enabled")
+	}
+	if !strings.Contains(err.Error(), "no upstream is enabled") {
+		t.Errorf("error = %q, want the nothing-was-attempted explanation", err)
+	}
+	// The header must still print (the command ran, the table is just empty),
+	// with no phantom data rows.
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "UPSTREAM") {
+		t.Errorf("output = %q, want exactly the header line and nothing else", out.String())
 	}
 }
 

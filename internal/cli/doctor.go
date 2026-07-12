@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -75,6 +76,11 @@ func runDoctor(cmd *cobra.Command, configPath string) error {
 	return nil
 }
 
+// tableCellSanitizer strips the characters tabwriter treats as structure: a
+// tab would open a phantom column, a newline would orphan the rest of the cell
+// onto a column-less line and break the alignment of every row after it.
+var tableCellSanitizer = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ")
+
 // printDoctorReport renders the per-upstream statuses as an aligned table on
 // the command's stdout (slog diagnostics go to stderr, so the two never mix).
 func printDoctorReport(cmd *cobra.Command, report []registry.UpstreamStatus) {
@@ -83,7 +89,11 @@ func printDoctorReport(cmd *cobra.Command, report []registry.UpstreamStatus) {
 	for _, s := range report {
 		status, reason := "OK", ""
 		if !s.OK {
-			status, reason = "FAIL", s.Err
+			// s.Err comes from an arbitrary error string (possibly relayed from
+			// the upstream itself), so it must be sanitized before it hits the
+			// table. s.Name needs no such treatment: the config regex
+			// (^[a-zA-Z0-9_-]+$) already rules control characters out.
+			status, reason = "FAIL", tableCellSanitizer.Replace(s.Err)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", s.Name, status, s.Tools, reason)
 	}
