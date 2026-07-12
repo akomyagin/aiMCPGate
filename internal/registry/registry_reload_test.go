@@ -34,7 +34,7 @@ func TestReloadAddsAndRemovesUpstreams(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base("alpha", "a")},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestReloadChangedUpstreamRelaunches(t *testing.T) {
 			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{up},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestReloadDisabledUpstreamRemoved(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{on, stay},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestReloadNotifiesSubscribers(t *testing.T) {
 			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "1"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestReloadRetiredSupervisorDoesNotRestart(t *testing.T) {
 			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil)
+	r := New(cfg, quietLogger(), nil, true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

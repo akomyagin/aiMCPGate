@@ -56,6 +56,17 @@ type route struct {
 	original string
 }
 
+// UpstreamStatus is one upstream's outcome from the very first bring-up pass
+// (Start). It is the machine-readable counterpart of the per-upstream slog
+// lines Start already emits, consumed by `mcp-gate doctor` (Stage 8) — parsing
+// the slog output back would be fragile, so the same facts are recorded here.
+type UpstreamStatus struct {
+	Name  string
+	OK    bool
+	Tools int    // tools merged into the catalog; 0 when the upstream failed
+	Err   string // failure reason (same text recordFailure captures); empty on success
+}
+
 // upstreamStarter abstracts launching one upstream, so tests can inject fakes
 // without spawning real processes. The production implementation wraps
 // upstream.StartStdio.
@@ -84,6 +95,15 @@ type Registry struct {
 	callLog logging.CallLog
 	start   upstreamStarter
 
+	// autoRestart gates the per-upstream auto-restart supervisor goroutines
+	// (Stage 7a); it is New's supervise parameter. serve runs with true;
+	// `mcp-gate doctor` (Stage 8) runs with false so its single diagnostic pass
+	// reports a flapping upstream instead of endlessly resurrecting it. This is
+	// the ONLY behavioural difference — Start/bringUp/catalog work identically
+	// either way. (Named autoRestart, not supervise, because the supervisor loop
+	// method already carries that name.)
+	autoRestart bool
+
 	// procCtx is the context each upstream CHILD PROCESS is launched under —
 	// deliberately independent of Start's errgroup context. errgroup.WithContext
 	// cancels its derived context the instant g.Wait() returns, which is right
@@ -101,7 +121,8 @@ type Registry struct {
 	toolRoute map[string]route          // namespaced name → (upstream, original)
 
 	failMu   sync.Mutex
-	failures []string // "<upstream>: <reason>" for upstreams that never came up; unordered (parallel bringUp), sorted when reported
+	failures []string         // "<upstream>: <reason>" for upstreams that never came up; unordered (parallel bringUp), sorted when reported
+	report   []UpstreamStatus // per-upstream outcome of the FIRST bring-up pass, for StartReport (Stage 8); shares failMu with failures
 
 	// supervisors tracks the per-stdio-upstream auto-restart goroutines (Stage
 	// 7a) so Close can wait for them all to unwind before returning — otherwise a
@@ -143,11 +164,14 @@ const relistDebounce = 200 * time.Millisecond
 
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
-func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog) *Registry {
+// supervise=false disables the auto-restart supervisors entirely (see the field
+// comment) — used by `mcp-gate doctor`, which wants exactly one pass.
+func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, supervise bool) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
 		log:          logger,
 		callLog:      callLog,
+		autoRestart:  supervise,
 		conns:        map[string]Upstream{},
 		tools:        map[string]ToolDescriptor{},
 		toolRoute:    map[string]route{},
@@ -258,6 +282,7 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 		return
 	}
 	r.merge(u.Name, conn, tools)
+	r.recordSuccess(u.Name, len(tools))
 	r.superviseUpstream(u, conn)
 }
 
@@ -338,6 +363,9 @@ func doneChan(conn Upstream) (<-chan struct{}, bool) {
 // exact config.Upstream u the upstream was first launched with — restart is
 // "run it again", never "reconfigure it".
 func (r *Registry) superviseUpstream(u config.Upstream, conn Upstream) {
+	if !r.autoRestart {
+		return // doctor mode (Stage 8): one diagnostic pass, never auto-restart.
+	}
 	policy := r.config().EffectiveRestart()
 	if policy.Enabled == nil || !*policy.Enabled {
 		return
@@ -869,6 +897,29 @@ func (r *Registry) recordFailure(name, reason string) {
 	r.failMu.Lock()
 	defer r.failMu.Unlock()
 	r.failures = append(r.failures, name+": "+reason)
+	r.report = append(r.report, UpstreamStatus{Name: name, Err: reason})
+}
+
+// recordSuccess is recordFailure's happy-path twin: it notes an upstream that
+// came up on the first pass and how many tools it contributed, feeding
+// StartReport (Stage 8). Start-time only, like recordFailure — later restarts
+// and reloads do not rewrite history.
+func (r *Registry) recordSuccess(name string, tools int) {
+	r.failMu.Lock()
+	defer r.failMu.Unlock()
+	r.report = append(r.report, UpstreamStatus{Name: name, OK: true, Tools: tools})
+}
+
+// StartReport returns one UpstreamStatus per enabled upstream, reflecting the
+// state at the end of the very first bring-up pass — call it AFTER Start. The
+// slice is a sorted copy (bringUp runs upstreams in parallel, so the internal
+// order is nondeterministic); mutating it does not affect the registry.
+func (r *Registry) StartReport() []UpstreamStatus {
+	r.failMu.Lock()
+	out := append([]UpstreamStatus(nil), r.report...)
+	r.failMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // failureSummary renders one "- upstream: reason" line per recorded failure,

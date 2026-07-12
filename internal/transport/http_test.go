@@ -37,7 +37,7 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil)
+	reg := registry.New(cfg, quietLogger(), nil, true)
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -215,7 +215,7 @@ func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, fun
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil)
+	reg := registry.New(cfg, quietLogger(), nil, true)
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestHTTPServerGETNotAllowed(t *testing.T) {
 // once listen_addr is widened past loopback (found by code review).
 func TestHTTPServerTimeoutsConfigured(t *testing.T) {
 	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
-	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil), quietLogger(), "test")
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, true), quietLogger(), "test")
 	srv := hs.buildServer(http.NewServeMux())
 
 	if srv.ReadHeaderTimeout <= 0 {
