@@ -15,9 +15,11 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -75,6 +77,31 @@ type Upstream struct {
 
 	// Enabled allows disabling an upstream without removing its config.
 	Enabled bool `yaml:"enabled"`
+
+	// Tools narrows and renames what this upstream contributes to the
+	// aggregated catalog (Stage 9). The zero value passes every tool through
+	// under the default "<upstream>__<tool>" name.
+	Tools ToolFilter `yaml:"tools"`
+}
+
+// ToolFilter selects and renames the tools one upstream exposes to the client.
+// All keys refer to the upstream's ORIGINAL tool names (before namespacing) —
+// the filter logically belongs to the upstream, not to the aggregated catalog.
+//
+// Semantics (applied in this order by the registry):
+//  1. Allow — when non-empty, only the listed tools survive (intersection);
+//  2. Deny — always subtracted, even from an explicit Allow;
+//  3. Rename — maps a surviving original name to its client-facing name;
+//     tools without a rename get the default "<upstream>__<tool>".
+//
+// Deny is an ADDITIONAL safety barrier, not a replacement for upstream-side
+// auth: it narrows the tool surface the client can even see, independent of
+// whatever flags the upstream itself supports — but a compromised upstream is
+// still a compromised upstream.
+type ToolFilter struct {
+	Allow  []string          `yaml:"allow"`
+	Deny   []string          `yaml:"deny"`
+	Rename map[string]string `yaml:"rename"`
 }
 
 // SameLaunch reports whether two upstreams would launch identically — same
@@ -93,6 +120,18 @@ func (u Upstream) SameLaunch(other Upstream) bool {
 		return false
 	}
 	return true
+}
+
+// SameFilter reports whether two upstreams project the same tool filter
+// (allow/deny/rename). It is deliberately SEPARATE from SameLaunch: the launch
+// predicate is about how the upstream PROCESS is reached, while the filter is
+// only a projection of its catalog — hot-reload (Stage 9) uses the distinction
+// to re-apply a changed filter to the stored raw tool list without relaunching
+// (or even re-listing) an otherwise-identical upstream.
+func (u Upstream) SameFilter(other Upstream) bool {
+	return equalStringSlice(u.Tools.Allow, other.Tools.Allow) &&
+		equalStringSlice(u.Tools.Deny, other.Tools.Deny) &&
+		equalStringMap(u.Tools.Rename, other.Tools.Rename)
 }
 
 func equalStringSlice(a, b []string) bool {
@@ -392,6 +431,12 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]bool, len(c.Upstreams))
+	// clientNames tracks every client-facing tool name the config makes
+	// statically known (rename targets and default-namespaced allow entries),
+	// across ALL upstreams: a collision there would silently shadow one tool
+	// behind another at merge time, so it must be a config error, not a
+	// runtime keep-first (Stage 9).
+	clientNames := make(map[string]string)
 	for i, u := range c.Upstreams {
 		if u.Name == "" {
 			return fmt.Errorf("upstream #%d: name is required", i)
@@ -405,6 +450,70 @@ func (c *Config) Validate() error {
 		seen[u.Name] = true
 
 		if err := validateUpstreamTransport(u); err != nil {
+			return err
+		}
+		if err := validateToolFilter(u, clientNames); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateToolFilter checks one upstream's tools filter and claims its
+// statically-known client-facing names in clientNames (name → human-readable
+// owner), rejecting a cross-upstream collision. The config only knows the
+// original names spelled in allow/rename — tools that pass through with the
+// default "<upstream>__<tool>" name and are not listed anywhere cannot be
+// checked here; the registry's merge keeps the first of a runtime duplicate
+// and logs it, as before. Runs over disabled upstreams too, matching how
+// Validate catches a disabled-but-malformed entry early (and how enabling one
+// via reload must not surface a brand-new collision).
+func validateToolFilter(u Upstream, clientNames map[string]string) error {
+	f := u.Tools
+	allow := make(map[string]bool, len(f.Allow))
+	for _, a := range f.Allow {
+		allow[a] = true
+	}
+	deny := make(map[string]bool, len(f.Deny))
+	for _, d := range f.Deny {
+		deny[d] = true
+	}
+
+	claim := func(clientName, owner string) error {
+		if prev, dup := clientNames[clientName]; dup {
+			return fmt.Errorf("client-facing tool name %q claimed by both %s and %s", clientName, prev, owner)
+		}
+		clientNames[clientName] = owner
+		return nil
+	}
+
+	// Rename keys in sorted order so a config with several problems reports
+	// the same one on every run (map iteration order is randomized).
+	for _, orig := range slices.Sorted(maps.Keys(f.Rename)) {
+		newName := f.Rename[orig]
+		if !upstreamNameRe.MatchString(newName) {
+			return fmt.Errorf("upstream %q: tools.rename[%q] = %q: client-facing name must match %s (MCP_NOTES §6)",
+				u.Name, orig, newName, upstreamNameRe)
+		}
+		if len(f.Allow) > 0 && !allow[orig] {
+			return fmt.Errorf("upstream %q: tools.rename key %q is not in tools.allow — the rename could never apply", u.Name, orig)
+		}
+		if deny[orig] {
+			continue // a denied tool never reaches the client, so its renamed name is never used
+		}
+		if err := claim(newName, fmt.Sprintf("upstream %q (rename of %q)", u.Name, orig)); err != nil {
+			return err
+		}
+	}
+	// Allowed-but-not-renamed tools land under the default namespaced name —
+	// the only other client-facing names the config knows before runtime.
+	for _, a := range f.Allow {
+		if _, renamed := f.Rename[a]; renamed || deny[a] {
+			continue
+		}
+		// "__" is the registry's NameSeparator (docs/MCP_NOTES.md §6); config
+		// cannot import registry (import cycle), so it is spelled here.
+		if err := claim(u.Name+"__"+a, fmt.Sprintf("upstream %q (tool %q)", u.Name, a)); err != nil {
 			return err
 		}
 	}
