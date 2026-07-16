@@ -140,6 +140,33 @@ func TestRegistryAppliesToolFilter(t *testing.T) {
 	}
 }
 
+// TestStartReportCountsFilteredTools is the regression test for the doctor
+// tool count: an upstream advertising more tools than its allow-filter lets
+// through must be reported (UpstreamStatus.Tools → doctor's TOOLS column) with
+// the PROJECTED count — what the client actually sees — not the raw
+// advertisement.
+func TestStartReportCountsFilteredTools(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "gh", Enabled: true, Tools: config.ToolFilter{
+			Allow: []string{"search"},
+		}},
+	}}
+	gh := &fakeUpstream{name: "gh", tools: []string{"search", "create_issue", "delete_repo"}}
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{"gh": gh})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	report := r.StartReport()
+	if len(report) != 1 {
+		t.Fatalf("report has %d entries, want 1: %+v", len(report), report)
+	}
+	if got := report[0]; !got.OK || got.Tools != 1 {
+		t.Errorf("report entry = %+v, want OK=true Tools=1 (3 advertised, allow keeps 1)", got)
+	}
+}
+
 // TestReloadFilterOnlyDoesNotRelaunch is the Stage 9 race-guard (run under
 // -race): a reload that changes ONLY the tools filter (launch fields identical)
 // must apply the new projection WITHOUT closing, relaunching, or even

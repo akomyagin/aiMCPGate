@@ -289,8 +289,8 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 		r.recordFailure(u.Name, err.Error())
 		return
 	}
-	r.merge(u.Name, conn, tools)
-	r.recordSuccess(u.Name, len(tools))
+	n := r.merge(u.Name, conn, tools)
+	r.recordSuccess(u.Name, n)
 	r.superviseUpstream(u, conn)
 }
 
@@ -582,12 +582,14 @@ func (r *Registry) relistUpstream(name string) {
 }
 
 // merge namespaces an upstream's tools and adds them to the aggregated catalog
-// and routing table under the registry lock.
-func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool) {
+// and routing table under the registry lock. It returns the number of tools
+// actually projected into the catalog (post-filter, post-dedup).
+func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog merged", "upstream", name, "tools", len(tools))
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n)
+	return n
 }
 
 // toolEntry pairs a client-facing tool name with the (verbatim) upstream tool
@@ -656,17 +658,23 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 // collisions are rejected by config.Validate for every name the config knows
 // statically; this keep-first only guards runtime surprises (an upstream
 // advertising a name that happens to match another's projection).
-func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) {
+// It returns the number of entries actually added to the catalog by this call
+// (post-filter, post-dedup) — the count the client really sees, which callers
+// report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
+func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int {
 	r.conns[name] = conn
 	r.rawTools[name] = tools
+	n := 0
 	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
 		if _, dup := r.tools[e.name]; dup {
-			r.log.Debug("duplicate client-facing tool name skipped", "name", e.name, "upstream", name)
+			r.log.Warn("duplicate client-facing tool name skipped", "name", e.name, "upstream", name)
 			continue
 		}
 		r.tools[e.name] = ToolDescriptor{Name: e.name, Upstream: name, Tool: e.tool}
 		r.toolRoute[e.name] = route{upstream: name, original: e.tool.Name}
+		n++
 	}
+	return n
 }
 
 // dropUpstream removes an upstream and every catalog/routing entry it owns,
@@ -709,8 +717,8 @@ func (r *Registry) replaceUpstream(name string, conn Upstream, tools []mcp.Tool)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dropLocked(name)
-	r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", len(tools))
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", n)
 }
 
 // Subscribe registers interest in runtime catalog changes and returns a channel
@@ -884,8 +892,8 @@ func (r *Registry) remergeUpstream(name string) {
 	}
 	tools := r.rawTools[name] // read BEFORE dropLocked, which deletes the entry
 	r.dropLocked(name)
-	r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog re-projected", "upstream", name, "raw_tools", len(tools))
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog re-projected", "upstream", name, "tools", n)
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
