@@ -45,8 +45,9 @@ func runDoctor(cmd *cobra.Command, configPath string) error {
 
 	// supervise=false: one pass, no auto-restart goroutines (see the comment on
 	// Registry.supervise). callLog=nil: doctor performs no tool calls, so there
-	// is nothing to audit.
-	reg := registry.New(cfg, logger, nil, false)
+	// is nothing to audit; the payload log is the no-op (empty path never errors).
+	payloadLog, _ := logging.NewPayloadLog("")
+	reg := registry.New(cfg, logger, nil, payloadLog, false)
 	defer func() { _ = reg.Close() }()
 
 	// Start's error for the all-upstreams-failed case is deliberately NOT

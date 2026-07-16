@@ -74,7 +74,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestSupervisorReapsCrashedProcess(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSupervisorGivesUpAndDrops(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestSupervisorDisabled(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestUpstreamListChangedRefreshesCatalog(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

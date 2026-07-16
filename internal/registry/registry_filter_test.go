@@ -200,7 +200,7 @@ func TestReloadFilterOnlyDoesNotRelaunch(t *testing.T) {
 		},
 		Upstreams: []config.Upstream{base},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestReloadAllowExpansionRestoresFilteredTool(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base},
 	}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

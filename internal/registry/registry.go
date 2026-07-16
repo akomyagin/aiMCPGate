@@ -93,7 +93,13 @@ type Registry struct {
 	cfg     atomic.Pointer[config.Config]
 	log     *slog.Logger
 	callLog logging.CallLog
-	start   upstreamStarter
+	// payloadLog is the OPT-IN payload debug log (Stage 10). It is never nil —
+	// New always sets it (a no-op implementation when disabled) so CallTool can
+	// call Record unconditionally. Unlike callLog it carries raw arguments and
+	// results, which may contain secrets; it stays strictly separate from the
+	// metadata-only audit log (SKILL §6).
+	payloadLog logging.PayloadLog
+	start      upstreamStarter
 
 	// autoRestart gates the per-upstream auto-restart supervisor goroutines
 	// (Stage 7a); it is New's supervise parameter. serve runs with true;
@@ -171,13 +177,17 @@ const relistDebounce = 200 * time.Millisecond
 
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
-// supervise=false disables the auto-restart supervisors entirely (see the field
-// comment) — used by `mcp-gate doctor`, which wants exactly one pass.
-func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, supervise bool) *Registry {
+// payloadLog is the opt-in payload debug log (Stage 10); pass
+// logging.NewPayloadLog("") for the no-op when payload logging is not wanted
+// (doctor, tests) — it must not be nil. supervise=false disables the
+// auto-restart supervisors entirely (see the field comment) — used by
+// `mcp-gate doctor`, which wants exactly one pass.
+func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
 		log:          logger,
 		callLog:      callLog,
+		payloadLog:   payloadLog,
 		autoRestart:  supervise,
 		conns:        map[string]Upstream{},
 		tools:        map[string]ToolDescriptor{},
@@ -965,6 +975,7 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 	start := time.Now()
 	resp, err := conn.CallTool(callCtx, rt.original, arguments)
 	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
+	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
 	if err != nil {
 		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -995,6 +1006,32 @@ func (r *Registry) audit(up, method, tool string, start time.Time, resp *mcp.Mes
 		rec.Err = resp.Error.Message // upstream error message; no arguments
 	}
 	r.callLog.Record(rec)
+}
+
+// recordPayload writes one PayloadRecord to the OPT-IN payload debug log — the
+// full arguments and result of a call. This is deliberately kept separate from
+// audit (which stays metadata-only): only here, when the operator explicitly
+// enabled payload logging, do raw arguments (possible secrets) hit disk. When
+// payload logging is disabled r.payloadLog is a no-op, so this is a cheap call.
+func (r *Registry) recordPayload(up, tool string, arguments json.RawMessage, resp *mcp.Message, err error) {
+	rec := logging.PayloadRecord{
+		Time:      time.Now(),
+		Upstream:  up,
+		Tool:      tool,
+		Method:    mcp.MethodToolsCall,
+		OK:        err == nil && (resp == nil || resp.Error == nil),
+		Arguments: arguments,
+	}
+	switch {
+	case err != nil:
+		rec.Err = err.Error()
+	case resp != nil && resp.Error != nil:
+		rec.Err = resp.Error.Message
+		rec.Result = resp.Result
+	case resp != nil:
+		rec.Result = resp.Result
+	}
+	r.payloadLog.Record(rec)
 }
 
 func (r *Registry) upstreamCount() int {

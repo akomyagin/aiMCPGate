@@ -100,7 +100,7 @@ func TestNoSuperviseSkipsRestart(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, false)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), false)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

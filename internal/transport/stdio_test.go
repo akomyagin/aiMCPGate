@@ -21,6 +21,13 @@ import (
 // quietLogger discards operational logs so test output stays clean.
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// noopPayloadLog returns the disabled (no-op) payload log for registry.New in
+// transport tests, which do not exercise Stage 10 payload logging.
+func noopPayloadLog() logging.PayloadLog {
+	p, _ := logging.NewPayloadLog("")
+	return p
+}
+
 // buildFakeServer compiles the shared internal/upstream/testdata/fakeserver
 // binary once and returns its path. The fakeserver speaks MCP over stdio and is
 // configured via env (FAKE_NAME/FAKE_TOOLS/FAKE_ECHO). Same helper pattern as
@@ -80,7 +87,7 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 // custom config or a call log.
 func startServerWithConfig(t *testing.T, cfg *config.Config, callLog logging.CallLog) (*fakeClient, context.CancelFunc, <-chan error) {
 	t.Helper()
-	reg := registry.New(cfg, quietLogger(), callLog, true)
+	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true)
 
 	clientToSrv, srvIn := io.Pipe() // client writes to srvIn side... (see below)
 	srvOut, clientFromSrv := io.Pipe()

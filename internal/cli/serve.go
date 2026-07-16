@@ -52,7 +52,19 @@ func runServe(parent context.Context, configPath, version string) error {
 	}
 	defer func() { _ = callLog.Close() }()
 
-	reg := registry.New(cfg, logger, callLog, true)
+	// Opt-in payload debug log (Stage 10): off unless debug_payload_log is set.
+	// When enabled it writes raw request/response bodies — possibly secrets — so
+	// warn loudly at startup; it must never be left on in production.
+	payloadLog, err := logging.NewPayloadLog(cfg.DebugPayloadLog)
+	if err != nil {
+		return fmt.Errorf("open payload log: %w", err)
+	}
+	defer func() { _ = payloadLog.Close() }()
+	if cfg.DebugPayloadLog != "" {
+		logger.Warn("payload logging ENABLED: request/response bodies (incl. possible secrets) are written to disk; disable in production", "path", cfg.DebugPayloadLog)
+	}
+
+	reg := registry.New(cfg, logger, callLog, payloadLog, true)
 	srv := transport.NewServer(cfg, reg, logger, version)
 
 	// Live config reload on SIGHUP (Stage 7d): reload runs in its own goroutine
