@@ -761,6 +761,11 @@ func (r *Registry) notifyCatalogChanged() {
 //   - REMOVED (live, now absent or disabled): retire supervisor + Close + drop;
 //   - CHANGED (live, launch fields differ): retire supervisor + Close old +
 //     launch new + replaceUpstream + supervise;
+//   - FILTER-ONLY (live, launch identical, tools filter differs — Stage 9):
+//     re-project the stored raw tool list through the new filter. No Close, no
+//     relaunch, no network re-list — the upstream's raw catalog did not change,
+//     only its projection did, so a deny-list edit takes effect on SIGHUP
+//     without any upstream downtime;
 //   - UNCHANGED: left running untouched.
 //
 // newCfg MUST already be validated (serve.go loads it via config.Load, which
@@ -793,7 +798,7 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	r.mu.RUnlock()
 
 	var added, changed []config.Upstream
-	var removed []string
+	var removed, filterOnly []string
 
 	for name, nu := range newEnabled {
 		ou, wasEnabled := oldEnabled[name]
@@ -804,6 +809,12 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 			added = append(added, nu)
 		case wasEnabled && !ou.SameLaunch(nu):
 			changed = append(changed, nu)
+		case wasEnabled && !ou.SameFilter(nu):
+			// FILTER-ONLY: launch identical (the previous case would have caught
+			// anything else), only the tools filter differs. The new filter is
+			// applied by re-merging the stored raw tool list below — mergeLocked
+			// reads the filter from r.cfg, already swapped to newCfg above.
+			filterOnly = append(filterOnly, name)
 		default:
 			// Live and unchanged (or was live from an identical launch): leave it.
 		}
@@ -847,9 +858,34 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		r.superviseUpstream(u, conn)
 		r.log.Info("upstream added by reload", "upstream", u.Name, "tools", len(tools))
 	}
+	for _, name := range filterOnly {
+		r.remergeUpstream(name)
+		r.log.Info("upstream tool filter updated by reload", "upstream", name)
+	}
+
 	r.notifyCatalogChanged()
-	r.log.Info("config reloaded", "added", len(added), "changed", len(changed), "removed", len(removed))
+	r.log.Info("config reloaded",
+		"added", len(added), "changed", len(changed), "removed", len(removed), "filter_only", len(filterOnly))
 	return nil
+}
+
+// remergeUpstream re-projects an upstream's stored raw tool list through the
+// CURRENT config's filter, under a single hold of r.mu — the client never sees
+// a torn catalog, exactly like replaceUpstream (Stage 9, filter-only reload).
+// No I/O happens here: the connection and the raw list are reused as-is. A
+// concurrent restart/reload may have dropped the upstream since the diff was
+// computed — then there is nothing to re-merge.
+func (r *Registry) remergeUpstream(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	conn, ok := r.conns[name]
+	if !ok {
+		return
+	}
+	tools := r.rawTools[name] // read BEFORE dropLocked, which deletes the entry
+	r.dropLocked(name)
+	r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog re-projected", "upstream", name, "raw_tools", len(tools))
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
