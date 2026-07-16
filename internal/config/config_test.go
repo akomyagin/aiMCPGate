@@ -339,6 +339,160 @@ func TestSameLaunch(t *testing.T) {
 	}
 }
 
+// TestValidateToolFilter drives the Stage 9 filter validation: rename keys must
+// stay inside a non-empty allow, rename targets must be well-formed tool names,
+// and the client-facing names the config makes statically known must be unique
+// across the WHOLE config, not just within one upstream.
+func TestValidateToolFilter(t *testing.T) {
+	// two upstreams so cross-upstream collisions can be expressed
+	mk := func(aTools, bTools ToolFilter) *Config {
+		return &Config{Transport: TransportStdio, Upstreams: []Upstream{
+			{Name: "a", Command: "x", Tools: aTools},
+			{Name: "b", Command: "y", Tools: bTools},
+		}}
+	}
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr bool
+	}{
+		{"empty filters", mk(ToolFilter{}, ToolFilter{}), false},
+		{"allow and deny only", mk(
+			ToolFilter{Allow: []string{"t1", "t2"}, Deny: []string{"t2"}},
+			ToolFilter{Deny: []string{"danger"}},
+		), false},
+		{"rename without allow", mk(
+			ToolFilter{Rename: map[string]string{"t1": "short_t1"}},
+			ToolFilter{},
+		), false},
+		{"rename plus allow, key allowed", mk(
+			ToolFilter{Allow: []string{"t1"}, Rename: map[string]string{"t1": "short_t1"}},
+			ToolFilter{},
+		), false},
+		{"rename key outside allow", mk(
+			ToolFilter{Allow: []string{"t1"}, Rename: map[string]string{"t2": "short_t2"}},
+			ToolFilter{},
+		), true},
+		{"rename target with bad characters", mk(
+			ToolFilter{Rename: map[string]string{"t1": "has space"}},
+			ToolFilter{},
+		), true},
+		{"rename target empty", mk(
+			ToolFilter{Rename: map[string]string{"t1": ""}},
+			ToolFilter{},
+		), true},
+		{"renamed names collide across upstreams", mk(
+			ToolFilter{Rename: map[string]string{"t1": "shared"}},
+			ToolFilter{Rename: map[string]string{"other": "shared"}},
+		), true},
+		{"rename collides with other upstream default name", mk(
+			ToolFilter{Allow: []string{"t1"}}, // client-facing "a__t1"
+			ToolFilter{Rename: map[string]string{"x": "a__t1"}},
+		), true},
+		{"same client name freed by deny", mk(
+			// a's rename never materializes (denied), so b may take the name
+			ToolFilter{Deny: []string{"t1"}, Rename: map[string]string{"t1": "shared"}},
+			ToolFilter{Rename: map[string]string{"x": "shared"}},
+		), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestSameFilter checks the reload diff's FILTER-ONLY predicate — and that a
+// filter change alone does NOT flip SameLaunch (the whole point of keeping the
+// two predicates separate: filter-only reload must not relaunch the process).
+func TestSameFilter(t *testing.T) {
+	base := Upstream{Name: "x", Command: "cmd", Tools: ToolFilter{
+		Allow:  []string{"a", "b"},
+		Deny:   []string{"c"},
+		Rename: map[string]string{"a": "short_a"},
+	}}
+	clone := func() Upstream {
+		u := base
+		u.Tools = ToolFilter{
+			Allow:  append([]string(nil), base.Tools.Allow...),
+			Deny:   append([]string(nil), base.Tools.Deny...),
+			Rename: map[string]string{"a": "short_a"},
+		}
+		return u
+	}
+	tests := []struct {
+		name string
+		mod  func(*Upstream)
+		same bool
+	}{
+		{"identical", func(*Upstream) {}, true},
+		{"allow differs", func(u *Upstream) { u.Tools.Allow = []string{"a"} }, false},
+		{"deny differs", func(u *Upstream) { u.Tools.Deny = []string{"c", "d"} }, false},
+		{"rename differs", func(u *Upstream) { u.Tools.Rename["a"] = "other" }, false},
+		{"launch fields ignored by SameFilter", func(u *Upstream) { u.Command = "other" }, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := clone()
+			tt.mod(&other)
+			if got := base.SameFilter(other); got != tt.same {
+				t.Errorf("SameFilter = %v, want %v", got, tt.same)
+			}
+			// A filter-only difference must never look like a launch change.
+			if !base.SameLaunch(clone()) {
+				t.Error("sanity: identical launch reported as changed")
+			}
+		})
+	}
+
+	filterOnly := clone()
+	filterOnly.Tools.Deny = []string{"c", "extra"}
+	if !base.SameLaunch(filterOnly) {
+		t.Error("filter change flipped SameLaunch — it must stay a launch-identical upstream")
+	}
+	if base.SameFilter(filterOnly) {
+		t.Error("changed deny list reported as same filter")
+	}
+}
+
+// TestLoadParsesToolFilter confirms the YAML shape of the tools block
+// (allow/deny/rename) round-trips through Load.
+func TestLoadParsesToolFilter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+upstreams:
+  - name: grafana
+    command: grafana-mcp
+    enabled: true
+    tools:
+      allow: ["query_prometheus", "list_dashboards"]
+      deny: ["delete_dashboard"]
+      rename:
+        query_prometheus: "grafana_query"
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f := cfg.Upstreams[0].Tools
+	if len(f.Allow) != 2 || f.Allow[0] != "query_prometheus" {
+		t.Errorf("allow = %v, want [query_prometheus list_dashboards]", f.Allow)
+	}
+	if len(f.Deny) != 1 || f.Deny[0] != "delete_dashboard" {
+		t.Errorf("deny = %v, want [delete_dashboard]", f.Deny)
+	}
+	if f.Rename["query_prometheus"] != "grafana_query" {
+		t.Errorf("rename = %v, want query_prometheus→grafana_query", f.Rename)
+	}
+}
+
 // TestSameLaunchHTTP checks url/headers are compared for http upstreams.
 func TestSameLaunchHTTP(t *testing.T) {
 	a := Upstream{Name: "h", URL: "https://x/mcp", Headers: map[string]string{"Authorization": "Bearer a"}}

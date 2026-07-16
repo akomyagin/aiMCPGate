@@ -117,8 +117,15 @@ type Registry struct {
 
 	mu        sync.RWMutex
 	conns     map[string]Upstream
-	tools     map[string]ToolDescriptor // namespaced name → descriptor
-	toolRoute map[string]route          // namespaced name → (upstream, original)
+	tools     map[string]ToolDescriptor // client-facing name → descriptor
+	toolRoute map[string]route          // client-facing name → (upstream, original)
+	// rawTools holds the last UNFILTERED tools/list result per upstream, kept
+	// alongside the filtered catalog (Stage 9): a reload that only widens an
+	// allow-list must be able to resurrect a previously filtered-out tool
+	// whose mcp.Tool is long gone from r.tools — without a fresh network
+	// re-list. Guarded by the same r.mu as conns/tools/toolRoute because the
+	// four are always mutated together (mergeLocked/dropLocked).
+	rawTools map[string][]mcp.Tool
 
 	failMu   sync.Mutex
 	failures []string         // "<upstream>: <reason>" for upstreams that never came up; unordered (parallel bringUp), sorted when reported
@@ -175,6 +182,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, super
 		conns:        map[string]Upstream{},
 		tools:        map[string]ToolDescriptor{},
 		toolRoute:    map[string]route{},
+		rawTools:     map[string][]mcp.Tool{},
 		subscribers:  map[int]chan struct{}{},
 		relistTimers: map[string]*time.Timer{},
 		supStop:      map[string]chan struct{}{},
@@ -281,8 +289,8 @@ func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
 		r.recordFailure(u.Name, err.Error())
 		return
 	}
-	r.merge(u.Name, conn, tools)
-	r.recordSuccess(u.Name, len(tools))
+	n := r.merge(u.Name, conn, tools)
+	r.recordSuccess(u.Name, n)
 	r.superviseUpstream(u, conn)
 }
 
@@ -574,29 +582,99 @@ func (r *Registry) relistUpstream(name string) {
 }
 
 // merge namespaces an upstream's tools and adds them to the aggregated catalog
-// and routing table under the registry lock.
-func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool) {
+// and routing table under the registry lock. It returns the number of tools
+// actually projected into the catalog (post-filter, post-dedup).
+func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog merged", "upstream", name, "tools", len(tools))
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n)
+	return n
+}
+
+// toolEntry pairs a client-facing tool name with the (verbatim) upstream tool
+// it exposes — the output unit of filterAndRenameTools.
+type toolEntry struct {
+	name string // renamed, or default "<upstream>__<original>"
+	tool mcp.Tool
+}
+
+// filterAndRenameTools projects one upstream's raw tool list through its
+// configured filter (Stage 9): allow (when non-empty — intersection), then
+// deny (subtraction), then rename (client-facing name for survivors; tools
+// without a rename get the default namespaced "<upstream>__<original>").
+// It is pure — no registry state, no side effects — so the projection can be
+// re-run at any time against the stored raw list (filter-only reload).
+func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter) []toolEntry {
+	allow := make(map[string]bool, len(f.Allow))
+	for _, a := range f.Allow {
+		allow[a] = true
+	}
+	deny := make(map[string]bool, len(f.Deny))
+	for _, d := range f.Deny {
+		deny[d] = true
+	}
+
+	out := make([]toolEntry, 0, len(tools))
+	for _, t := range tools {
+		if len(allow) > 0 && !allow[t.Name] {
+			continue
+		}
+		if deny[t.Name] {
+			continue
+		}
+		name, renamed := f.Rename[t.Name]
+		if !renamed {
+			name = upstream + NameSeparator + t.Name
+		}
+		out = append(out, toolEntry{name: name, tool: t})
+	}
+	return out
+}
+
+// filterFor looks up the CURRENT tool filter for an upstream by name from the
+// atomic config snapshot — deliberately not passed as a parameter: several
+// callers of merge/replaceUpstream (relistUpstream, a supervisor holding the
+// config.Upstream it was launched with) would otherwise carry a filter frozen
+// at launch time, guaranteed stale after the next reload. A linear scan over
+// units-to-tens of upstreams outside any hot path is fine. An upstream absent
+// from the current config (narrow window: reload just removed it while a late
+// re-list is still running) gets the empty filter — pass everything through,
+// consistent with relistUpstream's own conn==nil bail-out.
+func (r *Registry) filterFor(name string) config.ToolFilter {
+	for _, u := range r.config().Upstreams {
+		if u.Name == name {
+			return u.Tools
+		}
+	}
+	return config.ToolFilter{}
 }
 
 // mergeLocked is the shared catalog-write body used by merge and
 // replaceUpstream, assuming r.mu is already held. It records the connection and
-// namespaces each tool into the catalog/routing table, skipping a duplicate
-// namespaced name (same upstream advertising it twice — keep first, log).
-func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) {
+// the raw (pre-filter) tool list, then projects the tools through the
+// upstream's current filter (Stage 9) into the catalog/routing table, skipping
+// a duplicate client-facing name (keep first, log). Cross-upstream rename
+// collisions are rejected by config.Validate for every name the config knows
+// statically; this keep-first only guards runtime surprises (an upstream
+// advertising a name that happens to match another's projection).
+// It returns the number of entries actually added to the catalog by this call
+// (post-filter, post-dedup) — the count the client really sees, which callers
+// report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
+func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int {
 	r.conns[name] = conn
-	for _, t := range tools {
-		ns := name + NameSeparator + t.Name
-		if _, dup := r.tools[ns]; dup {
-			r.log.Debug("duplicate namespaced tool skipped", "name", ns)
+	r.rawTools[name] = tools
+	n := 0
+	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
+		if _, dup := r.tools[e.name]; dup {
+			r.log.Warn("duplicate client-facing tool name skipped", "name", e.name, "upstream", name)
 			continue
 		}
-		r.tools[ns] = ToolDescriptor{Name: ns, Upstream: name, Tool: t}
-		r.toolRoute[ns] = route{upstream: name, original: t.Name}
+		r.tools[e.name] = ToolDescriptor{Name: e.name, Upstream: name, Tool: e.tool}
+		r.toolRoute[e.name] = route{upstream: name, original: e.tool.Name}
+		n++
 	}
+	return n
 }
 
 // dropUpstream removes an upstream and every catalog/routing entry it owns,
@@ -621,6 +699,7 @@ func (r *Registry) dropUpstream(name string) {
 // replaceUpstream can drop-then-merge under a SINGLE lock acquisition (below).
 func (r *Registry) dropLocked(name string) {
 	delete(r.conns, name)
+	delete(r.rawTools, name)
 	for ns, d := range r.tools {
 		if d.Upstream == name {
 			delete(r.tools, ns)
@@ -638,8 +717,8 @@ func (r *Registry) replaceUpstream(name string, conn Upstream, tools []mcp.Tool)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dropLocked(name)
-	r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", len(tools))
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", n)
 }
 
 // Subscribe registers interest in runtime catalog changes and returns a channel
@@ -690,6 +769,11 @@ func (r *Registry) notifyCatalogChanged() {
 //   - REMOVED (live, now absent or disabled): retire supervisor + Close + drop;
 //   - CHANGED (live, launch fields differ): retire supervisor + Close old +
 //     launch new + replaceUpstream + supervise;
+//   - FILTER-ONLY (live, launch identical, tools filter differs — Stage 9):
+//     re-project the stored raw tool list through the new filter. No Close, no
+//     relaunch, no network re-list — the upstream's raw catalog did not change,
+//     only its projection did, so a deny-list edit takes effect on SIGHUP
+//     without any upstream downtime;
 //   - UNCHANGED: left running untouched.
 //
 // newCfg MUST already be validated (serve.go loads it via config.Load, which
@@ -722,7 +806,7 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	r.mu.RUnlock()
 
 	var added, changed []config.Upstream
-	var removed []string
+	var removed, filterOnly []string
 
 	for name, nu := range newEnabled {
 		ou, wasEnabled := oldEnabled[name]
@@ -733,6 +817,12 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 			added = append(added, nu)
 		case wasEnabled && !ou.SameLaunch(nu):
 			changed = append(changed, nu)
+		case wasEnabled && !ou.SameFilter(nu):
+			// FILTER-ONLY: launch identical (the previous case would have caught
+			// anything else), only the tools filter differs. The new filter is
+			// applied by re-merging the stored raw tool list below — mergeLocked
+			// reads the filter from r.cfg, already swapped to newCfg above.
+			filterOnly = append(filterOnly, name)
 		default:
 			// Live and unchanged (or was live from an identical launch): leave it.
 		}
@@ -776,10 +866,34 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		r.superviseUpstream(u, conn)
 		r.log.Info("upstream added by reload", "upstream", u.Name, "tools", len(tools))
 	}
+	for _, name := range filterOnly {
+		r.remergeUpstream(name)
+		r.log.Info("upstream tool filter updated by reload", "upstream", name)
+	}
 
 	r.notifyCatalogChanged()
-	r.log.Info("config reloaded", "added", len(added), "changed", len(changed), "removed", len(removed))
+	r.log.Info("config reloaded",
+		"added", len(added), "changed", len(changed), "removed", len(removed), "filter_only", len(filterOnly))
 	return nil
+}
+
+// remergeUpstream re-projects an upstream's stored raw tool list through the
+// CURRENT config's filter, under a single hold of r.mu — the client never sees
+// a torn catalog, exactly like replaceUpstream (Stage 9, filter-only reload).
+// No I/O happens here: the connection and the raw list are reused as-is. A
+// concurrent restart/reload may have dropped the upstream since the diff was
+// computed — then there is nothing to re-merge.
+func (r *Registry) remergeUpstream(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	conn, ok := r.conns[name]
+	if !ok {
+		return
+	}
+	tools := r.rawTools[name] // read BEFORE dropLocked, which deletes the entry
+	r.dropLocked(name)
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug("upstream catalog re-projected", "upstream", name, "tools", n)
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
