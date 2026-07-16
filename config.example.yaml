@@ -51,6 +51,18 @@ upstreams:
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}         # from the environment, not hardcoded
     enabled: true
+    # Optional per-upstream tool filter/rename (all keys are the upstream's
+    # ORIGINAL tool names). allow non-empty → only those tools; deny is always
+    # subtracted (an extra safety barrier, not a replacement for auth); rename
+    # maps a surviving tool to its client-facing name — unrenamed tools keep
+    # the default "<upstream>__<tool>". Client-facing names must be unique
+    # across the whole config. Editable at runtime via SIGHUP without
+    # restarting the upstream process.
+    # tools:
+    #   allow: ["search_repositories", "get_issue", "create_issue"]
+    #   deny: ["create_issue"]
+    #   rename:
+    #     search_repositories: "gh_search"
 
   # http upstream (Phase 2): an already-running MCP server reached over
   # Streamable HTTP. Set `url` instead of `command` (exactly one of the two).
