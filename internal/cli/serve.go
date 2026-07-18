@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -104,9 +106,52 @@ func watchReload(ctx context.Context, configPath string, reg *registry.Registry,
 				logger.Error("reload failed, keeping current config", "err", err)
 				continue
 			}
-			if err := reg.Reload(ctx, newCfg); err != nil {
+			switch err := reg.Reload(ctx, newCfg); {
+			case err == nil:
+			case errors.Is(err, registry.ErrNotStarted):
+				// SIGHUP landed before Start finished its bring-up (watchReload
+				// starts before srv.Serve). Not fatal — the edit is valid, the
+				// registry just is not ready for it yet; retry shortly.
+				logger.Warn("reload received before startup finished, retrying")
+				retryReload(ctx, reg, newCfg, logger)
+			case errors.Is(err, registry.ErrClosing):
+				// The gateway is shutting down anyway; the reload is moot.
+				logger.Debug("reload ignored: gateway is shutting down")
+			default:
 				logger.Error("reload apply failed", "err", err)
 			}
 		}
 	}
+}
+
+// retryReload re-attempts a Reload that arrived before Start completed
+// (registry.ErrNotStarted). Start normally finishes within moments, so a few
+// short-interval retries suffice; if the limit is exhausted the reload is
+// dropped with an error (the operator can send SIGHUP again). Returns silently
+// when ctx is cancelled (process shutting down) or the registry starts closing.
+func retryReload(ctx context.Context, reg *registry.Registry, newCfg *config.Config, logger *slog.Logger) {
+	const (
+		maxAttempts = 10
+		interval    = 100 * time.Millisecond
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+		switch err := reg.Reload(ctx, newCfg); {
+		case err == nil:
+			return
+		case errors.Is(err, registry.ErrNotStarted):
+			continue // Start still in flight; wait another interval.
+		case errors.Is(err, registry.ErrClosing):
+			logger.Debug("reload abandoned: gateway is shutting down")
+			return
+		default:
+			logger.Error("reload apply failed", "err", err)
+			return
+		}
+	}
+	logger.Error("reload dropped: startup did not finish within the retry window; send the reload signal again")
 }

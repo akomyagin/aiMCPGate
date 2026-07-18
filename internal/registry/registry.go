@@ -39,6 +39,30 @@ import (
 // namespaced name: "<upstream>__<tool>". See docs/MCP_NOTES.md §6.
 const NameSeparator = "__"
 
+// ErrNotStarted is returned by Reload when it is called before Start has
+// completed. Applying a reload mid-Start would race the parallel bring-up:
+// an upstream Start is still handshaking looks "not live" to the reload diff,
+// which would launch a SECOND process with the same name and orphan one of the
+// two (found by independent review after Stage 7). The caller (watchReload)
+// treats this as retryable — Start will finish shortly.
+var ErrNotStarted = errors.New("registry: reload before start completed")
+
+// ErrClosing is returned by Reload when the registry is shutting down (Close
+// has begun). There is nothing meaningful to reload — the caller should just
+// let the process exit.
+var ErrClosing = errors.New("registry: reload during shutdown")
+
+// phase is the registry's lifecycle position, guarded by lifecycleMu. It gates
+// Reload so it can only run between a completed Start and the beginning of
+// Close (see ErrNotStarted / ErrClosing).
+type phase int
+
+const (
+	phaseNew     phase = iota // Start has not completed successfully yet
+	phaseRunning              // Start completed, the registry is serving
+	phaseClosing              // Close has begun
+)
+
 // ToolDescriptor is one aggregated tool entry in the merged catalog.
 //
 // Name is the client-facing name after namespacing (e.g. "github__search").
@@ -120,6 +144,21 @@ type Registry struct {
 	// Registry's whole lifetime and is only cancelled by Close.
 	procCtx    context.Context
 	procCancel context.CancelFunc
+
+	// lifecycleMu serializes Start, Reload and Close against each other; phase
+	// records where in the lifecycle the registry is (guarded by lifecycleMu).
+	// This is the fix for the WaitGroup Add/Wait races found by independent
+	// review after Stage 7: a Reload racing a still-running Start could launch a
+	// duplicate upstream process, and a Reload's supervisors.Add(1) racing
+	// Close's supervisors.Wait() is the documented-forbidden WaitGroup reuse
+	// pattern. With all three under one mutex, none of those windows exist.
+	//
+	// Lock ordering: lifecycleMu is the OUTERMOST lock — it is taken first and
+	// only by Start/Reload/Close; everything they call underneath (bringUp,
+	// launch, merge, superviseUpstream, dropUpstream, ...) takes only the inner
+	// locks (mu, failMu, supMu, ...) and never lifecycleMu, so no cycle exists.
+	lifecycleMu sync.Mutex
+	phase       phase
 
 	mu        sync.RWMutex
 	conns     map[string]Upstream
@@ -222,13 +261,20 @@ func (r *Registry) startUpstream(ctx context.Context, u config.Upstream) (Upstre
 	}
 }
 
-// startStdio launches a stdio child-process upstream.
+// startStdio launches a stdio child-process upstream. The upstream→registry
+// notification callback (Stage 7b) is handed to StartStdio itself, so it is in
+// place BEFORE the connection's reader goroutine starts — installing it after
+// the fact raced an upstream that notifies immediately on startup (found by
+// independent review). Only stdio upstreams push notifications; HTTP has no
+// long-lived reader (documented limitation), so startHTTP wires nothing.
 func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream, error) {
 	env := make([]string, 0, len(u.Env))
 	for k, v := range u.Env {
 		env = append(env, k+"="+v)
 	}
-	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env)
+	name := u.Name
+	onNotify := func(method string) { r.onUpstreamNotification(name, method) }
+	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, onNotify)
 }
 
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
@@ -246,7 +292,14 @@ func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 // if it cannot proceed at all (e.g. context cancelled), or if every upstream
 // failed (or none were enabled) leaving zero live connections — an empty
 // gateway is not a useful degraded mode, it is a misconfiguration.
+//
+// The whole of Start runs under lifecycleMu: a SIGHUP-triggered Reload or a
+// shutdown Close arriving mid-bring-up blocks until Start returns, instead of
+// racing the parallel fan-out (see the lifecycleMu field comment).
 func (r *Registry) Start(ctx context.Context) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
 	g, gctx := errgroup.WithContext(ctx)
 	for _, u := range r.config().Upstreams {
 		if !u.Enabled {
@@ -276,6 +329,7 @@ func (r *Registry) Start(ctx context.Context) error {
 		return fmt.Errorf("no upstream MCP server is reachable:\n%s", r.failureSummary())
 	}
 	r.log.Info("registry ready", "upstreams", r.upstreamCount(), "tools", len(r.Tools()))
+	r.phase = phaseRunning // Reload is admissible from here on (lifecycleMu held).
 	return nil
 }
 
@@ -324,14 +378,9 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 		return nil, nil, fmt.Errorf("failed to start: %w", err)
 	}
 
-	// Wire up upstream→registry notifications (Stage 7b) before the handshake,
-	// so a list_changed that arrives immediately is not missed. Only stdio
-	// upstreams push notifications (HTTP has no long-lived reader — documented
-	// limitation), so this is a type-assertion, like Done()/doneChan.
-	if n, ok := conn.(interface{ OnNotification(func(string)) }); ok {
-		name := u.Name
-		n.OnNotification(func(method string) { r.onUpstreamNotification(name, method) })
-	}
+	// Upstream→registry notifications (Stage 7b) are wired inside startStdio —
+	// the callback rides into StartStdio itself, so it is set before the reader
+	// goroutine starts and a list_changed arriving immediately is not missed.
 
 	initCtx, cancel := context.WithTimeout(ctx, timeout)
 	info, err := conn.Initialize(initCtx)
@@ -795,9 +844,26 @@ func (r *Registry) notifyCatalogChanged() {
 // isolated (logged, that upstream simply absent) — one bad new upstream does not
 // abort the whole reload, matching Start's per-upstream isolation.
 //
-// The atomic config swap happens FIRST so any concurrent CallTool immediately
-// sees the new call timeout / restart policy; the catalog then converges.
+// Reload runs entirely under lifecycleMu, mutually exclusive with Start and
+// Close (see the lifecycleMu field comment): a reload can neither race a
+// still-running Start (duplicate upstream processes) nor a concurrent Close
+// (supervisors.Add vs supervisors.Wait — forbidden WaitGroup reuse). Before
+// Start has completed it returns ErrNotStarted (retryable); once Close has
+// begun it returns ErrClosing. Only after passing that gate is the config
+// swapped atomically — a rejected reload must NOT leave newCfg's timeout/
+// restart policy live while the catalog still reflects the old config — and
+// from the swap on any concurrent CallTool immediately sees the new call
+// timeout / restart policy; the catalog then converges.
 func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	switch r.phase {
+	case phaseNew:
+		return ErrNotStarted
+	case phaseClosing:
+		return ErrClosing
+	}
+
 	oldCfg := r.config()
 	r.cfg.Store(newCfg)
 
@@ -1094,7 +1160,17 @@ func (r *Registry) failureSummary() string {
 }
 
 // Close tears down all upstream connections/child processes, joining any errors.
+//
+// It runs under lifecycleMu, mutually exclusive with Start and Reload: by the
+// time supervisors.Wait() below runs, no Reload can be mid-flight about to
+// supervisors.Add(1) — the WaitGroup reuse race independent review flagged.
+// Marking phaseClosing first makes any Reload queued behind this lock bail out
+// with ErrClosing instead of relaunching upstreams during shutdown.
 func (r *Registry) Close() error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	r.phase = phaseClosing
+
 	// Cancel the long-lived process context first: any upstream still mid-launch
 	// (e.g. blocked in cmd.Start or the handshake) unwinds, and it backstops each
 	// conn's own graceful Close below in case a child ignores stdin closing.

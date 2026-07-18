@@ -30,6 +30,11 @@
 //	                   list_changed to stdout, then truncates the file so it fires
 //	                   once per touch — used to test the gateway's reaction to an
 //	                   upstream list_changed (Stage 7b).
+//	FAKE_NOTIFY_ON_START  if "1", the server writes one notifications/tools/
+//	                   list_changed to stdout immediately on startup, before
+//	                   reading any request — reproduces an upstream that
+//	                   notifies the instant it is launched, the window of the
+//	                   onNotify data race found by independent review.
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -94,6 +99,13 @@ func main() {
 		out.WriteByte('\n')
 		out.Flush()
 		writeMu.Unlock()
+	}
+
+	// notify-on-start: fire one list_changed the moment the process is up,
+	// before any request is even read — the earliest possible server→client
+	// traffic, racing the gateway's callback installation if it were late.
+	if os.Getenv("FAKE_NOTIFY_ON_START") == "1" {
+		write(message{Method: "notifications/tools/list_changed"})
 	}
 
 	// notify poller: when notifyFile becomes non-empty, emit one

@@ -41,7 +41,7 @@ func TestStdioConnHandshakeAndCatalog(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "github", bin, nil,
-		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"})
+		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestStdioConnCallToolEcho(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "web", bin, nil,
-		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"})
+		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "fs", bin, nil,
-		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"})
+		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 
 func TestStdioConnMissingCommand(t *testing.T) {
 	ctx := context.Background()
-	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil)
+	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for missing command")
 	}
@@ -158,7 +158,7 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 	// not hang.
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"})
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 	conn, err := upstream.StartStdio(ctx, logger, "z", bin, nil, []string{
 		"FAKE_TOOLS=t",
 		"FAKE_STDERR_LINES=" + strconv.Itoa(lines),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 func TestStdioConnCloseIsSafeForConcurrentCallers(t *testing.T) {
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"})
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -256,6 +256,39 @@ func TestStdioConnCloseIsSafeForConcurrentCallers(t *testing.T) {
 		if err != errs[0] {
 			t.Errorf("Close() call %d returned %v, want the same cached result as call 0 (%v)", i, err, errs[0])
 		}
+	}
+}
+
+// TestStdioNotifyOnStartNoRace is a regression test for the data race found by
+// independent review after Stage 7: StartStdio used to start the reader
+// goroutine and only AFTERWARDS did the registry install the notification
+// callback via a setter — an upstream that notifies the instant it starts
+// raced readLoop's read of c.onNotify against that late write. The callback is
+// now a StartStdio parameter, written into the struct before the reader
+// goroutine exists. FAKE_NOTIFY_ON_START makes the fake server emit a
+// tools/list_changed before reading any request, hitting exactly that window.
+// Run with -race: the test must be race-clean AND the callback must fire.
+func TestStdioNotifyOnStartNoRace(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	notified := make(chan string, 4)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "eager", bin, nil,
+		[]string{"FAKE_TOOLS=t", "FAKE_NOTIFY_ON_START=1"},
+		func(method string) { notified <- method })
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	defer conn.Close()
+
+	select {
+	case method := <-notified:
+		if method != "notifications/tools/list_changed" {
+			t.Errorf("callback got method %q, want notifications/tools/list_changed", method)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("notification callback was not invoked for the startup list_changed")
 	}
 }
 
