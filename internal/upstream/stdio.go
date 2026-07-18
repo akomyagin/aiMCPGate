@@ -76,16 +76,11 @@ type StdioConn struct {
 	// onNotify, when set, is invoked by readLoop for each notification method
 	// received from the upstream (e.g. notifications/tools/list_changed). The
 	// registry sets it to react to a catalog change (Stage 7b). It is set once,
-	// right after StartStdio and before any traffic, so it needs no lock.
+	// inside StartStdio, before the reader goroutine starts — hence no lock
+	// needed. (It used to be set post-factum via a setter, which raced an
+	// upstream notifying immediately on startup — found by independent review.)
 	onNotify func(method string)
 }
-
-// OnNotification registers a callback invoked (from the reader goroutine) for
-// each notification the upstream sends. Set it before the handshake; it must
-// not block or call back into the connection synchronously, as it runs on the
-// single reader goroutine that also delivers responses (Stage 7b). A nil fn
-// clears it.
-func (c *StdioConn) OnNotification(fn func(method string)) { c.onNotify = fn }
 
 // Name returns the upstream's stable identifier.
 func (c *StdioConn) Name() string { return c.name }
@@ -104,7 +99,15 @@ func (c *StdioConn) Done() <-chan struct{} { return c.done }
 // ctx is bound to the process via exec.CommandContext, so cancelling ctx (e.g.
 // on Ctrl-C) terminates the child. env entries are "KEY=VALUE"; they are
 // appended to the current environment.
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string) (*StdioConn, error) {
+//
+// onNotify, when non-nil, is invoked (from the reader goroutine) for each
+// notification the upstream sends. It must be passed here — not installed
+// after the fact — because the reader goroutine starts before StartStdio
+// returns, and an upstream may notify immediately; the field is written into
+// the struct literal before that goroutine exists, so no lock is needed. The
+// callback must not block or call back into the connection synchronously
+// (Stage 7b).
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, onNotify func(method string)) (*StdioConn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -141,6 +144,7 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 		waiters:    make(map[string]chan *mcp.Message),
 		done:       make(chan struct{}),
 		stderrDone: make(chan struct{}),
+		onNotify:   onNotify, // must be set before go c.readLoop() below
 	}
 
 	go c.readLoop()
