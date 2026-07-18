@@ -57,7 +57,7 @@ func TestRegistryAggregatesHTTPUpstream(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
 		{Name: "remote", URL: srv.URL, Enabled: true}, // kind inferred http from url
 	}}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

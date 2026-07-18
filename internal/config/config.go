@@ -191,6 +191,16 @@ type Config struct {
 	// LogLevel is the slog level: "debug" | "info" | "warn" | "error".
 	LogLevel string `yaml:"log_level"`
 
+	// DebugPayloadLog, when non-empty, enables an OPT-IN, off-by-default debug
+	// log of tool-call payloads (arguments and results) written as JSON lines
+	// to this file — for debugging only, NEVER production. It is deliberately
+	// separate from LogFile: the audit log (LogFile) stays metadata-only and
+	// must never carry arguments, which may contain secrets (SKILL §6). Empty
+	// (the default) disables payload logging entirely. A relative path is
+	// resolved against the config file's directory (Load); it must not equal
+	// LogFile (Validate), otherwise secrets would leak into the audit log.
+	DebugPayloadLog string `yaml:"debug_payload_log"`
+
 	// SkillFile, when set, points to a Markdown file that `mcp-gate skill`
 	// prints instead of the built-in deployment-independent guide — e.g. to
 	// add org-specific tool-usage policy or a translation. Unset uses the
@@ -391,6 +401,7 @@ func Load(path string) (*Config, error) {
 	dir := filepath.Dir(path)
 	cfg.LogFile = resolveRelative(dir, cfg.LogFile)
 	cfg.SkillFile = resolveRelative(dir, cfg.SkillFile)
+	cfg.DebugPayloadLog = resolveRelative(dir, cfg.DebugPayloadLog)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config %q: %w", path, err)
 	}
@@ -428,6 +439,13 @@ func (c *Config) Validate() error {
 
 	if err := c.Restart.validate(); err != nil {
 		return err
+	}
+
+	// The opt-in payload debug log must never share a file with the audit log:
+	// payloads carry raw arguments/results (possibly secrets), which the audit
+	// log is required to stay free of (SKILL §6). Reject the overlap outright.
+	if c.DebugPayloadLog != "" && c.DebugPayloadLog == c.LogFile {
+		return fmt.Errorf("debug_payload_log must not equal log_file (%q): payloads may contain secrets and must not leak into the audit log", c.LogFile)
 	}
 
 	seen := make(map[string]bool, len(c.Upstreams))

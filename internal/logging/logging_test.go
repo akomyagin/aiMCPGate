@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -40,5 +41,51 @@ func TestReadRecordsSkipsTrailingGarbage(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Upstream != "a" {
 		t.Fatalf("want the one good record, got %+v", got)
+	}
+}
+
+// TestPayloadLogRecord writes a PayloadRecord and checks the JSON line carries
+// the raw arguments and result verbatim (the opt-in Stage 10 debug log).
+func TestPayloadLogRecord(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewPayloadLogWriter(&buf)
+	log.Record(PayloadRecord{
+		Upstream:  "github",
+		Tool:      "github__search",
+		Method:    "tools/call",
+		Arguments: json.RawMessage(`{"q":"secret-token"}`),
+		Result:    json.RawMessage(`{"items":[1,2,3]}`),
+	})
+
+	line := strings.TrimSpace(buf.String())
+	var rec PayloadRecord
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.Fatalf("unmarshal payload record: %v (line=%q)", err, line)
+	}
+	if rec.Upstream != "github" || rec.Tool != "github__search" || rec.Method != "tools/call" {
+		t.Errorf("metadata mismatch: %+v", rec)
+	}
+	if string(rec.Arguments) != `{"q":"secret-token"}` {
+		t.Errorf("arguments = %s, want raw passthrough", rec.Arguments)
+	}
+	if string(rec.Result) != `{"items":[1,2,3]}` {
+		t.Errorf("result = %s, want raw passthrough", rec.Result)
+	}
+	if rec.Time.IsZero() {
+		t.Error("Record should stamp a non-zero time")
+	}
+}
+
+// TestPayloadLogDisabled asserts the no-op payload log (empty path) writes
+// nothing, never panics, and closes cleanly — the default off state.
+func TestPayloadLogDisabled(t *testing.T) {
+	log, err := NewPayloadLog("")
+	if err != nil {
+		t.Fatalf("NewPayloadLog(\"\"): %v", err)
+	}
+	// Must not panic and must not write anywhere.
+	log.Record(PayloadRecord{Upstream: "x", Tool: "x__y", Arguments: json.RawMessage(`{"a":1}`)})
+	if err := log.Close(); err != nil {
+		t.Errorf("Close on no-op payload log = %v, want nil", err)
 	}
 }

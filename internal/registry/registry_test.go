@@ -25,6 +25,7 @@ type fakeUpstream struct {
 	initErr   error
 	listErr   error
 	callErr   error
+	callResp  *mcp.Message // if set, CallTool returns this response verbatim
 	nextID    atomic.Int64
 	lastArgs  json.RawMessage
 	lastNamed string
@@ -58,6 +59,9 @@ func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments json.R
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
+	if f.callResp != nil {
+		return f.callResp, nil
+	}
 	// Use a private id counter to prove id spaces are separate from any other
 	// upstream / the registry.
 	id := mcp.IntID(f.nextID.Add(1))
@@ -69,11 +73,25 @@ func (f *fakeUpstream) Close() error { return nil }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// noopPayloadLog returns the disabled (no-op) payload log used by tests that do
+// not exercise Stage 10 payload logging (empty path never errors).
+func noopPayloadLog() logging.PayloadLog {
+	p, _ := logging.NewPayloadLog("")
+	return p
+}
+
 // newTestRegistry builds a registry whose starter returns the provided fakes by
 // upstream name.
 func newTestRegistry(t *testing.T, cfg *config.Config, callLog logging.CallLog, fakes map[string]*fakeUpstream) *Registry {
 	t.Helper()
-	r := New(cfg, quietLogger(), callLog, true)
+	return newTestRegistryWithPayload(t, cfg, callLog, noopPayloadLog(), fakes)
+}
+
+// newTestRegistryWithPayload is newTestRegistry plus an explicit payload log,
+// for the Stage 10 opt-in payload tests.
+func newTestRegistryWithPayload(t *testing.T, cfg *config.Config, callLog logging.CallLog, payloadLog logging.PayloadLog, fakes map[string]*fakeUpstream) *Registry {
+	t.Helper()
+	r := New(cfg, quietLogger(), callLog, payloadLog, true)
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		f, ok := fakes[u.Name]
 		if !ok {
@@ -330,6 +348,134 @@ func TestRegistryCallLogHasNoSecrets(t *testing.T) {
 	}
 	if !strings.Contains(logged, `"ok":true`) {
 		t.Fatalf("call log missing ok=true:\n%s", logged)
+	}
+}
+
+// TestRegistryPayloadLogRecordsArgsAndResult is the Stage 10 end-to-end check:
+// when the opt-in payload log is enabled, CallTool writes the raw arguments AND
+// the upstream result to it (the deliberate difference from the audit log).
+func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var auditBuf, payloadBuf bytes.Buffer
+	callLog := logging.NewCallLogWriter(&auditBuf)
+	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
+
+	r := newTestRegistryWithPayload(t, cfg, callLog, payloadLog, map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	const secret = "SUPER_SECRET_TOKEN_abc123"
+	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
+	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	// The payload log DOES carry the raw arguments and a result (opt-in debug).
+	var rec logging.PayloadRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(payloadBuf.String())), &rec); err != nil {
+		t.Fatalf("decode payload record: %v (line=%q)", err, payloadBuf.String())
+	}
+	if rec.Tool != "web__fetch" || rec.Upstream != "web" || rec.Method != mcp.MethodToolsCall {
+		t.Errorf("payload metadata mismatch: %+v", rec)
+	}
+	if string(rec.Arguments) != string(args) {
+		t.Errorf("payload arguments = %s, want raw %s", rec.Arguments, args)
+	}
+	if len(rec.Result) == 0 {
+		t.Errorf("payload result missing, want the upstream result")
+	}
+
+	// Regression guard (SKILL §6): the AUDIT log still contains no arguments —
+	// enabling the payload log must not leak secrets into calls.jsonl.
+	if strings.Contains(auditBuf.String(), secret) {
+		t.Fatalf("audit log leaked secret:\n%s", auditBuf.String())
+	}
+}
+
+// TestRegistryDefaultPayloadLogOff is the core security regression guard: with
+// payload logging DISABLED (the default no-op), the audit log carries no call
+// arguments — the Stage 10 invariant that a disabled payload log leaves the
+// existing metadata-only guarantee intact (SKILL §6).
+func TestRegistryDefaultPayloadLogOff(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var auditBuf bytes.Buffer
+	callLog := logging.NewCallLogWriter(&auditBuf)
+
+	// newTestRegistry uses the no-op payload log (the disabled default).
+	r := newTestRegistry(t, cfg, callLog, map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	const secret = "SUPER_SECRET_TOKEN_xyz789"
+	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
+	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	logged := auditBuf.String()
+	if strings.Contains(logged, secret) {
+		t.Fatalf("audit log leaked secret with payload logging off:\n%s", logged)
+	}
+	if strings.Contains(logged, "authorization") {
+		t.Fatalf("audit log contains arguments with payload logging off:\n%s", logged)
+	}
+	// Sanity: metadata still recorded.
+	if !strings.Contains(logged, `"tool":"web__fetch"`) {
+		t.Fatalf("audit log missing metadata:\n%s", logged)
+	}
+}
+
+// TestRegistryPayloadLogMarksErrorResponseNotOK is the Stage 10 regression guard
+// for the omitempty trap: when an upstream returns a JSON-RPC error-object with
+// an EMPTY Message (valid per spec — only the code is meaningful), the empty Err
+// string is dropped from the record by `json:"error,omitempty"`. Without an
+// explicit OK field such a record would be indistinguishable from a clean
+// success. OK is written without omitempty precisely so false survives.
+func TestRegistryPayloadLogMarksErrorResponseNotOK(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var auditBuf, payloadBuf bytes.Buffer
+	callLog := logging.NewCallLogWriter(&auditBuf)
+	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
+
+	// Upstream returns a JSON-RPC error response with an EMPTY message string.
+	errResp := mcp.NewError(mcp.IntID(1), -32000, "", nil)
+	r := newTestRegistryWithPayload(t, cfg, callLog, payloadLog, map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}, callResp: errResp},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	line := strings.TrimSpace(payloadBuf.String())
+	var rec logging.PayloadRecord
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.Fatalf("decode payload record: %v (line=%q)", err, line)
+	}
+	// The whole point: even though Err is empty (Message was ""), OK must be
+	// false so the record is not mistaken for a successful call.
+	if rec.OK {
+		t.Errorf("PayloadRecord.OK = true for an error response; want false (rec=%+v)", rec)
+	}
+	if rec.Err != "" {
+		t.Errorf("precondition: expected empty Err (empty upstream Message), got %q", rec.Err)
+	}
+	// And the raw JSON line must actually carry "ok":false (omitempty would have
+	// dropped it) so a log reader can tell success from failure.
+	if !strings.Contains(line, `"ok":false`) {
+		t.Errorf("payload line missing \"ok\":false marker:\n%s", line)
 	}
 }
 

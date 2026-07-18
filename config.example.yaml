@@ -22,6 +22,14 @@ listen_addr: "127.0.0.1:28080" # only used when transport: http
 # launched from — so serve can be run from anywhere and still find its files.
 log_file: ./logs/calls.jsonl
 log_level: info             # debug | info | warn | error
+
+# OPT-IN payload debug log — OFF by default (empty). When set, writes the raw
+# arguments AND results of every tool call as JSON lines to this file. This is a
+# DEBUG-ONLY aid: those bodies can contain secrets, so NEVER leave it enabled in
+# production. It is a SEPARATE file from log_file (which stays metadata-only,
+# with no arguments) and MUST NOT equal log_file. Relative paths resolve against
+# this config file's directory, same as log_file. Uncomment to enable:
+# debug_payload_log: ./logs/payloads.jsonl
 call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 
 # Auto-restart policy for stdio upstreams whose child process dies while the

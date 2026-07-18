@@ -45,7 +45,7 @@ func TestRegistryStartDoesNotKillUpstreamsAfterReturning(t *testing.T) {
 			"FAKE_ECHO":  "1",
 		}},
 	}}
-	r := New(cfg, quietLogger(), nil, true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
 
 	startCtx, cancelStart := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelStart()

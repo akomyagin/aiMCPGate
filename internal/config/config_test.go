@@ -48,6 +48,32 @@ func TestValidateRejectsDuplicateAndBadNames(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPayloadLogEqualsLogFile(t *testing.T) {
+	// Sharing the file would leak raw arguments (possible secrets) into the
+	// metadata-only audit log — a hard security invariant (SKILL §6, Stage 10).
+	c := &Config{
+		Transport:       TransportStdio,
+		LogFile:         "./logs/calls.jsonl",
+		DebugPayloadLog: "./logs/calls.jsonl",
+		Upstreams:       []Upstream{{Name: "a", Command: "x"}},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when debug_payload_log equals log_file")
+	}
+
+	// A distinct payload-log path is accepted.
+	c.DebugPayloadLog = "./logs/payloads.jsonl"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("distinct payload-log path should be valid, got %v", err)
+	}
+
+	// Empty (disabled) is always fine, even if log_file is set.
+	c.DebugPayloadLog = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty payload log should be valid, got %v", err)
+	}
+}
+
 func TestValidateRejectsUnknownTransport(t *testing.T) {
 	c := &Config{Transport: "grpc"}
 	if err := c.Validate(); err == nil {

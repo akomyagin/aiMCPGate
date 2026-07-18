@@ -108,6 +108,86 @@ func (l *jsonCallLog) Close() error {
 	return nil
 }
 
+// PayloadRecord is one entry of the OPT-IN payload debug log — the full
+// arguments and result of a tool call. Unlike CallRecord (metadata only), this
+// deliberately carries the raw request/response bodies, which may contain
+// secrets; it exists strictly for debugging and is off by default (SKILL §6,
+// Stage 10). Arguments/Result are json.RawMessage so payloads pass through
+// verbatim; a nil raw message is emitted as JSON null.
+type PayloadRecord struct {
+	Time      time.Time       `json:"time"`
+	Upstream  string          `json:"upstream"`
+	Tool      string          `json:"tool"`
+	Method    string          `json:"method"`
+	OK        bool            `json:"ok"` // no omitempty: false is the load-bearing value
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Err       string          `json:"error,omitempty"`
+}
+
+// PayloadLog persists PayloadRecords. Implementations must be safe for
+// concurrent use — many upstream calls run on separate goroutines.
+type PayloadLog interface {
+	Record(r PayloadRecord)
+	io.Closer
+}
+
+// jsonPayloadLog writes one JSON object per line to an io.Writer, serialized by
+// a mutex — the same shape as jsonCallLog, but for the opt-in payload debug log.
+type jsonPayloadLog struct {
+	mu     sync.Mutex
+	w      io.Writer
+	closer io.Closer // non-nil only when we opened a file we own
+}
+
+// noopPayloadLog is the default when payload logging is disabled: Record does
+// nothing and Close is a no-op. Returning this instead of nil lets callers
+// invoke Record unconditionally, without a nil check on the hot path.
+type noopPayloadLog struct{}
+
+func (noopPayloadLog) Record(PayloadRecord) {}
+func (noopPayloadLog) Close() error         { return nil }
+
+// NewPayloadLog returns a PayloadLog writing JSON lines. An empty path disables
+// payload logging and returns a no-op implementation. Otherwise the file is
+// opened for append (created if missing) with 0600, like NewCallLog.
+func NewPayloadLog(path string) (PayloadLog, error) {
+	if path == "" {
+		return noopPayloadLog{}, nil
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open payload log %q: %w", path, err)
+	}
+	return &jsonPayloadLog{w: f, closer: f}, nil
+}
+
+// NewPayloadLogWriter builds a payload log over an arbitrary writer (tests).
+func NewPayloadLogWriter(w io.Writer) PayloadLog {
+	return &jsonPayloadLog{w: w}
+}
+
+func (l *jsonPayloadLog) Record(r PayloadRecord) {
+	if r.Time.IsZero() {
+		r.Time = time.Now()
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return // ignore defensively; a PayloadRecord is normally marshalable
+	}
+	b = append(b, '\n')
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = l.w.Write(b)
+}
+
+func (l *jsonPayloadLog) Close() error {
+	if l.closer != nil {
+		return l.closer.Close()
+	}
+	return nil
+}
+
 // ReadRecords decodes CallRecords from a JSON-lines stream (the format
 // NewCallLog writes). It is the read side consumed by the `mcp-gate logs`
 // command. A line that fails to decode is skipped rather than aborting the whole
