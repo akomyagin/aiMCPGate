@@ -10,7 +10,19 @@
 //	FAKE_ECHO        if "1", tools/call echoes back the received arguments as text
 //	FAKE_CALL_DELAY  Go duration (e.g. "2s") to sleep before answering tools/call;
 //	                 used to exercise the gateway's call-timeout path. Handshake
-//	                 and tools/list are never delayed.
+//	                 and tools/list are never delayed by it (see FAKE_INIT_DELAY).
+//	FAKE_INIT_DELAY  Go duration (e.g. "300ms") to sleep before answering the
+//	                 initialize request specifically (tools/list and tools/call
+//	                 are unaffected) — holds the gateway's launch()/handshake
+//	                 open so tests can land a Reload while a supervisor's
+//	                 crash-restart is mid-launch (the replaceUpstreamIfLive
+//	                 race window).
+//	FAKE_LIST_DELAY  Go duration (e.g. "600ms") to sleep before answering
+//	                 tools/list specifically (initialize and tools/call are
+//	                 unaffected) — holds the registry's list_changed re-list
+//	                 RPC in flight so tests can land a Reload while
+//	                 relistUpstream's ListTools is still pending (the
+//	                 replaceUpstreamIfCurrent race window).
 //	FAKE_STDERR_LINES  number of lines to write to stderr right as stdin closes
 //	                   (simulating shutdown diagnostics), before the process
 //	                   exits — used to test that Close() waits for stderr to
@@ -76,6 +88,14 @@ func main() {
 	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
 		callDelay, _ = time.ParseDuration(raw)
 	}
+	var initDelay time.Duration
+	if raw := os.Getenv("FAKE_INIT_DELAY"); raw != "" {
+		initDelay, _ = time.ParseDuration(raw)
+	}
+	var listDelay time.Duration
+	if raw := os.Getenv("FAKE_LIST_DELAY"); raw != "" {
+		listDelay, _ = time.ParseDuration(raw)
+	}
 	exitAfter, _ := strconv.Atoi(os.Getenv("FAKE_EXIT_AFTER"))
 	toolsFile := os.Getenv("FAKE_TOOLS_FILE")
 	notifyFile := os.Getenv("FAKE_NOTIFY_FILE")
@@ -137,6 +157,9 @@ func main() {
 		}
 		switch req.Method {
 		case "initialize":
+			if initDelay > 0 {
+				time.Sleep(initDelay)
+			}
 			result := fmt.Sprintf(
 				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"1.0.0"}}`,
 				name)
@@ -144,6 +167,9 @@ func main() {
 		case "notifications/initialized":
 			// no response
 		case "tools/list":
+			if listDelay > 0 {
+				time.Sleep(listDelay)
+			}
 			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(currentTools(toolsFile, tools)))})
 		case "resources/list":
 			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})

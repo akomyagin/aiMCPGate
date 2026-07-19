@@ -221,6 +221,17 @@ func TestStdioPushesListChangedOnCatalogChange(t *testing.T) {
 	c, cancel, done := startServerWithConfig(t, cfg, nil)
 	defer func() { cancel(); <-done }()
 
+	// Initialize first: push notifications are gated until the client has
+	// completed the handshake (see TestStdioNoListChangedBeforeInitialize).
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
 	// One call crashes the upstream; its reply comes back first.
 	callID := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "crasher__ping"}))
 	callResp := c.readResponse()
@@ -244,6 +255,83 @@ func TestStdioPushesListChangedOnCatalogChange(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestStdioNoListChangedBeforeInitialize verifies the push gate: a catalog
+// change that happens BEFORE the client's initialize must not produce a
+// server→client notification (a strict client would reject traffic before the
+// handshake). The parked push is flushed right after the initialize response,
+// so nothing is lost — the deferred list_changed must be the very next message
+// AFTER the initialize reply. The upstream self-signals a catalog change with
+// FAKE_NOTIFY_ON_START (its list_changed → debounced re-list → subscriber
+// signal), no client involvement.
+func TestStdioNoListChangedBeforeInitialize(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			{Name: "eager", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":           "ping",
+				"FAKE_NOTIFY_ON_START": "1",
+			}},
+		},
+	}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	// A single long-lived reader goroutine feeds every server→client message
+	// into msgs: the "no message yet" wait below leaves a Read blocked, and the
+	// same goroutine must then deliver the initialize response — two competing
+	// readers would steal each other's frames.
+	msgs := make(chan *mcp.Message, 4)
+	go func() {
+		for {
+			m, err := c.fromSrv.Read()
+			if err != nil {
+				return // pipe closed on test teardown
+			}
+			msgs <- m
+		}
+	}()
+
+	// The upstream's list_changed fires on startup; the registry's debounced
+	// re-list (~200ms) signals the transport. Without the gate a push would
+	// arrive here. Wait long enough to cover the debounce plus slack.
+	select {
+	case m := <-msgs:
+		t.Fatalf("server pushed a message before initialize: method=%q", m.Method)
+	case <-time.After(800 * time.Millisecond):
+	}
+
+	// Now initialize. The FIRST message must be the initialize response, and
+	// the deferred list_changed must follow it — order on the stream matters.
+	id := c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+
+	var first, second *mcp.Message
+	select {
+	case first = <-msgs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no initialize response within deadline")
+	}
+	if first.IsNotification() {
+		t.Fatalf("first message after initialize is a notification %q, want the initialize response first", first.Method)
+	}
+	if string(first.ID) != string(id) {
+		t.Fatalf("first message id = %s, want initialize id %s", first.ID, id)
+	}
+
+	select {
+	case second = <-msgs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deferred list_changed never arrived after initialize")
+	}
+	if !second.IsNotification() || second.Method != mcp.NotifToolsListChanged {
+		t.Fatalf("second message = %+v, want notifications/tools/list_changed", second)
+	}
+}
 
 func TestStdioToolsListAggregatesNamespaced(t *testing.T) {
 	c, cancel, done := startServer(t, true)

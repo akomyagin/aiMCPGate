@@ -200,13 +200,15 @@ type Registry struct {
 	relistMu     sync.Mutex
 	relistTimers map[string]*time.Timer
 
-	// supMu guards supStop, one stop-channel per supervised stdio upstream
-	// (Stage 7d). Closing an upstream's channel tells its supervisor to exit
+	// supMu guards supCancel, one context.CancelFunc per supervised stdio
+	// upstream (Stage 7d). Each supervisor runs under its own context derived
+	// from procCtx; cancelling an upstream's entry tells its supervisor to exit
 	// WITHOUT restarting — used when reload removes or replaces that upstream, so
 	// the deliberate Close of its old connection is not mistaken for a crash and
-	// auto-restarted. Full shutdown uses procCtx instead (Close cancels it).
-	supMu   sync.Mutex
-	supStop map[string]chan struct{}
+	// auto-restarted. Full shutdown needs nothing extra: Close cancels procCtx,
+	// which cancels every derived supervisor context automatically.
+	supMu     sync.Mutex
+	supCancel map[string]context.CancelFunc
 }
 
 // relistDebounce is how long the registry waits after the last tools/list_
@@ -234,7 +236,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		rawTools:     map[string][]mcp.Tool{},
 		subscribers:  map[int]chan struct{}{},
 		relistTimers: map[string]*time.Timer{},
-		supStop:      map[string]chan struct{}{},
+		supCancel:    map[string]context.CancelFunc{},
 		procCtx:      procCtx,
 		procCancel:   procCancel,
 	}
@@ -433,6 +435,11 @@ func (r *Registry) superviseUpstream(u config.Upstream, conn Upstream) {
 	if !r.autoRestart {
 		return // doctor mode (Stage 8): one diagnostic pass, never auto-restart.
 	}
+	// policy.Enabled is read ONCE here, only to gate whether a supervisor is
+	// started at all; the policy itself is NOT captured for the supervisor — the
+	// restart loop re-reads it from the live config on every attempt, so a
+	// reload changing backoff/attempts takes effect without recreating the
+	// supervisor (see restart).
 	policy := r.config().EffectiveRestart()
 	if policy.Enabled == nil || !*policy.Enabled {
 		return
@@ -441,43 +448,49 @@ func (r *Registry) superviseUpstream(u config.Upstream, conn Upstream) {
 	if !ok {
 		return // HTTP upstream: unreachability is caught at the next CallTool.
 	}
-	// Register a per-upstream stop channel so reload can retire THIS supervisor
-	// (its deliberate Close must not look like a crash). If one already exists
-	// for the name (shouldn't, but be safe), retire it first.
-	stop := make(chan struct{})
+	// Each supervisor gets its own context derived from procCtx, so a full
+	// shutdown (Close cancels procCtx) retires it automatically, while reload
+	// can retire exactly THIS supervisor via its cancel func (a deliberate
+	// Close must not look like a crash). If a cancel func already exists for
+	// the name (shouldn't, but be safe), retire the old supervisor first.
+	supCtx, cancel := context.WithCancel(r.procCtx)
 	r.supMu.Lock()
-	if old, ok := r.supStop[u.Name]; ok {
-		close(old)
+	if old, ok := r.supCancel[u.Name]; ok {
+		old()
 	}
-	r.supStop[u.Name] = stop
+	r.supCancel[u.Name] = cancel
 	r.supMu.Unlock()
 
 	r.supervisors.Add(1)
 	go func() {
 		defer r.supervisors.Done()
-		r.supervise(u, conn, done, stop, policy)
+		r.supervise(u, conn, done, supCtx)
 	}()
 }
 
-// stopSupervisor retires the supervisor watching upstream name, if any, so its
-// next Close is not auto-restarted (reload removing/replacing an upstream). It
-// closes and forgets the stop channel; a supervisor selecting on it exits.
-func (r *Registry) stopSupervisor(name string) {
+// retireSupervisor retires the supervisor watching upstream name, if any, so
+// its next Close is not auto-restarted (reload removing/replacing an upstream).
+// It cancels and forgets the supervisor's context; a supervisor (or its restart
+// loop, mid-backoff or mid-launch) selecting on it exits without touching the
+// catalog (see replaceUpstreamIfLive).
+func (r *Registry) retireSupervisor(name string) {
 	r.supMu.Lock()
-	if stop, ok := r.supStop[name]; ok {
-		close(stop)
-		delete(r.supStop, name)
+	if cancel, ok := r.supCancel[name]; ok {
+		cancel()
+		delete(r.supCancel, name)
 	}
 	r.supMu.Unlock()
 }
 
-// supervise blocks until the current connection's process dies (done closes),
-// the registry shuts down (procCtx cancelled), or this upstream is retired by
-// reload (stop closed), then drives the restart loop. Each successful restart
-// installs a fresh connection via replaceUpstream and re-arms the watch on the
-// NEW connection's done channel; each failure backs off (exponentially, capped
-// at MaxBackoff) and retries up to MaxAttempts (0 = unlimited). Exhausting the
-// attempts leaves the upstream out of the catalog — the MVP terminal state.
+// supervise blocks until the current connection's process dies (done closes)
+// or the supervisor's context is cancelled — by reload retiring this upstream,
+// or by Close cancelling procCtx (supCtx is derived from it, so the parent's
+// cancellation propagates automatically) — then drives the restart loop. Each
+// successful restart installs a fresh connection via replaceUpstreamIfLive and
+// re-arms the watch on the NEW connection's done channel; each failure backs
+// off (exponentially, capped at MaxBackoff) and retries up to MaxAttempts
+// (0 = unlimited). Exhausting the attempts leaves the upstream out of the
+// catalog — the MVP terminal state.
 //
 // conn is tracked (not just its done channel) so a confirmed real crash can be
 // reaped via conn.Close() before relaunching — otherwise cmd.Wait() is never
@@ -485,24 +498,21 @@ func (r *Registry) stopSupervisor(name string) {
 // forever, since nothing else holds a reference to it once replaceUpstream
 // overwrites the registry's map entry (found by independent review;
 // reproduced with a /proc zombie-count check).
-func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struct{}, stop <-chan struct{}, policy config.RestartPolicy) {
+func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struct{}, supCtx context.Context) {
 	for {
 		select {
-		case <-r.procCtx.Done():
-			return // gateway shutting down: Close cancelled procCtx.
-		case <-stop:
-			return // this upstream was retired/replaced by reload.
+		case <-supCtx.Done():
+			return // reload retired this upstream, or Close cancelled procCtx.
 		case <-done:
-			// The process died. If procCtx is also done, it died BECAUSE we are
-			// shutting down; if stop is closed, reload deliberately Closed it.
-			// Either way, do not restart — just exit. In both cases some other
-			// path (Registry.Close's own loop, or retireAndClose) already owns
-			// (or will own) closing conn, so we must NOT close it here too —
-			// that would double-close via a different goroutine, which
-			// StdioConn.Close's sync.Once now tolerates safely, but touching a
-			// connection this code no longer owns is still the wrong call to
-			// make.
-			if r.procCtx.Err() != nil || isClosed(stop) {
+			// The process died. If supCtx is also done, it died BECAUSE we are
+			// shutting down or reload deliberately Closed it. Either way, do not
+			// restart — just exit. In both cases some other path (Registry.
+			// Close's own loop, or retireAndClose) already owns (or will own)
+			// closing conn, so we must NOT close it here too — that would
+			// double-close via a different goroutine, which StdioConn.Close's
+			// sync.Once now tolerates safely, but touching a connection this
+			// code no longer owns is still the wrong call to make.
+			if supCtx.Err() != nil {
 				return
 			}
 			// A genuine crash, not a deliberate shutdown/retire: reap it before
@@ -511,7 +521,7 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 				r.log.Debug("close crashed upstream", "upstream", u.Name, "err", err)
 			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
-			newConn, newDone, ok := r.restart(u, stop, policy)
+			newConn, newDone, ok := r.restart(u, supCtx)
 			if !ok {
 				return // restart gave up (attempts exhausted), retired, or shutting down.
 			}
@@ -520,36 +530,58 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 	}
 }
 
-// isClosed reports whether a struct{} signalling channel has been closed. Safe
-// only for a channel that is exclusively closed (never sent to), which is how
-// the per-upstream stop channel is used.
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
 // restart re-launches a dead stdio upstream with exponential backoff,
 // returning the new connection and its done channel on success — the caller
 // (supervise) must keep the returned conn to close it on the NEXT crash. It
 // returns ok=false when the attempt budget is exhausted (upstream left out of
-// the catalog), the upstream was retired by reload (stop), or the gateway is
-// shutting down. On each successful relaunch it swaps the connection and
-// catalog atomically via replaceUpstream so a client never sees a torn
-// catalog.
-func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy config.RestartPolicy) (Upstream, <-chan struct{}, bool) {
-	backoff := policy.InitialBackoff
-	for attempt := 1; policy.MaxAttempts == 0 || attempt <= policy.MaxAttempts; attempt++ {
-		// Wait out the backoff, but abandon it immediately on shutdown or retire.
+// the catalog), the upstream was retired by reload (supCtx cancelled), or the
+// gateway is shutting down. On each successful relaunch it swaps the
+// connection and catalog atomically via replaceUpstreamIfLive so a client
+// never sees a torn catalog — and a relaunch that lost the race with a reload
+// retiring this upstream is discarded instead of resurrecting it.
+//
+// The restart policy is global (not per-upstream); it is re-read from the live
+// config at the start of EVERY attempt, so a reload that changed
+// enabled/backoff/attempts is picked up without recreating the supervisor —
+// including Enabled=false, which makes an already-looping supervisor give up
+// on its next attempt (found by independent review of the Tier 2 fix: only
+// superviseUpstream checked Enabled, so a mid-backoff supervisor kept retrying
+// forever after a reload disabled auto-restart). Giving up deliberately does
+// NOT dropUpstream — the upstream just stays in its current (unreachable)
+// state, exactly as if the supervisor had never been started. The
+// disabled→enabled transition for an upstream whose supervisor was never
+// started (Enabled=false at Start time) is out of scope — it would need a
+// separate mechanism to start a supervisor post-hoc.
+func (r *Registry) restart(u config.Upstream, supCtx context.Context) (Upstream, <-chan struct{}, bool) {
+	for attempt := 1; ; attempt++ {
+		policy := r.config().EffectiveRestart()
+		if policy.Enabled == nil || !*policy.Enabled {
+			r.log.Info("stdio upstream restart disabled by reload, giving up", "upstream", u.Name)
+			return nil, nil, false
+		}
+		if policy.MaxAttempts != 0 && attempt > policy.MaxAttempts {
+			r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
+				"upstream", u.Name, "max_attempts", policy.MaxAttempts)
+			r.dropUpstream(u.Name)
+			r.notifyCatalogChanged()
+			return nil, nil, false
+		}
+		// Backoff for this attempt, derived entirely from the CURRENT policy:
+		// InitialBackoff grown by the fixed factor per previous failure, capped
+		// at MaxBackoff.
+		backoff := policy.InitialBackoff
+		for i := 1; i < attempt && backoff < policy.MaxBackoff; i++ {
+			backoff *= config.RestartBackoffFactor
+		}
+		if backoff > policy.MaxBackoff {
+			backoff = policy.MaxBackoff
+		}
+
+		// Wait out the backoff, but abandon it immediately on shutdown or retire
+		// (supCtx is derived from procCtx, so it covers both).
 		timer := time.NewTimer(backoff)
 		select {
-		case <-r.procCtx.Done():
-			timer.Stop()
-			return nil, nil, false
-		case <-stop:
+		case <-supCtx.Done():
 			timer.Stop()
 			return nil, nil, false
 		case <-timer.C:
@@ -559,10 +591,6 @@ func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy confi
 		if err != nil {
 			r.log.Warn("stdio upstream restart attempt failed",
 				"upstream", u.Name, "attempt", attempt, "err", err)
-			backoff *= config.RestartBackoffFactor
-			if backoff > policy.MaxBackoff {
-				backoff = policy.MaxBackoff
-			}
 			continue
 		}
 
@@ -574,16 +602,18 @@ func (r *Registry) restart(u config.Upstream, stop <-chan struct{}, policy confi
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
 			return nil, nil, false
 		}
-		r.replaceUpstream(u.Name, conn, tools)
+		if !r.replaceUpstreamIfLive(u.Name, conn, tools, supCtx) {
+			// A reload retired this upstream while we were launching: the fresh
+			// connection must not enter the catalog (that would resurrect an
+			// upstream the reload just removed/replaced). Close it and stop.
+			_ = conn.Close()
+			r.log.Info("stdio upstream retired during restart, discarding relaunch", "upstream", u.Name)
+			return nil, nil, false
+		}
 		r.notifyCatalogChanged()
 		r.log.Info("stdio upstream restarted", "upstream", u.Name, "attempt", attempt, "tools", len(tools))
 		return conn, newDone, true
 	}
-	r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
-		"upstream", u.Name, "max_attempts", policy.MaxAttempts)
-	r.dropUpstream(u.Name)
-	r.notifyCatalogChanged()
-	return nil, nil, false
 }
 
 // onUpstreamNotification handles a notification pushed by a stdio upstream
@@ -612,11 +642,21 @@ func (r *Registry) onUpstreamNotification(name, method string) {
 }
 
 // relistUpstream re-fetches one upstream's tools after it announced a change,
-// swaps its catalog atomically (replaceUpstream), and tells the client
+// swaps its catalog atomically (replaceUpstreamIfCurrent), and tells the client
 // (notifyCatalogChanged). It runs off the debounce timer, bounded by the call
 // timeout and abandoned if the gateway is shutting down. The connection is read
 // under the lock (it may have been replaced/dropped by a concurrent restart);
 // if the upstream is gone, there is nothing to re-list.
+//
+// The ListTools RPC can be in flight for seconds (up to the call timeout), and
+// a Reload can retire/replace THIS upstream meanwhile — an unconditional write
+// afterwards would resurrect a removed upstream or clobber the reload's fresh
+// entry with a stale one (the same class of race replaceUpstreamIfLive closes
+// for the supervisor, found by independent review of the Tier 2 fix). The
+// write therefore goes through replaceUpstreamIfCurrent, which re-checks conn
+// identity atomically with the catalog write. A discarded result must NOT
+// Close conn: this path never owns the connection — either the reload already
+// closed the old conn, or it is the live one and must stay open.
 func (r *Registry) relistUpstream(name string) {
 	if r.procCtx.Err() != nil {
 		return // shutting down
@@ -635,9 +675,11 @@ func (r *Registry) relistUpstream(name string) {
 		r.log.Warn("re-list after upstream list_changed failed", "upstream", name, "err", err)
 		return
 	}
-	r.replaceUpstream(name, conn, tools)
+	if !r.replaceUpstreamIfCurrent(name, conn, tools) {
+		r.log.Info("stale re-list discarded, upstream replaced or removed meanwhile", "upstream", name)
+		return
+	}
 	r.notifyCatalogChanged()
-	r.log.Info("upstream catalog refreshed after list_changed", "upstream", name, "tools", len(tools))
 }
 
 // merge namespaces an upstream's tools and adds them to the aggregated catalog
@@ -770,14 +812,58 @@ func (r *Registry) dropLocked(name string) {
 // replaceUpstream atomically swaps out an upstream's connection and catalog:
 // it drops the old entries and merges the new ones under a single hold of
 // r.mu, so the client never sees the upstream's tools vanish and reappear
-// (which a separate dropUpstream+merge would expose). Used by the auto-restart
-// supervisor, list_changed re-list, and reload of a changed upstream.
+// (which a separate dropUpstream+merge would expose). Used by reload of a
+// changed upstream — the one context where no retire race applies (Reload
+// holds lifecycleMu, so no other Reload can retire the entry it is itself
+// installing), hence the always-live context (Background().Err() is always
+// nil). The list_changed re-list goes through replaceUpstreamIfCurrent
+// instead — it CAN race a Reload.
 func (r *Registry) replaceUpstream(name string, conn Upstream, tools []mcp.Tool) {
+	r.replaceUpstreamIfLive(name, conn, tools, context.Background())
+}
+
+// replaceUpstreamIfLive is replaceUpstream with a liveness gate for the
+// auto-restart supervisor: the supCtx check and the catalog write happen under
+// ONE hold of r.mu, so "was I retired while launching?" and "install my fresh
+// connection" are a single atomic step. Without that atomicity a restart that
+// passed an earlier check could still install its connection after a reload's
+// retireAndClose+dropUpstream ran, resurrecting an upstream the reload just
+// removed (the supervisor-vs-reload race found by independent review). Returns
+// false — leaving the catalog untouched — when supCtx was already cancelled;
+// the caller then owns closing the never-installed connection.
+func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, supCtx context.Context) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if supCtx.Err() != nil {
+		return false
+	}
 	r.dropLocked(name)
 	n := r.mergeLocked(name, conn, tools)
 	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", n)
+	return true
+}
+
+// replaceUpstreamIfCurrent is replaceUpstream with a currency gate for
+// relistUpstream: the check that oldConn is STILL the live connection for this
+// name, and the catalog write, happen under ONE hold of r.mu — so a Reload
+// that retired/relaunched this exact upstream while the ListTools RPC was in
+// flight cannot be raced. relistUpstream is triggered by an upstream's own
+// list_changed notification, not by a supervisor, so it has no supervisor
+// context to check (the gate replaceUpstreamIfLive uses) — the only truth it
+// can consult is the r.conns map itself, hence the connection-identity
+// comparison (all Upstream implementations are pointers, so == is identity).
+// Returns false — leaving the catalog untouched — when r.conns[name] is no
+// longer oldConn (removed, or already replaced by something newer).
+func (r *Registry) replaceUpstreamIfCurrent(name string, oldConn Upstream, tools []mcp.Tool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[name] != oldConn {
+		return false
+	}
+	r.dropLocked(name)
+	n := r.mergeLocked(name, oldConn, tools)
+	r.log.Debug("upstream catalog refreshed after list_changed", "upstream", name, "tools", n)
+	return true
 }
 
 // Subscribe registers interest in runtime catalog changes and returns a channel
@@ -909,8 +995,24 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		}
 	}
 
-	// Apply removals and changes: retire the supervisor first (so the deliberate
-	// Close is not auto-restarted), then Close the old connection, then drop or
+	// Apply the plan in three phases:
+	//
+	//  1. removed — SEQUENTIALLY, FIRST: retiring them frees their client-facing
+	//     names before added/changed upstreams (possibly renamed onto the same
+	//     names) try to claim them;
+	//  2. changed + added — IN PARALLEL (errgroup, same pattern as Start): each
+	//     involves a full launch/handshake, and one slow upstream must not
+	//     serialize the whole reload. Errors stay isolated per-upstream (logged,
+	//     never propagated — g.Go always returns nil), matching Start;
+	//  3. filterOnly — SEQUENTIALLY, LAST: a pure re-projection without I/O that
+	//     must see the final catalog state after removed/changed/added.
+	//
+	// Parallel goroutines here are safe: lifecycleMu is held for the whole
+	// Reload (Tier 1), so no Start/Close/other Reload can interleave; the
+	// catalog itself is guarded by r.mu inside merge/replaceUpstream.
+	//
+	// For removed/changed: retire the supervisor first (so the deliberate Close
+	// is not auto-restarted), then Close the old connection, then drop or
 	// relaunch. Close/launch are I/O — done outside the catalog lock (each of
 	// dropUpstream/replaceUpstream takes the lock itself, briefly).
 	for _, name := range removed {
@@ -918,30 +1020,40 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		r.dropUpstream(name)
 		r.log.Info("upstream removed by reload", "upstream", name)
 	}
+	var g errgroup.Group
 	for _, u := range changed {
-		r.retireAndClose(u.Name)
-		conn, tools, err := r.launch(ctx, u)
-		if err != nil {
-			// The changed upstream failed to relaunch: drop it (its old connection
-			// is already closed) rather than leave the stale catalog entry.
-			r.dropUpstream(u.Name)
-			r.log.Warn("changed upstream failed to relaunch, dropped", "upstream", u.Name, "err", err)
-			continue
-		}
-		r.replaceUpstream(u.Name, conn, tools)
-		r.superviseUpstream(u, conn)
-		r.log.Info("upstream reconfigured by reload", "upstream", u.Name, "tools", len(tools))
+		u := u
+		g.Go(func() error {
+			r.retireAndClose(u.Name)
+			conn, tools, err := r.launch(ctx, u)
+			if err != nil {
+				// The changed upstream failed to relaunch: drop it (its old connection
+				// is already closed) rather than leave the stale catalog entry.
+				r.dropUpstream(u.Name)
+				r.log.Warn("changed upstream failed to relaunch, dropped", "upstream", u.Name, "err", err)
+				return nil
+			}
+			r.replaceUpstream(u.Name, conn, tools)
+			r.superviseUpstream(u, conn)
+			r.log.Info("upstream reconfigured by reload", "upstream", u.Name, "tools", len(tools))
+			return nil
+		})
 	}
 	for _, u := range added {
-		conn, tools, err := r.launch(ctx, u)
-		if err != nil {
-			r.log.Warn("added upstream failed to launch", "upstream", u.Name, "err", err)
-			continue
-		}
-		r.merge(u.Name, conn, tools)
-		r.superviseUpstream(u, conn)
-		r.log.Info("upstream added by reload", "upstream", u.Name, "tools", len(tools))
+		u := u
+		g.Go(func() error {
+			conn, tools, err := r.launch(ctx, u)
+			if err != nil {
+				r.log.Warn("added upstream failed to launch", "upstream", u.Name, "err", err)
+				return nil
+			}
+			r.merge(u.Name, conn, tools)
+			r.superviseUpstream(u, conn)
+			r.log.Info("upstream added by reload", "upstream", u.Name, "tools", len(tools))
+			return nil
+		})
 	}
+	_ = g.Wait() // errors are handled inside each goroutine; Wait only joins them.
 	for _, name := range filterOnly {
 		r.remergeUpstream(name)
 		r.log.Info("upstream tool filter updated by reload", "upstream", name)
@@ -976,7 +1088,7 @@ func (r *Registry) remergeUpstream(name string) {
 // connection, if any. Order matters: retire first so the supervisor treats the
 // coming Close as a deliberate teardown, not a crash to auto-restart.
 func (r *Registry) retireAndClose(name string) {
-	r.stopSupervisor(name)
+	r.retireSupervisor(name)
 	r.mu.RLock()
 	conn := r.conns[name]
 	r.mu.RUnlock()
@@ -1181,8 +1293,15 @@ func (r *Registry) Close() error {
 	// otherwise call replaceUpstream after Close emptied the map, resurrecting a
 	// connection Close would then never tear down (goroutine + child-process
 	// leak) and racing the map access. procCancel above makes them all exit
-	// promptly (their selects and backoff timers watch procCtx).
+	// promptly (every supCtx is derived from procCtx, so cancelling the parent
+	// cancels them all — their selects and backoff timers watch supCtx).
 	r.supervisors.Wait()
+
+	// Every supervisor has returned; drop their (already cancelled) cancel
+	// funcs. Pure tidiness — nothing reads the map after this point.
+	r.supMu.Lock()
+	r.supCancel = map[string]context.CancelFunc{}
+	r.supMu.Unlock()
 
 	// Stop any pending re-list debounce timers so none fires after shutdown.
 	// A timer that already fired is harmless (relistUpstream bails on procCtx

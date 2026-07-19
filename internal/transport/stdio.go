@@ -75,6 +75,15 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	frames := make(chan readResult, 1)
 	go s.readFrames(frames)
 
+	// A server MUST NOT push notifications before the client has initialized —
+	// a list_changed arriving mid-handshake confuses strict clients. Both flags
+	// are plain locals: this select loop is the ONLY place that reads frames and
+	// writes push notifications, so no extra synchronization is needed. A
+	// catalog change arriving before initialize is parked in pendingListChanged
+	// and flushed right after the initialize response goes out.
+	initialized := false
+	pendingListChanged := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -82,11 +91,13 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 			return nil
 		case <-catalogChanged:
 			// The aggregated catalog changed at runtime — tell the client to
-			// re-list. Writes to s.w are serialized by mcp.Writer's own mutex, so
-			// this is safe alongside the reply writes below. A write failure means
-			// the client pipe is gone, so stop serving (same as a failed reply).
-			if err := s.w.Write(mcp.NewNotification(mcp.NotifToolsListChanged, nil)); err != nil {
-				s.log.Warn("write list_changed failed", "err", err)
+			// re-list. Before the client's initialize, park the signal instead
+			// (coalescing into one pending push, matching Subscribe's semantics).
+			if !initialized {
+				pendingListChanged = true
+				continue
+			}
+			if err := s.pushListChanged(); err != nil {
 				return nil
 			}
 		case fr, ok := <-frames:
@@ -100,6 +111,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				s.log.Warn("read client message", "err", fr.err)
 				continue
 			}
+			isInitialize := fr.msg.IsRequest() && fr.msg.Method == mcp.MethodInitialize
 			reply := s.d.dispatch(ctx, fr.msg)
 			if reply == nil {
 				continue // notification or ignored message: nothing to write
@@ -109,8 +121,32 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				s.log.Warn("write reply failed", "err", err)
 				return nil
 			}
+			if isInitialize {
+				// The initialize response is on the wire: pushes are allowed from
+				// here on. Flush a catalog change that arrived during the gate —
+				// it always lands AFTER the initialize response.
+				initialized = true
+				if pendingListChanged {
+					pendingListChanged = false
+					if err := s.pushListChanged(); err != nil {
+						return nil
+					}
+				}
+			}
 		}
 	}
+}
+
+// pushListChanged writes one notifications/tools/list_changed push to the
+// client. Writes to s.w are serialized by mcp.Writer's own mutex, so this is
+// safe alongside the reply writes in Serve. A write failure means the client
+// pipe is gone — the caller stops serving (same as a failed reply).
+func (s *stdioServer) pushListChanged() error {
+	if err := s.w.Write(mcp.NewNotification(mcp.NotifToolsListChanged, nil)); err != nil {
+		s.log.Warn("write list_changed failed", "err", err)
+		return err
+	}
+	return nil
 }
 
 // readResult carries one decoded frame or a per-line decode error from the
