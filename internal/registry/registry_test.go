@@ -479,6 +479,42 @@ func TestRegistryPayloadLogMarksErrorResponseNotOK(t *testing.T) {
 	}
 }
 
+// TestRegistryPayloadLogRecordsErrorData is the Tier 3 regression guard: when
+// an upstream's JSON-RPC error carries the optional structured Data field, the
+// payload log must capture it verbatim in ErrorData — the payload log exists
+// for full debugging visibility, so dropping error.data would defeat its point.
+func TestRegistryPayloadLogRecordsErrorData(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var payloadBuf bytes.Buffer
+	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
+
+	// Upstream returns a JSON-RPC error with a structured data payload.
+	errData := json.RawMessage(`{"reason":"quota","limit":42}`)
+	errResp := mcp.NewError(mcp.IntID(1), -32000, "boom", errData)
+	r := newTestRegistryWithPayload(t, cfg, nil, payloadLog, map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}, callResp: errResp},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	var rec logging.PayloadRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(payloadBuf.String())), &rec); err != nil {
+		t.Fatalf("decode payload record: %v (line=%q)", err, payloadBuf.String())
+	}
+	if rec.Err != "boom" {
+		t.Errorf("PayloadRecord.Err = %q, want %q", rec.Err, "boom")
+	}
+	if string(rec.ErrorData) != string(errData) {
+		t.Errorf("PayloadRecord.ErrorData = %s, want verbatim %s", rec.ErrorData, errData)
+	}
+}
+
 // Two upstreams each mint id=1 from their private counters; the registry must
 // still route every response correctly (id spaces are per-upstream, not global).
 func TestRegistrySeparatesIDSpaces(t *testing.T) {
