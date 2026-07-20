@@ -822,6 +822,16 @@ func (r *Registry) replaceUpstream(name string, conn Upstream, tools []mcp.Tool)
 	r.replaceUpstreamIfLive(name, conn, tools, context.Background())
 }
 
+// installLocked replaces name's catalog entry with (conn, tools), assuming
+// r.mu is already held — the common tail of replaceUpstreamIfLive,
+// replaceUpstreamIfCurrent, and remergeUpstream, once each has decided under
+// its own gate that the write is safe to make.
+func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, logMsg string) {
+	r.dropLocked(name)
+	n := r.mergeLocked(name, conn, tools)
+	r.log.Debug(logMsg, "upstream", name, "tools", n)
+}
+
 // replaceUpstreamIfLive is replaceUpstream with a liveness gate for the
 // auto-restart supervisor: the supCtx check and the catalog write happen under
 // ONE hold of r.mu, so "was I retired while launching?" and "install my fresh
@@ -837,9 +847,7 @@ func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp
 	if supCtx.Err() != nil {
 		return false
 	}
-	r.dropLocked(name)
-	n := r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog replaced", "upstream", name, "tools", n)
+	r.installLocked(name, conn, tools, "upstream catalog replaced")
 	return true
 }
 
@@ -860,9 +868,7 @@ func (r *Registry) replaceUpstreamIfCurrent(name string, oldConn Upstream, tools
 	if r.conns[name] != oldConn {
 		return false
 	}
-	r.dropLocked(name)
-	n := r.mergeLocked(name, oldConn, tools)
-	r.log.Debug("upstream catalog refreshed after list_changed", "upstream", name, "tools", n)
+	r.installLocked(name, oldConn, tools, "upstream catalog refreshed after list_changed")
 	return true
 }
 
@@ -1078,10 +1084,8 @@ func (r *Registry) remergeUpstream(name string) {
 	if !ok {
 		return
 	}
-	tools := r.rawTools[name] // read BEFORE dropLocked, which deletes the entry
-	r.dropLocked(name)
-	n := r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog re-projected", "upstream", name, "tools", n)
+	tools := r.rawTools[name] // read BEFORE installLocked's drop, which deletes the entry
+	r.installLocked(name, conn, tools, "upstream catalog re-projected")
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
@@ -1205,6 +1209,7 @@ func (r *Registry) recordPayload(up, tool string, arguments json.RawMessage, res
 		rec.Err = err.Error()
 	case resp != nil && resp.Error != nil:
 		rec.Err = resp.Error.Message
+		rec.ErrorData = resp.Error.Data
 		rec.Result = resp.Result
 	case resp != nil:
 		rec.Result = resp.Result

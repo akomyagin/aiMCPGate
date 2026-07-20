@@ -69,13 +69,20 @@ type jsonCallLog struct {
 	closer io.Closer // non-nil only when we opened a file we own
 }
 
+// openAppendFile opens path for append (creating it if missing) with 0600 —
+// the shared file-opening contract for both the audit log and the payload
+// debug log: callers only differ in what error-message prefix to use.
+func openAppendFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+}
+
 // NewCallLog returns a CallLog writing JSON lines. An empty logFile writes to
 // stderr; otherwise the file is opened for append (created if missing).
 func NewCallLog(logFile string) (CallLog, error) {
 	if logFile == "" {
 		return &jsonCallLog{w: os.Stderr}, nil
 	}
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openAppendFile(logFile)
 	if err != nil {
 		return nil, fmt.Errorf("open call log %q: %w", logFile, err)
 	}
@@ -123,6 +130,7 @@ type PayloadRecord struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 	Err       string          `json:"error,omitempty"`
+	ErrorData json.RawMessage `json:"error_data,omitempty"` // JSON-RPC error.data, if the upstream sent one
 }
 
 // PayloadLog persists PayloadRecords. Implementations must be safe for
@@ -155,7 +163,7 @@ func NewPayloadLog(path string) (PayloadLog, error) {
 	if path == "" {
 		return noopPayloadLog{}, nil
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openAppendFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open payload log %q: %w", path, err)
 	}
