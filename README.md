@@ -95,6 +95,30 @@ All commands except `token --generate` and `skill` (which falls back to a built-
 guide) load the config: pass `--config`, or drop a `config.yaml` next to the
 binary (see Configuration below).
 
+## Reloading config (SIGHUP)
+
+The gateway reloads its configuration live on **SIGHUP** — no restart, no
+dropped client connection. Edit `config.yaml` and send the signal:
+
+```bash
+kill -HUP $(pgrep -f 'mcp-gate serve')
+```
+
+On reload the gateway diffs the new config against the running upstreams and
+applies the minimum change: newly added upstreams are launched, removed (or
+`enabled: false`) ones are shut down, upstreams whose launch fields
+(`command`/`args`/`url`/`env`/`headers`) changed are relaunched, and upstreams
+where only the tool `allow`/`deny`/`rename` filter changed are re-projected
+without any restart. Unchanged upstreams keep running untouched. A bad edit
+(invalid YAML, failed validation) is logged and ignored — the currently running
+config stays live, so a typo never takes the gateway down.
+
+**Behavioural note:** since the gateway installs a SIGHUP handler, SIGHUP no
+longer terminates the process the way the OS default would. To stop the gateway
+use Ctrl-C, SIGINT, or SIGTERM. SIGHUP is Unix-only; on Windows it does not
+exist and reload is unavailable (the process serves the config it started with
+until restarted).
+
 ## Configuration
 
 Without `--config`, the gateway looks for `config.yaml` **next to its own
