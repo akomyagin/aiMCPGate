@@ -5,8 +5,9 @@
 Шлюз / прокси для **MCP-серверов** (Model Context Protocol) на Go. Presents
 себя MCP-клиенту (Claude Code, Cursor и др.) как **один** MCP-сервер, а под
 капотом **мультиплексирует** вызовы к нескольким upstream MCP-серверам,
-**агрегирует** их каталоги инструментов/ресурсов в один и **логирует** каждый
-вызов.
+**агрегирует** их каталоги инструментов в один и **логирует** каждый вызов.
+(Агрегация ресурсов между upstream пока не реализована — `resources/list`
+возвращает пустой каталог; см. `internal/transport/dispatch.go`.)
 
 > Статус: **MVP завершён (Этапы 0–6)**. Фаза 1 — мультиплексирование
 > stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
@@ -114,6 +115,11 @@ mcp-gate serve --config ./config.yaml
 
 # http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp:
 mcp-gate serve --config ./config-http.yaml
+
+# проверить каждый включённый upstream один раз (запуск → handshake → tools/list)
+# и напечатать таблицу OK/FAIL по каждому; ненулевой код возврата, если хоть один
+# упал (удобно для CI/cron); без авто-рестарта и без журналирования — один проход:
+mcp-gate doctor --config ./config.yaml
 
 # просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50

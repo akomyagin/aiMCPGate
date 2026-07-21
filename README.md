@@ -5,8 +5,9 @@
 A gateway / proxy for **MCP servers** (Model Context Protocol) written in Go.
 It presents itself to an MCP client (Claude Code, Cursor, etc.) as **one**
 MCP server, while under the hood it **multiplexes** calls across several
-upstream MCP servers, **aggregates** their tool/resource catalogs into one,
-and **logs** every call.
+upstream MCP servers, **aggregates** their tool catalogs into one, and
+**logs** every call. (Resource aggregation across upstreams is not implemented
+yet — `resources/list` returns an empty catalog; see `internal/transport/dispatch.go`.)
 
 > Status: **MVP complete (Stages 0–6)**. Phase 1 — multiplexing stdio
 > upstreams behind a stdio endpoint with a call log; Phase 2 — HTTP/SSE
@@ -114,6 +115,11 @@ mcp-gate serve --config ./config.yaml
 
 # http mode (transport: http in the config) — endpoint at http://<listen_addr>/mcp:
 mcp-gate serve --config ./config-http.yaml
+
+# check every enabled upstream once (launch → handshake → tools/list) and print
+# a per-upstream OK/FAIL table; exit code is non-zero if any upstream failed
+# (scriptable for CI/cron), no auto-restart, no call logging — one pass then exit:
+mcp-gate doctor --config ./config.yaml
 
 # view the call log (last 50 records; filter by upstream/tool/status):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
