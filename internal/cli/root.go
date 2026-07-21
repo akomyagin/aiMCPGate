@@ -27,5 +27,6 @@ func Build(version string) *cobra.Command {
 	root.AddCommand(newTokenCmd())
 	root.AddCommand(newClientConfigCmd())
 	root.AddCommand(newSkillCmd())
+	root.AddCommand(newDemoServerCmd(version))
 	return root
 }

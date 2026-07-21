@@ -21,6 +21,48 @@ Cross-platform binaries are built via [`goreleaser`](https://goreleaser.com)
 the version is baked in via `-ldflags -X main.version=...`, checksums land in
 `SHA256SUMS`. Local dry run: `goreleaser release --snapshot --clean`.
 
+## Install from MCP registry
+
+Besides the raw release binaries, the gateway ships as an OCI image on GitHub
+Container Registry and as an npm wrapper package — the two formats MCP
+registries install from.
+
+Docker:
+
+```bash
+docker run --rm -i -v $(pwd)/config.yaml:/config.yaml ghcr.io/akomyagin/aimcpgate serve
+```
+
+`-i` is mandatory: the gateway talks MCP over stdio, so the client must keep
+stdin open (without it the container sees EOF and exits immediately). The
+image has no config of its own, so mount yours — the example above mounts it
+onto the default path `/config.yaml`; any other path works with `serve -c`.
+
+To reproduce a registry sandbox check (Glama.ai etc.) without any real
+upstream, use the demo config baked into the image — this exact command is
+what a sandbox should run:
+
+```bash
+docker run --rm -i ghcr.io/akomyagin/aimcpgate serve -c /demo.config.yaml
+```
+
+npx (downloads the prebuilt binary for your platform on first install and
+verifies its SHA256 checksum):
+
+```bash
+npx aimcpgate serve -c ./config.yaml
+```
+
+**Image policy:** the OCI image contains only the `mcp-gate` binary — no
+runtimes for stdio upstreams (no node/npx, python, shells). If your config
+launches stdio upstream servers, extend the image yourself and install what
+they need; HTTP upstreams work out of the box (CA certificates are included).
+
+**Demo config:** [`demo.config.yaml`](demo.config.yaml) and the hidden
+`__demo-echo` subcommand exist only so registry sandboxes (Glama.ai) can
+introspect the gateway without any real upstream — never use them in a real
+deployment.
+
 ## Why
 
 An active MCP user typically has several servers configured (filesystem,

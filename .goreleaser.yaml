@@ -36,6 +36,50 @@ archives:
         formats:
           - zip
 
+# OCI images for the MCP registry / Glama.ai (Stage 12): one image per arch
+# pushed to ghcr.io, then stitched into multi-arch manifests below. The
+# workflow (.github/workflows/release.yml) logs docker in to ghcr.io and sets
+# up buildx/qemu before goreleaser runs.
+dockers:
+  - id: mcp-gate-amd64
+    use: buildx
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    extra_files:
+      - demo.config.yaml
+    image_templates:
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/akomyagin/aiMCPGate"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+  - id: mcp-gate-arm64
+    use: buildx
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    extra_files:
+      - demo.config.yaml
+    image_templates:
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/akomyagin/aiMCPGate"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/akomyagin/aimcpgate:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-amd64"
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/akomyagin/aimcpgate:latest"
+    image_templates:
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-amd64"
+      - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-arm64"
+
 checksum:
   name_template: SHA256SUMS
   algorithm: sha256
