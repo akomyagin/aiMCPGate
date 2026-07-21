@@ -63,17 +63,28 @@ type CallLog interface {
 // method, tool name, latency, ok/error) — never the call arguments, which may
 // contain tokens (SKILL §6). The error string is expected to be sanitized by
 // the caller before being placed in CallRecord.Err.
+//
+// A Record arriving after Close is dropped EXPLICITLY (the closed flag, checked
+// under mu) rather than relying on the OS silently rejecting a write to a
+// closed file. Draining such late records gracefully is a deeper lifecycle
+// concern deliberately out of scope here — the flag just makes the loss cheap
+// (no marshal, no syscall) and intentional.
 type jsonCallLog struct {
 	mu     sync.Mutex
 	w      io.Writer
 	closer io.Closer // non-nil only when we opened a file we own
+	closed bool      // set by Close (under mu); Record becomes a no-op after
 }
 
 // openAppendFile opens path for append (creating it if missing) with 0600 —
 // the shared file-opening contract for both the audit log and the payload
 // debug log: callers only differ in what error-message prefix to use.
+// oNoFollow (syscall.O_NOFOLLOW on Unix, 0 elsewhere — see the build-tagged
+// nofollow_*.go files) guards against a symlink planted at the log path: if
+// path is an existing symlink the open fails (ELOOP) instead of silently
+// following it and appending gateway logs to whatever file the link points at.
 func openAppendFile(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|oNoFollow, 0o600)
 }
 
 // NewCallLog returns a CallLog writing JSON lines. An empty logFile writes to
@@ -98,17 +109,23 @@ func (l *jsonCallLog) Record(r CallRecord) {
 	if r.Time.IsZero() {
 		r.Time = time.Now()
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return // dropped explicitly: no marshal, no write to a closed file
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return // a CallRecord is always marshalable; ignore defensively
 	}
 	b = append(b, '\n')
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	_, _ = l.w.Write(b)
 }
 
 func (l *jsonCallLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true // set BEFORE closing the file, under the same mu Record takes
 	if l.closer != nil {
 		return l.closer.Close()
 	}
@@ -142,10 +159,14 @@ type PayloadLog interface {
 
 // jsonPayloadLog writes one JSON object per line to an io.Writer, serialized by
 // a mutex — the same shape as jsonCallLog, but for the opt-in payload debug log.
+// Like jsonCallLog, a Record after Close is dropped explicitly via the closed
+// flag (checked under mu) — cheap and intentional, not a swallowed OS error;
+// graceful draining of late records is deliberately out of scope.
 type jsonPayloadLog struct {
 	mu     sync.Mutex
 	w      io.Writer
 	closer io.Closer // non-nil only when we opened a file we own
+	closed bool      // set by Close (under mu); Record becomes a no-op after
 }
 
 // noopPayloadLog is the default when payload logging is disabled: Record does
@@ -179,17 +200,23 @@ func (l *jsonPayloadLog) Record(r PayloadRecord) {
 	if r.Time.IsZero() {
 		r.Time = time.Now()
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return // dropped explicitly: no marshal, no write to a closed file
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return // ignore defensively; a PayloadRecord is normally marshalable
 	}
 	b = append(b, '\n')
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	_, _ = l.w.Write(b)
 }
 
 func (l *jsonPayloadLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true // set BEFORE closing the file, under the same mu Record takes
 	if l.closer != nil {
 		return l.closer.Close()
 	}

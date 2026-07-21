@@ -9,9 +9,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
@@ -23,6 +25,25 @@ import (
 // or malicious upstream could otherwise force the gateway to buffer an
 // unbounded response into memory.
 const maxHTTPResponseBytes = 32 << 20 // 32 MiB
+
+// defaultHTTPClientTimeout bounds a whole request round-trip on the fallback
+// client below. It mirrors config.DefaultCallTimeout (30s) without importing
+// the config package here; it is a BACKSTOP under the per-call context
+// deadline every current caller already applies (registry wraps each call in
+// context.WithTimeout), not the primary timeout mechanism — it just guarantees
+// a future caller that forgets a deadline cannot hang a request forever.
+const defaultHTTPClientTimeout = 30 * time.Second
+
+// defaultHTTPClient is used when StartHTTP's caller passes no client. It is a
+// dedicated client — NOT http.DefaultClient, which is process-global, shared,
+// and has no Timeout at all. Transport is set explicitly to http.DefaultTransport
+// (the zero field would make Close's *http.Transport assertion fail, turning
+// CloseIdleConnections into a silent no-op) so idle connections are actually
+// released on Close.
+var defaultHTTPClient = &http.Client{
+	Timeout:   defaultHTTPClientTimeout,
+	Transport: http.DefaultTransport,
+}
 
 // HTTPConn is a live connection to one upstream MCP server reached over the
 // Streamable HTTP transport (MCP 2025-06-18). It is the second Upstream
@@ -69,7 +90,7 @@ type HTTPConn struct {
 // their values are treated as secrets and never logged.
 func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client) *HTTPConn {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTPClient
 	}
 	return &HTTPConn{
 		name:     name,
@@ -291,9 +312,26 @@ func (c *HTTPConn) post(ctx context.Context, msg *mcp.Message) (*http.Response, 
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("upstream %q: POST %s: %w", c.name, c.endpoint, err)
+		// The endpoint is REDACTED in the error text: an operator may have put
+		// credentials into the URL itself (https://user:pass@host/mcp — the one
+		// config field that carries no env-expansion), and this error string
+		// ends up in the metadata-only audit log via err.Error().
+		return nil, fmt.Errorf("upstream %q: POST %s: %w", c.name, redactedEndpoint(c.endpoint), err)
 	}
 	return resp, nil
+}
+
+// redactedEndpoint returns endpoint safe for error messages and logs: any
+// userinfo password is masked via url.URL.Redacted ("user:xxxxx@host"). The
+// real endpoint is still used for the actual network request — only the TEXT
+// that can reach logs is redacted. An unparsable endpoint is returned as-is
+// (it cannot carry parseable userinfo either).
+func redactedEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	return u.Redacted()
 }
 
 // readSSEResponse reads an SSE stream and returns the first JSON-RPC message

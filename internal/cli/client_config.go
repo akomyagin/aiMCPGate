@@ -51,6 +51,13 @@ func newClientConfigCmd() *cobra.Command {
 			}
 			out, _ := json.MarshalIndent(snippet, "", "  ")
 
+			// The warning goes to STDERR so piping the JSON output stays clean;
+			// the snippets below embed the auth_token verbatim, which makes the
+			// command's whole output secret-bearing.
+			if cfg.AuthToken != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), "# WARNING: the snippet below contains your auth_token — treat it as a secret (don't paste it into a shared chat, public gist, or commit it to git).")
+			}
+
 			w := cmd.OutOrStdout()
 			fmt.Fprintln(w, "─── Claude Code  (~/.claude/claude_desktop_config.json) ───────────────────")
 			fmt.Fprintln(w, "Merge into the existing file or create it if absent:")

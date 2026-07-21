@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -583,6 +584,147 @@ func TestReloadRemovedFreedNameReusedByAdded(t *testing.T) {
 	}
 }
 
+// TestReloadParallelMergeOrderDeterministic pins the launch/merge split inside
+// Reload: launches of added/changed upstreams run in parallel, but the catalog
+// MERGE runs sequentially, in CONFIG order, after all launches complete. Two
+// added upstreams collide on the client-facing name "one__t" — "one" advertises
+// tool "t" under the default name (not statically known to config.Validate, so
+// the collision cannot be rejected at load time), while "two" renames its tool
+// "z" onto that same name. "one" is listed FIRST in the config but finishes
+// launching LAST (FAKE_INIT_DELAY holds its handshake 300ms; "two" launches
+// instantly), so with merge-inside-goroutines the winner would be "two"
+// (completion order); with the sequential post-Wait merge it must be "one"
+// (config order). Run under -race: the goroutines write disjoint slots of the
+// shared results slice.
+func TestReloadParallelMergeOrderDeterministic(t *testing.T) {
+	bin := buildFakeServer(t)
+	base := config.Upstream{Name: "base", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "b"}}
+	cfg := &config.Config{
+		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{base},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	waitForTool(t, r, "base__b", 2*time.Second)
+
+	one := config.Upstream{Name: "one", Command: bin, Enabled: true, Env: map[string]string{
+		"FAKE_TOOLS": "t",
+		// Slow launch: "one" reliably finishes AFTER "two", inverting the
+		// config order at the goroutine-completion level.
+		"FAKE_INIT_DELAY": "300ms",
+	}}
+	two := config.Upstream{
+		Name: "two", Command: bin, Enabled: true,
+		Env:   map[string]string{"FAKE_TOOLS": "z"},
+		Tools: config.ToolFilter{Rename: map[string]string{"z": "one__t"}},
+	}
+	newCfg := &config.Config{
+		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{base, one, two},
+	}
+	if err := r.Reload(context.Background(), newCfg); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	var owner string
+	for _, d := range r.Tools() {
+		if d.Name == "one__t" {
+			owner = d.Upstream
+		}
+	}
+	if owner != "one" {
+		t.Fatalf("collided name one__t owned by %q, want %q (merge must follow config order, not goroutine completion order)", owner, "one")
+	}
+}
+
+// TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch pins the timing
+// of the CHANGED path inside Reload: the old catalog entry is dropped INSIDE
+// the launch goroutine, right after the old connection is closed — not in the
+// sequential merge pass after g.Wait(). With the drop deferred to the merge
+// pass, the entry would linger pointing at the already-closed connection for
+// as long as the SLOWEST sibling launch in the batch takes (here: an added
+// upstream stalls 500ms in initialize), and a client calling the changed
+// upstream mid-reload would hit a transport error against a closed conn
+// instead of an honest "unknown tool" (regression found by review of the
+// deterministic-merge fix). Timeline:
+//
+//	t=0      Reload starts in the background: the changed upstream "svc" is
+//	         retired+closed+dropped within milliseconds (its own relaunch is
+//	         instant), while the added sibling "slow" holds the merge pass
+//	         until ≈t=500ms;
+//	t≤300ms  svc__old must already be OUT of the catalog (polled), with
+//	         Reload still in flight — and CallTool("svc__old") must fail with
+//	         "unknown tool", never with a closed-connection transport error;
+//	t≈500ms  Reload returns; svc__new and slow__s are merged.
+//
+// Run under -race.
+func TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
+		},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	waitForTool(t, r, "svc__old", 2*time.Second)
+
+	newCfg := &config.Config{
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			// Same name, different env → CHANGED; its own relaunch is instant.
+			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "new"}},
+			// ADDED sibling whose 500ms initialize stall holds the whole
+			// errgroup — and with it the sequential merge pass — open.
+			{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":      "s",
+				"FAKE_INIT_DELAY": "500ms",
+			}},
+		},
+	}
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- r.Reload(context.Background(), newCfg) }()
+
+	// The old entry must leave the catalog well before the slow sibling lets
+	// Reload return: the drop runs in the goroutine within milliseconds, and
+	// 300ms is a comfortable bound far under the 500ms stall.
+	start := time.Now()
+	for hasTool(r, "svc__old") {
+		if time.Since(start) > 300*time.Millisecond {
+			t.Fatal("svc__old still in catalog 300ms into Reload — old entry not dropped early, lingering until the slow sibling's launch completes")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-reloadDone:
+		t.Fatalf("Reload already returned (err=%v) — the slow sibling did not hold the merge pass; timing staging broken", err)
+	default:
+	}
+	// Mid-reload client semantics: the dropped entry yields "unknown tool" —
+	// NOT a transport failure against the closed old connection, which is what
+	// a lingering entry would produce.
+	if _, err := r.CallTool(context.Background(), "svc__old", []byte(`{}`)); err == nil {
+		t.Fatal("CallTool(svc__old) succeeded mid-reload, want unknown-tool error")
+	} else if !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("CallTool(svc__old) mid-reload = %q, want an unknown-tool error, not a transport error", err)
+	}
+
+	if err := <-reloadDone; err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	waitForTool(t, r, "svc__new", 2*time.Second)
+	if !hasTool(r, "slow__s") {
+		t.Error("added sibling slow__s missing after reload")
+	}
+}
+
 // gatedListUpstream wraps fakeUpstream so a test can hold a re-list's ListTools
 // RPC "in flight" for exactly as long as it wants: every call after the first
 // (Start's initial list) signals `entered` and then blocks until `release` is
@@ -918,9 +1060,14 @@ func TestReloadDisablesRunningSupervisor(t *testing.T) {
 	}
 	time.Sleep(1 * time.Second)
 
-	// Deliberately-stopped restart does NOT drop the catalog entry (the
-	// upstream stays in its unreachable state, as if no supervisor ever ran),
-	// so the proof is callability: the dead connection must still fail.
+	// Giving up (restart disabled mid-backoff) must be symmetric with the
+	// exhausted-attempts terminal state: the dead connection is already closed,
+	// so the upstream is DROPPED from the catalog entirely — the client must
+	// see "unknown tool", not a live-looking entry whose calls fail with a
+	// transport error.
+	if hasTool(r, "mayfly__ping") {
+		t.Fatal("upstream still in catalog after reload disabled auto-restart mid-backoff — want it dropped")
+	}
 	if _, err := r.CallTool(context.Background(), "mayfly__ping", []byte(`{}`)); err == nil {
 		t.Fatal("upstream recovered after reload disabled auto-restart — supervisor ignored Enabled=false")
 	}

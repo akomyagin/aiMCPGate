@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
@@ -132,10 +133,37 @@ func (s *httpServer) Serve(ctx context.Context) error {
 	}
 }
 
+// originAllowed reports whether a browser-sent Origin header names a local
+// page. Non-browser MCP clients send no Origin at all (the caller skips the
+// check for them); a browser page from anywhere else must not be able to drive
+// the gateway — the DNS-rebinding defence the MCP transport spec calls for.
+// "Local" is config.IsLoopbackHost's definition — the same one Validate
+// applies to listen_addr, covering the whole loopback range, not just the
+// literal 127.0.0.1/::1 this check used to string-compare against.
+func originAllowed(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return config.IsLoopbackHost(u.Hostname())
+}
+
 // handleMCP is the single MCP endpoint. POST carries one client JSON-RPC
 // message; GET would open a server→client SSE stream, which the gateway does not
 // offer in the MVP (405, per the spec's allowance).
+//
+// Any request carrying an Origin header (i.e. sent by a browser) must come from
+// a localhost page, otherwise it is rejected 403 before any dispatch — a
+// malicious web page resolving its own hostname to 127.0.0.1 (DNS rebinding)
+// could otherwise call the gateway with the victim's local network position.
 func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(origin) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		s.handlePost(w, r)

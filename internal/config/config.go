@@ -16,10 +16,12 @@ package config
 import (
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -437,6 +439,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("unknown transport %q (want %q or %q)", c.Transport, TransportStdio, TransportHTTP)
 	}
 
+	// An HTTP gateway bound beyond loopback with no auth_token would hand every
+	// aggregated upstream tool to anyone on the network — reject that outright
+	// instead of silently serving it (security audit finding). stdio has no
+	// listen address, so the check applies to TransportHTTP only.
+	if c.Transport == TransportHTTP && c.AuthToken == "" && !isLoopbackAddr(c.EffectiveListenAddr()) {
+		return fmt.Errorf("listen_addr %q is not loopback-only but auth_token is empty: the HTTP endpoint would be reachable from the network without authentication — set auth_token or bind to a loopback address (127.0.0.1/::1/localhost)", c.EffectiveListenAddr())
+	}
+
 	if err := c.Restart.validate(); err != nil {
 		return err
 	}
@@ -444,8 +454,17 @@ func (c *Config) Validate() error {
 	// The opt-in payload debug log must never share a file with the audit log:
 	// payloads carry raw arguments/results (possibly secrets), which the audit
 	// log is required to stay free of (SKILL §6). Reject the overlap outright.
-	if c.DebugPayloadLog != "" && c.DebugPayloadLog == c.LogFile {
-		return fmt.Errorf("debug_payload_log must not equal log_file (%q): payloads may contain secrets and must not leak into the audit log", c.LogFile)
+	// Both paths are canonicalized via filepath.Abs first, so a relative
+	// spelling like "logs/sub/../a.log" cannot dodge the check against
+	// "logs/a.log" (Load already resolved them against the config dir; Abs
+	// additionally collapses "."/".." — it does not resolve symlinks, which is
+	// a separate, deeper concern).
+	if c.DebugPayloadLog != "" && c.LogFile != "" {
+		dp, err1 := filepath.Abs(c.DebugPayloadLog)
+		lf, err2 := filepath.Abs(c.LogFile)
+		if err1 == nil && err2 == nil && dp == lf {
+			return fmt.Errorf("debug_payload_log must not equal log_file (%q): payloads may contain secrets and must not leak into the audit log", c.LogFile)
+		}
 	}
 
 	seen := make(map[string]bool, len(c.Upstreams))
@@ -475,6 +494,35 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// IsLoopbackHost reports whether host (already stripped of any port) names a
+// loopback interface: the literal "localhost" (matched by string,
+// case-insensitively — net.ParseIP cannot resolve names) or an IP in a
+// loopback range (127.0.0.0/8, ::1). Shared by Validate's listen_addr check
+// and the transport layer's browser-Origin check, so both use the SAME
+// definition of "loopback" — the two used to diverge (config: the full
+// IsLoopback() range; transport: exact-string 127.0.0.1/::1 only — found by
+// review).
+func IsLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackAddr reports whether a "host:port" listen address binds to a
+// loopback interface only. An address whose host part is empty (":28080")
+// binds ALL interfaces and is therefore NOT loopback; an unparsable address is
+// conservatively treated as non-loopback too — net.Listen will reject it later
+// anyway.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return IsLoopbackHost(host)
 }
 
 // validateToolFilter checks one upstream's tools filter and claims its
@@ -531,7 +579,15 @@ func validateToolFilter(u Upstream, clientNames map[string]string) error {
 		}
 		// "__" is the registry's NameSeparator (docs/MCP_NOTES.md §6); config
 		// cannot import registry (import cycle), so it is spelled here.
-		if err := claim(u.Name+"__"+a, fmt.Sprintf("upstream %q (tool %q)", u.Name, a)); err != nil {
+		defaultName := u.Name + "__" + a
+		// An allow entry without a rename surfaces under this default name, so
+		// it must satisfy the same client-facing name constraint rename targets
+		// already do (MCP_NOTES §6) — an original name like "weird name!" would
+		// otherwise smuggle invalid characters past the naming guarantee.
+		if !upstreamNameRe.MatchString(defaultName) {
+			return fmt.Errorf("upstream %q: tools.allow entry %q (without a rename) would produce client-facing name %q, which does not match %s", u.Name, a, defaultName, upstreamNameRe)
+		}
+		if err := claim(defaultName, fmt.Sprintf("upstream %q (tool %q)", u.Name, a)); err != nil {
 			return err
 		}
 	}

@@ -72,6 +72,85 @@ func TestValidateRejectsPayloadLogEqualsLogFile(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("empty payload log should be valid, got %v", err)
 	}
+
+	// A relative spelling that resolves to the SAME file must be caught too:
+	// the comparison canonicalizes via filepath.Abs, so "logs/sub/../a.log"
+	// cannot dodge the check against "logs/a.log".
+	c.LogFile = "logs/a.log"
+	c.DebugPayloadLog = "logs/sub/../a.log"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when debug_payload_log resolves to log_file via ..")
+	}
+}
+
+// TestValidateRequiresAuthTokenForNonLoopbackListen pins the security invariant:
+// an HTTP gateway bound beyond loopback without auth_token would expose every
+// aggregated tool to the whole network, so Validate must reject it. Loopback
+// binds (and any bind with a token) remain fine.
+func TestValidateRequiresAuthTokenForNonLoopbackListen(t *testing.T) {
+	mk := func(addr, token string) *Config {
+		return &Config{
+			Transport:  TransportHTTP,
+			ListenAddr: addr,
+			AuthToken:  token,
+			Upstreams:  []Upstream{{Name: "a", Command: "x"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr bool
+	}{
+		{"0.0.0.0 without token", mk("0.0.0.0:1234", ""), true},
+		{"all-interfaces shorthand without token", mk(":1234", ""), true},
+		{"LAN address without token", mk("192.168.1.10:1234", ""), true},
+		{"0.0.0.0 with token", mk("0.0.0.0:1234", "s3cr3t"), false},
+		{"127.0.0.1 without token", mk("127.0.0.1:1234", ""), false},
+		{"localhost without token", mk("localhost:1234", ""), false},
+		{"IPv6 loopback without token", mk("[::1]:1234", ""), false},
+		{"default listen addr without token", mk("", ""), false}, // defaults to 127.0.0.1:28080
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	// stdio transport never uses listen_addr — no token required regardless.
+	c := &Config{Transport: TransportStdio, ListenAddr: "0.0.0.0:1234", Upstreams: []Upstream{{Name: "a", Command: "x"}}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("stdio transport must ignore listen_addr, got %v", err)
+	}
+}
+
+// TestIsLoopbackHost pins the shared "is this host loopback?" definition used
+// by BOTH Validate's listen_addr check and the transport layer's browser
+// Origin check: the whole 127.0.0.0/8 range and ::1 count, not just the
+// literal 127.0.0.1 (the two checks used to diverge — found by review).
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true},
+		{"LOCALHOST", true}, // case-insensitive string match
+		{"127.0.0.1", true},
+		{"127.0.0.2", true}, // anywhere in 127.0.0.0/8, not just .1
+		{"127.255.255.254", true},
+		{"::1", true},
+		{"0.0.0.0", false},
+		{"192.168.1.10", false},
+		{"example.com", false}, // names other than localhost are never resolved
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := IsLoopbackHost(tt.host); got != tt.want {
+			t.Errorf("IsLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
 }
 
 func TestValidateRejectsUnknownTransport(t *testing.T) {
@@ -103,6 +182,7 @@ func TestLoadExpandsEnvAndValidates(t *testing.T) {
 	yaml := `
 transport: http
 listen_addr: ":9999"
+auth_token: "gate-test-token" # ":9999" binds all interfaces, so a token is now mandatory (Validate)
 upstreams:
   - name: remote
     url: https://example.com/mcp
@@ -407,6 +487,16 @@ func TestValidateToolFilter(t *testing.T) {
 			ToolFilter{Rename: map[string]string{"t1": ""}},
 			ToolFilter{},
 		), true},
+		{"allow entry with bad characters and no rename", mk(
+			// would surface as client-facing "a__weird name!" — invalid
+			ToolFilter{Allow: []string{"weird name!"}},
+			ToolFilter{},
+		), true},
+		{"allow entry with bad characters but renamed", mk(
+			// the rename replaces the default name, so the odd original is fine
+			ToolFilter{Allow: []string{"weird name!"}, Rename: map[string]string{"weird name!": "tamed"}},
+			ToolFilter{},
+		), false},
 		{"renamed names collide across upstreams", mk(
 			ToolFilter{Rename: map[string]string{"t1": "shared"}},
 			ToolFilter{Rename: map[string]string{"other": "shared"}},
