@@ -1,0 +1,28 @@
+{
+  "name": "aimcpgate",
+  "version": "0.0.0-dev",
+  "description": "MCP gateway/proxy: one MCP endpoint multiplexing several upstream MCP servers, with an aggregated tool catalog and a call log. npm wrapper that downloads the prebuilt mcp-gate Go binary from GitHub Releases.",
+  "bin": {
+    "mcp-gate": "bin/mcp-gate.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akomyagin/aiMCPGate.git"
+  },
+  "homepage": "https://github.com/akomyagin/aiMCPGate",
+  "bugs": {
+    "url": "https://github.com/akomyagin/aiMCPGate/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gateway",
+    "proxy",
+    "multiplexer"
+  ],
+  "author": "Alexander Komyagin",
+  "license": "MIT"
+}
