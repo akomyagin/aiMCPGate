@@ -1,6 +1,7 @@
 {
   "name": "aimcpgate",
   "version": "0.0.0-dev",
+  "mcpName": "io.github.akomyagin/aimcpgate",
   "description": "MCP gateway/proxy: one MCP endpoint multiplexing several upstream MCP servers, with an aggregated tool catalog and a call log. npm wrapper that downloads the prebuilt mcp-gate Go binary from GitHub Releases.",
   "bin": {
     "mcp-gate": "bin/mcp-gate.js"
