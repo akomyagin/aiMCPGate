@@ -144,6 +144,30 @@ func toolsListJSON(tools []string) string {
 	return b.String()
 }
 
+// TestHTTPEndpointCredentialsRedactedInErrors pins the audit-log invariant: a
+// URL-embedded password (the one config field env-expansion never touches) must
+// not leak through a transport error's text, which reaches the metadata-only
+// audit log via err.Error(). The password is replaced by url.URL.Redacted's
+// "xxxxx" marker.
+func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
+	// Port 1 on loopback: connection refused, immediately and deterministically.
+	conn := upstream.StartHTTP(quietLogger(), "leaky", "http://user:sup3rsecret@127.0.0.1:1/mcp", nil, nil)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := conn.ListTools(ctx)
+	if err == nil {
+		t.Fatal("expected a connection error against a closed port")
+	}
+	if strings.Contains(err.Error(), "sup3rsecret") {
+		t.Fatalf("error text leaks the URL-embedded password: %v", err)
+	}
+	if !strings.Contains(err.Error(), "xxxxx") {
+		t.Fatalf("error text should carry the redacted endpoint (user:xxxxx@...), got: %v", err)
+	}
+}
+
 func newConn(t *testing.T, f *fakeHTTPServer, headers map[string]string) (*upstream.HTTPConn, func()) {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())

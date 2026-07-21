@@ -201,6 +201,48 @@ func TestHTTPServerParseErrorReturns400(t *testing.T) {
 	}
 }
 
+// TestHTTPServerHybridRequestResponseRejected pins the malformed-hybrid case:
+// a message carrying a method AND a result looks like both a request and a
+// response; instead of being silently dropped (202) it must be answered with
+// an explicit -32600 invalid-request error under its own id — INCLUDING when
+// that id is null or absent: such a hybrid used to slip past the gate entirely
+// (IsNotification looks only at the id, so it counted as a "notification" and
+// was silently accepted — found by review).
+func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
+	srv, cleanup := startHTTPGateway(t)
+	defer cleanup()
+
+	cases := []struct {
+		name   string
+		raw    string
+		wantID string // raw id echoed in the error response ("" = omitted)
+	}{
+		{"int id", `{"jsonrpc":"2.0","id":1,"method":"tools/list","result":{}}`, "1"},
+		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list","result":{}}`, "null"},
+		{"absent id", `{"jsonrpc":"2.0","method":"tools/list","result":{}}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/mcp", strings.NewReader(tc.raw))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("hybrid message HTTP status = %d, want 200 with a JSON-RPC error (not a silent 202)", resp.StatusCode)
+			}
+			msg := decodeBody(t, resp)
+			if msg.Error == nil || msg.Error.Code != mcp.CodeInvalidRequest {
+				t.Fatalf("want invalid-request error (-32600), got %+v", msg.Error)
+			}
+			if string(msg.ID) != tc.wantID {
+				t.Fatalf("error response id = %q, want %q (echo the hybrid's own id, null/omitted when it had none)", msg.ID, tc.wantID)
+			}
+		})
+	}
+}
+
 // startHTTPGatewayWithAuth is like startHTTPGateway but configures an auth token.
 func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, func()) {
 	t.Helper()
@@ -300,6 +342,57 @@ func TestHTTPServerGETNotAllowed(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /mcp status = %d, want 405 (no SSE server-stream in MVP)", resp.StatusCode)
+	}
+}
+
+// TestHTTPServerOriginCheck verifies the DNS-rebinding defence: a request whose
+// Origin header names a non-local page is rejected 403 before any dispatch,
+// while requests with no Origin (regular MCP clients) or a localhost Origin
+// (local browser tooling) are served as before.
+func TestHTTPServerOriginCheck(t *testing.T) {
+	srv, cleanup := startHTTPGateway(t)
+	defer cleanup()
+
+	postWithOrigin := func(origin string) *http.Response {
+		t.Helper()
+		body, err := mcp.Encode(mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		return resp
+	}
+
+	// Foreign origins → 403, before any JSON-RPC handling.
+	for _, origin := range []string{"http://evil.example.com", "https://evil.example.com:8080", "null"} {
+		resp := postWithOrigin(origin)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Origin %q: status = %d, want 403", origin, resp.StatusCode)
+		}
+	}
+
+	// No Origin (non-browser MCP client) and localhost origins → served
+	// normally. 127.0.0.2 is loopback too (127.0.0.0/8): originAllowed shares
+	// config.IsLoopbackHost with the listen_addr validation, so the whole
+	// range is accepted, not just the literal 127.0.0.1.
+	for _, origin := range []string{"", "http://localhost:3000", "http://127.0.0.1:8080", "https://localhost", "http://127.0.0.2:3000"} {
+		resp := postWithOrigin(origin)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Origin %q: status = %d, want 200", origin, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
 	}
 }
 

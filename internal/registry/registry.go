@@ -495,7 +495,7 @@ func (r *Registry) retireSupervisor(name string) {
 // conn is tracked (not just its done channel) so a confirmed real crash can be
 // reaped via conn.Close() before relaunching — otherwise cmd.Wait() is never
 // called for the dead process and it leaks as a zombie plus its pipe fds
-// forever, since nothing else holds a reference to it once replaceUpstream
+// forever, since nothing else holds a reference to it once replaceUpstreamIfLive
 // overwrites the registry's map entry (found by independent review;
 // reproduced with a /proc zombie-count check).
 func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struct{}, supCtx context.Context) {
@@ -546,9 +546,12 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 // including Enabled=false, which makes an already-looping supervisor give up
 // on its next attempt (found by independent review of the Tier 2 fix: only
 // superviseUpstream checked Enabled, so a mid-backoff supervisor kept retrying
-// forever after a reload disabled auto-restart). Giving up deliberately does
-// NOT dropUpstream — the upstream just stays in its current (unreachable)
-// state, exactly as if the supervisor had never been started. The
+// forever after a reload disabled auto-restart). Giving up — whether by
+// exhausted attempts or by a reload disabling restart mid-backoff — DROPS the
+// upstream from the catalog: by this point its old connection is already
+// closed (supervise reaped the crash before calling restart), so leaving the
+// catalog entry would advertise tools whose every call fails with a transport
+// error instead of an honest "unknown tool" (security-audit finding). The
 // disabled→enabled transition for an upstream whose supervisor was never
 // started (Enabled=false at Start time) is out of scope — it would need a
 // separate mechanism to start a supervisor post-hoc.
@@ -556,7 +559,11 @@ func (r *Registry) restart(u config.Upstream, supCtx context.Context) (Upstream,
 	for attempt := 1; ; attempt++ {
 		policy := r.config().EffectiveRestart()
 		if policy.Enabled == nil || !*policy.Enabled {
-			r.log.Info("stdio upstream restart disabled by reload, giving up", "upstream", u.Name)
+			// Symmetric with the exhausted-attempts branch below: the dead
+			// connection is already closed, so the catalog entry must go too.
+			r.log.Info("stdio upstream restart disabled by reload, dropped from catalog", "upstream", u.Name)
+			r.dropUpstream(u.Name)
+			r.notifyCatalogChanged()
 			return nil, nil, false
 		}
 		if policy.MaxAttempts != 0 && attempt > policy.MaxAttempts {
@@ -735,7 +742,7 @@ func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter
 
 // filterFor looks up the CURRENT tool filter for an upstream by name from the
 // atomic config snapshot — deliberately not passed as a parameter: several
-// callers of merge/replaceUpstream (relistUpstream, a supervisor holding the
+// paths into mergeLocked (relistUpstream, a supervisor holding the
 // config.Upstream it was launched with) would otherwise carry a filter frozen
 // at launch time, guaranteed stale after the next reload. A linear scan over
 // units-to-tens of upstreams outside any hot path is fine. An upstream absent
@@ -752,7 +759,7 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 }
 
 // mergeLocked is the shared catalog-write body used by merge and
-// replaceUpstream, assuming r.mu is already held. It records the connection and
+// installLocked, assuming r.mu is already held. It records the connection and
 // the raw (pre-filter) tool list, then projects the tools through the
 // upstream's current filter (Stage 9) into the catalog/routing table, skipping
 // a duplicate client-facing name (keep first, log). Cross-upstream rename
@@ -797,7 +804,7 @@ func (r *Registry) dropUpstream(name string) {
 }
 
 // dropLocked is dropUpstream's body, assuming r.mu is already held. It exists so
-// replaceUpstream can drop-then-merge under a SINGLE lock acquisition (below).
+// installLocked can drop-then-merge under a SINGLE lock acquisition (below).
 func (r *Registry) dropLocked(name string) {
 	delete(r.conns, name)
 	delete(r.rawTools, name)
@@ -807,19 +814,6 @@ func (r *Registry) dropLocked(name string) {
 			delete(r.toolRoute, ns)
 		}
 	}
-}
-
-// replaceUpstream atomically swaps out an upstream's connection and catalog:
-// it drops the old entries and merges the new ones under a single hold of
-// r.mu, so the client never sees the upstream's tools vanish and reappear
-// (which a separate dropUpstream+merge would expose). Used by reload of a
-// changed upstream — the one context where no retire race applies (Reload
-// holds lifecycleMu, so no other Reload can retire the entry it is itself
-// installing), hence the always-live context (Background().Err() is always
-// nil). The list_changed re-list goes through replaceUpstreamIfCurrent
-// instead — it CAN race a Reload.
-func (r *Registry) replaceUpstream(name string, conn Upstream, tools []mcp.Tool) {
-	r.replaceUpstreamIfLive(name, conn, tools, context.Background())
 }
 
 // installLocked replaces name's catalog entry with (conn, tools), assuming
@@ -832,10 +826,12 @@ func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, l
 	r.log.Debug(logMsg, "upstream", name, "tools", n)
 }
 
-// replaceUpstreamIfLive is replaceUpstream with a liveness gate for the
-// auto-restart supervisor: the supCtx check and the catalog write happen under
-// ONE hold of r.mu, so "was I retired while launching?" and "install my fresh
-// connection" are a single atomic step. Without that atomicity a restart that
+// replaceUpstreamIfLive atomically swaps out an upstream's connection and
+// catalog — old entries dropped, new ones merged under a single hold of r.mu,
+// so the client never sees the upstream's tools vanish and reappear — with a
+// liveness gate for the auto-restart supervisor: the supCtx check and the
+// catalog write happen under that ONE hold, so "was I retired while
+// launching?" and "install my fresh connection" are a single atomic step. Without that atomicity a restart that
 // passed an earlier check could still install its connection after a reload's
 // retireAndClose+dropUpstream ran, resurrecting an upstream the reload just
 // removed (the supervisor-vs-reload race found by independent review). Returns
@@ -851,7 +847,7 @@ func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp
 	return true
 }
 
-// replaceUpstreamIfCurrent is replaceUpstream with a currency gate for
+// replaceUpstreamIfCurrent is the same atomic swap with a currency gate for
 // relistUpstream: the check that oldConn is STILL the live connection for this
 // name, and the catalog write, happen under ONE hold of r.mu — so a Reload
 // that retired/relaunched this exact upstream while the ListTools RPC was in
@@ -919,7 +915,7 @@ func (r *Registry) notifyCatalogChanged() {
 //   - ADDED   (enabled, not live): launch + merge + supervise;
 //   - REMOVED (live, now absent or disabled): retire supervisor + Close + drop;
 //   - CHANGED (live, launch fields differ): retire supervisor + Close old +
-//     launch new + replaceUpstream + supervise;
+//     drop old catalog entry + launch new + merge + supervise;
 //   - FILTER-ONLY (live, launch identical, tools filter differs — Stage 9):
 //     re-project the stored raw tool list through the new filter. No Close, no
 //     relaunch, no network re-list — the upstream's raw catalog did not change,
@@ -976,7 +972,16 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	var added, changed []config.Upstream
 	var removed, filterOnly []string
 
-	for name, nu := range newEnabled {
+	// Iterate newCfg.Upstreams (the slice), NOT the newEnabled map: the
+	// changed/added slices must preserve CONFIG order, because the sequential
+	// merge pass below resolves a runtime client-facing-name collision
+	// keep-first — and "first" must deterministically mean "first in the
+	// config", not whichever map key (or goroutine) came up first.
+	for _, nu := range newCfg.Upstreams {
+		if !nu.Enabled {
+			continue
+		}
+		name := nu.Name
 		ou, wasEnabled := oldEnabled[name]
 		switch {
 		case !live[name]:
@@ -1006,60 +1011,103 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	//  1. removed — SEQUENTIALLY, FIRST: retiring them frees their client-facing
 	//     names before added/changed upstreams (possibly renamed onto the same
 	//     names) try to claim them;
-	//  2. changed + added — IN PARALLEL (errgroup, same pattern as Start): each
-	//     involves a full launch/handshake, and one slow upstream must not
-	//     serialize the whole reload. Errors stay isolated per-upstream (logged,
-	//     never propagated — g.Go always returns nil), matching Start;
+	//  2. changed + added — LAUNCH IN PARALLEL (errgroup, same pattern as
+	//     Start): each involves a full launch/handshake, and one slow upstream
+	//     must not serialize the whole reload. Errors stay isolated
+	//     per-upstream (recorded, never propagated — g.Go always returns nil),
+	//     matching Start. The catalog MERGE, however, runs SEQUENTIALLY after
+	//     g.Wait(), in config order: merging from inside the goroutines made
+	//     the keep-first winner of a runtime client-facing-name collision
+	//     depend on goroutine completion order, not on the config (found by
+	//     security audit). Each goroutine writes only its own pre-allocated
+	//     results slot, so no lock is needed until the post-Wait pass reads
+	//     them all;
 	//  3. filterOnly — SEQUENTIALLY, LAST: a pure re-projection without I/O that
 	//     must see the final catalog state after removed/changed/added.
 	//
 	// Parallel goroutines here are safe: lifecycleMu is held for the whole
 	// Reload (Tier 1), so no Start/Close/other Reload can interleave; the
-	// catalog itself is guarded by r.mu inside merge/replaceUpstream.
+	// catalog itself is guarded by r.mu inside merge/dropUpstream.
 	//
 	// For removed/changed: retire the supervisor first (so the deliberate Close
-	// is not auto-restarted), then Close the old connection, then drop or
-	// relaunch. Close/launch are I/O — done outside the catalog lock (each of
-	// dropUpstream/replaceUpstream takes the lock itself, briefly).
+	// is not auto-restarted), then Close the old connection, then IMMEDIATELY
+	// drop the old catalog entry. For changed upstreams all three run INSIDE
+	// the launch goroutine — early, in parallel — so the old entry never
+	// lingers pointing at a closed connection while a slow SIBLING launch holds
+	// up the sequential merge pass below: a client calling the already-closed
+	// upstream mid-reload gets an honest "unknown tool" (same as the removed
+	// path), not a transport error against a conn that no longer exists
+	// (regression found by review of the deterministic-merge fix — deferring
+	// the drop to the merge pass stretched that window from "this upstream's
+	// own launch" to "the slowest launch in the whole batch"). Close/launch are
+	// I/O — done outside the catalog lock (each of dropUpstream/merge takes the
+	// lock itself, briefly).
 	for _, name := range removed {
 		r.retireAndClose(name)
 		r.dropUpstream(name)
 		r.log.Info("upstream removed by reload", "upstream", name)
 	}
+	// launchResult carries one changed/added upstream's launch outcome from its
+	// goroutine to the sequential merge pass. Each goroutine owns exactly one
+	// slot (indexed: changed first, then added), so the writes need no mutex;
+	// the slice is only read after g.Wait().
+	type launchResult struct {
+		u       config.Upstream
+		conn    Upstream
+		tools   []mcp.Tool
+		err     error
+		changed bool // true: a relaunched (changed) upstream, its old entry already dropped; false: a newly added one
+	}
+	results := make([]launchResult, len(changed)+len(added))
 	var g errgroup.Group
-	for _, u := range changed {
-		u := u
+	for i, u := range changed {
+		i, u := i, u
 		g.Go(func() error {
+			// Retire + Close + drop together, up front: once the old connection
+			// is closed its catalog entry must not outlive it (see the phase
+			// comment above). The relaunched catalog merges after g.Wait().
 			r.retireAndClose(u.Name)
+			r.dropUpstream(u.Name)
 			conn, tools, err := r.launch(ctx, u)
-			if err != nil {
-				// The changed upstream failed to relaunch: drop it (its old connection
-				// is already closed) rather than leave the stale catalog entry.
-				r.dropUpstream(u.Name)
-				r.log.Warn("changed upstream failed to relaunch, dropped", "upstream", u.Name, "err", err)
-				return nil
-			}
-			r.replaceUpstream(u.Name, conn, tools)
-			r.superviseUpstream(u, conn)
-			r.log.Info("upstream reconfigured by reload", "upstream", u.Name, "tools", len(tools))
+			results[i] = launchResult{u: u, conn: conn, tools: tools, err: err, changed: true}
 			return nil
 		})
 	}
-	for _, u := range added {
-		u := u
+	for j, u := range added {
+		idx, u := len(changed)+j, u
 		g.Go(func() error {
 			conn, tools, err := r.launch(ctx, u)
-			if err != nil {
-				r.log.Warn("added upstream failed to launch", "upstream", u.Name, "err", err)
-				return nil
-			}
-			r.merge(u.Name, conn, tools)
-			r.superviseUpstream(u, conn)
-			r.log.Info("upstream added by reload", "upstream", u.Name, "tools", len(tools))
+			results[idx] = launchResult{u: u, conn: conn, tools: tools, err: err}
 			return nil
 		})
 	}
-	_ = g.Wait() // errors are handled inside each goroutine; Wait only joins them.
+	_ = g.Wait() // errors are carried in results; Wait only joins the goroutines.
+
+	// Sequential merge in config order (changed first, then added — each in the
+	// order the config lists them): the keep-first resolution of a runtime
+	// client-facing-name collision is deterministic again, exactly as it was
+	// before the launches were parallelized.
+	for _, res := range results {
+		switch {
+		case res.err != nil && res.changed:
+			// The changed upstream failed to relaunch. Its old entry was already
+			// dropped inside the goroutine (right after retireAndClose), so
+			// there is nothing left to clean up — just record the loss.
+			r.log.Warn("changed upstream failed to relaunch, dropped", "upstream", res.u.Name, "err", res.err)
+		case res.err != nil:
+			r.log.Warn("added upstream failed to launch", "upstream", res.u.Name, "err", res.err)
+		case res.changed:
+			// The old entry is long gone (dropped in the goroutine), so this is
+			// a plain merge into an empty name — same call as the added case.
+			r.merge(res.u.Name, res.conn, res.tools)
+			r.superviseUpstream(res.u, res.conn)
+			r.log.Info("upstream reconfigured by reload", "upstream", res.u.Name, "tools", len(res.tools))
+		default:
+			r.merge(res.u.Name, res.conn, res.tools)
+			r.superviseUpstream(res.u, res.conn)
+			r.log.Info("upstream added by reload", "upstream", res.u.Name, "tools", len(res.tools))
+		}
+	}
 	for _, name := range filterOnly {
 		r.remergeUpstream(name)
 		r.log.Info("upstream tool filter updated by reload", "upstream", name)
@@ -1073,7 +1121,8 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 
 // remergeUpstream re-projects an upstream's stored raw tool list through the
 // CURRENT config's filter, under a single hold of r.mu — the client never sees
-// a torn catalog, exactly like replaceUpstream (Stage 9, filter-only reload).
+// a torn catalog, exactly like installLocked's other callers (Stage 9,
+// filter-only reload).
 // No I/O happens here: the connection and the raw list are reused as-is. A
 // concurrent restart/reload may have dropped the upstream since the diff was
 // computed — then there is nothing to re-merge.
@@ -1295,7 +1344,7 @@ func (r *Registry) Close() error {
 
 	// Wait for every auto-restart supervisor to observe the cancellation and
 	// return BEFORE we clear conns below: a supervisor mid-restart could
-	// otherwise call replaceUpstream after Close emptied the map, resurrecting a
+	// otherwise call replaceUpstreamIfLive after Close emptied the map, resurrecting a
 	// connection Close would then never tear down (goroutine + child-process
 	// leak) and racing the map access. procCancel above makes them all exit
 	// promptly (every supCtx is derived from procCtx, so cancelling the parent

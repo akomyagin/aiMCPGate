@@ -65,6 +65,21 @@ func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, lis
 // message always echoes the CLIENT's id — never any upstream-side id the
 // registry used internally.
 func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Message {
+	// A malformed hybrid — a message with BOTH a method (request shape) and a
+	// result/error (response shape) — matches neither predicate cleanly and
+	// used to fall through the classification silently. Answer it with an
+	// explicit invalid-request error instead of dropping it (found by security
+	// audit). Checked FIRST, before the notification/request classification
+	// below, and INDEPENDENTLY of the id: a hybrid with a null/absent id would
+	// otherwise slip through the gate as a "notification" (IsNotification looks
+	// only at the id — found by review). A plain request never trips this:
+	// IsResponse requires an actual result/error. NewError echoes whatever id
+	// the message carried — null when there was none, which is what JSON-RPC
+	// prescribes when the request id cannot be determined.
+	if msg.Method != "" && msg.IsResponse() {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidRequest,
+			"message is not a valid request: carries both a method and a result/error", nil)
+	}
 	if msg.IsNotification() {
 		// notifications/initialized and the like need no reply.
 		d.log.Debug("client notification", "method", msg.Method)

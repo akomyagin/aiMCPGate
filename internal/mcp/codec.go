@@ -13,6 +13,11 @@ import (
 // message per line; the default bufio.Scanner token limit (64 KiB) is too small
 // for large inputSchema / tool results, so we raise it. 32 MiB is generous
 // while still bounding memory against a runaway upstream.
+//
+// A frame exceeding this limit surfaces as bufio.ErrTooLong, which is FATAL for
+// the whole Reader: bufio.Scanner cannot resynchronize after it (the scanner is
+// permanently errored), so there is no per-frame recovery mid-stream. That is
+// deliberate — see Reader.Read for how the caller is expected to react.
 const maxLineBytes = 32 << 20 // 32 MiB
 
 // Reader decodes newline-delimited MCP messages from an underlying stream.
@@ -39,6 +44,15 @@ func NewReader(r io.Reader) *Reader {
 // skipped (some servers pad output). A line that is not a single JSON object
 // yields a parse error but does not desynchronize the stream — the caller may
 // keep reading subsequent lines.
+//
+// A frame exceeding maxLineBytes (bufio.ErrTooLong) is different: it is a fatal
+// transport error for THIS connection — bufio.Scanner cannot recover from it,
+// so every subsequent Read fails too. The caller (the stdio reader loop in
+// internal/upstream) treats any such error like a dead stream: it tears the
+// connection down (done channel closes, pending calls fail), and the registry's
+// auto-restart supervisor — when enabled — relaunches the upstream fresh. That
+// "tear down and relaunch" is the intended recovery path, not per-scanner
+// resynchronization, which bufio.Scanner does not support.
 func (r *Reader) Read() (*Message, error) {
 	for {
 		if !r.sc.Scan() {

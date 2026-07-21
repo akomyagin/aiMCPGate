@@ -3,6 +3,9 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +76,70 @@ func TestPayloadLogRecord(t *testing.T) {
 	}
 	if rec.Time.IsZero() {
 		t.Error("Record should stamp a non-zero time")
+	}
+}
+
+// TestOpenAppendFileRefusesSymlink pins the symlink defence (O_NOFOLLOW): a
+// log path that is an existing symlink must fail to open rather than silently
+// appending to whatever the link points at. Skipped on Windows, where
+// os.O_NOFOLLOW is a no-op (defined as 0).
+func TestOpenAppendFileRefusesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.O_NOFOLLOW is a no-op on Windows")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.log")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	link := filepath.Join(dir, "link.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	if f, err := openAppendFile(link); err == nil {
+		_ = f.Close()
+		t.Fatal("openAppendFile followed a symlink; want an error (ELOOP)")
+	}
+	if _, err := NewCallLog(link); err == nil {
+		t.Fatal("NewCallLog opened a symlinked path; want an error")
+	}
+	if _, err := NewPayloadLog(link); err == nil {
+		t.Fatal("NewPayloadLog opened a symlinked path; want an error")
+	}
+
+	// A plain file still opens fine.
+	f, err := openAppendFile(target)
+	if err != nil {
+		t.Fatalf("openAppendFile on a regular file: %v", err)
+	}
+	_ = f.Close()
+}
+
+// TestRecordAfterCloseIsDropped verifies the explicit closed flag: a Record
+// arriving after Close must not panic and must not append anything — the drop
+// is intentional and cheap, not a swallowed OS write error.
+func TestRecordAfterCloseIsDropped(t *testing.T) {
+	var buf bytes.Buffer
+	cl := NewCallLogWriter(&buf)
+	cl.Record(CallRecord{Upstream: "a", Tool: "a__x", OK: true})
+	if err := cl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	cl.Record(CallRecord{Upstream: "b", Tool: "b__y", OK: true})
+	if got := strings.Count(buf.String(), "\n"); got != 1 {
+		t.Fatalf("call log has %d lines after post-Close Record, want 1", got)
+	}
+
+	var pbuf bytes.Buffer
+	pl := NewPayloadLogWriter(&pbuf)
+	pl.Record(PayloadRecord{Upstream: "a", Tool: "a__x"})
+	if err := pl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	pl.Record(PayloadRecord{Upstream: "b", Tool: "b__y"})
+	if got := strings.Count(pbuf.String(), "\n"); got != 1 {
+		t.Fatalf("payload log has %d lines after post-Close Record, want 1", got)
 	}
 }
 
