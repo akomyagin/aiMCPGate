@@ -15,5 +15,12 @@ COPY mcp-gate /mcp-gate
 # __demo-echo stub as its only upstream. Never use it for real work.
 COPY demo.config.yaml /demo.config.yaml
 
+# Ownership verification for the official MCP registry: the registry checks
+# this static LABEL against the server name in server.json. It is intentionally
+# NOT templated (the server name never changes between releases) and is
+# separate from the goreleaser --label flags in .goreleaser.yaml
+# build_flag_templates, which carry source/version/revision metadata.
+LABEL io.modelcontextprotocol.server.name="io.github.akomyagin/aimcpgate"
+
 ENTRYPOINT ["/mcp-gate"]
 CMD ["serve"]

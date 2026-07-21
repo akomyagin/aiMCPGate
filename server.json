@@ -1,8 +1,8 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.akomyagin/aimcpgate",
   "description": "MCP gateway/proxy: presents one MCP endpoint to a client and multiplexes tool calls across several upstream MCP servers, aggregating their catalogs into one namespaced catalog and logging every call.",
-  "version": "0.0.0-dev",
+  "version": "0.2.1",
   "repository": {
     "url": "https://github.com/akomyagin/aiMCPGate",
     "source": "github"
@@ -10,8 +10,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/akomyagin/aimcpgate",
-      "version": "0.0.0-dev",
+      "identifier": "ghcr.io/akomyagin/aimcpgate:0.2.1",
       "transport": {
         "type": "stdio"
       }
@@ -20,7 +19,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "aimcpgate",
-      "version": "0.0.0-dev",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       }
