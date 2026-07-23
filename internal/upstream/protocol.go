@@ -8,12 +8,6 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
-// gatewayClientInfo identifies aiMCPGate to upstream servers during initialize.
-var gatewayClientInfo = mcp.Implementation{
-	Name:    "aiMCPGate",
-	Version: "0.1.0-dev",
-}
-
 // transport is the minimal surface a concrete upstream connection must
 // provide for the shared MCP protocol logic below. Neither stdioTransport
 // nor httpTransport knows anything about Initialize/ListTools/ListResources/
@@ -45,6 +39,13 @@ type Conn struct {
 // `initialize` request and, on success, the `notifications/initialized`
 // notification. It returns the server's InitializeResult.
 func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
+	// gatewayClientInfo identifies aiMCPGate to the upstream during the
+	// handshake below — used nowhere else, so it lives here rather than at
+	// package scope.
+	gatewayClientInfo := mcp.Implementation{
+		Name:    "aiMCPGate",
+		Version: "0.1.0-dev",
+	}
 	params := mcp.MustParams(mcp.InitializeParams{
 		ProtocolVersion: mcp.ProtocolVersion,
 		Capabilities:    json.RawMessage(`{}`),
@@ -138,8 +139,3 @@ func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMess
 	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
 	return c.transport.call(ctx, mcp.MethodToolsCall, params)
 }
-
-var (
-	_ transport = (*stdioTransport)(nil)
-	_ transport = (*httpTransport)(nil)
-)
