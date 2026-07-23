@@ -3,7 +3,7 @@
 // Stage 1 provides StdioConn: an upstream MCP server launched as a child process
 // (os/exec) and spoken to over its stdin/stdout with JSON-RPC 2.0. A single
 // reader goroutine demultiplexes responses by JSON-RPC id and delivers them to
-// the goroutine that issued the matching Call.
+// the goroutine that issued the matching call.
 //
 // The upstream.Conn interface is intentionally NOT introduced yet — that lands
 // with the second implementation (httpConn, Phase 2), per the project rule
@@ -26,7 +26,7 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
-// ErrConnClosed is returned by Call once the connection's reader has stopped
+// ErrConnClosed is returned by call once the connection's reader has stopped
 // (child exited or Close was called).
 var ErrConnClosed = errors.New("upstream: connection closed")
 
@@ -41,7 +41,7 @@ const closeGracePeriod = 5 * time.Second
 //   - writes to the child's stdin are serialized by mcp.Writer's mutex;
 //   - one reader goroutine reads the child's stdout line by line and routes each
 //     response to a waiter channel keyed by the gateway-side id;
-//   - Call mints a fresh upstream-side id from an atomic counter, so the
+//   - call mints a fresh upstream-side id from an atomic counter, so the
 //     gateway's id space is fully separated from any client id space.
 type StdioConn struct {
 	name string
@@ -84,6 +84,32 @@ type StdioConn struct {
 
 // Name returns the upstream's stable identifier.
 func (c *StdioConn) Name() string { return c.name }
+
+// Initialize performs the MCP handshake against this upstream: sends an
+// `initialize` request and, on success, the `notifications/initialized`
+// notification. It returns the server's InitializeResult.
+func (c *StdioConn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
+	return doInitialize(ctx, c)
+}
+
+// ListTools fetches the upstream's full tool catalog, following pagination via
+// nextCursor until exhausted.
+func (c *StdioConn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
+	return doListTools(ctx, c)
+}
+
+// ListResources fetches the upstream's resource catalog, following pagination.
+// A method-not-found error (upstream declares no resources capability) is
+// treated as an empty catalog rather than a hard failure.
+func (c *StdioConn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
+	return doListResources(ctx, c)
+}
+
+// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
+// (un-namespaced) tool name expected by the upstream.
+func (c *StdioConn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+	return doCallTool(ctx, c, name, arguments)
+}
 
 // Done returns a channel closed when this connection's reader goroutine exits —
 // i.e. when the child process has died (its stdout reached EOF) or Close was
@@ -232,10 +258,10 @@ func (c *StdioConn) failAll() {
 	}
 }
 
-// Call sends a request with a fresh upstream-side id and waits for its response
+// call sends a request with a fresh upstream-side id and waits for its response
 // or ctx cancellation. The returned *mcp.Message is the raw response (which may
 // carry an Error); a nil error means a response was received.
-func (c *StdioConn) Call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
+func (c *StdioConn) call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
 	id := mcp.IntID(c.nextID.Add(1))
 	key := string(id)
 	ch := make(chan *mcp.Message, 1)
@@ -270,8 +296,10 @@ func (c *StdioConn) Call(ctx context.Context, method string, params json.RawMess
 	}
 }
 
-// Notify sends a one-way notification (no id, no response expected).
-func (c *StdioConn) Notify(method string, params json.RawMessage) error {
+// notify sends a one-way notification (no id, no response expected). ctx is
+// unused on the stdio side — the write is a local pipe write — and exists only
+// so the signature matches HTTPConn.notify for the shared caller interface.
+func (c *StdioConn) notify(_ context.Context, method string, params json.RawMessage) error {
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()

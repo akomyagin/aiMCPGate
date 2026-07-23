@@ -105,101 +105,28 @@ func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]strin
 func (c *HTTPConn) Name() string { return c.name }
 
 // Initialize performs the MCP handshake over HTTP: POSTs an initialize request,
-// captures any Mcp-Session-Id the server assigns, then POSTs the
+// captures any Mcp-Session-Id the server assigns (inside call), then POSTs the
 // notifications/initialized notification (which the server answers with 202).
 func (c *HTTPConn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
-	params := mcp.MustParams(mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    json.RawMessage(`{}`),
-		ClientInfo:      gatewayClientInfo,
-	})
-
-	resp, err := c.call(ctx, mcp.MethodInitialize, params)
-	if err != nil {
-		return nil, fmt.Errorf("upstream %q: initialize: %w", c.name, err)
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("upstream %q: initialize rejected: %w", c.name, resp.Error)
-	}
-
-	var res mcp.InitializeResult
-	if err := json.Unmarshal(resp.Result, &res); err != nil {
-		return nil, fmt.Errorf("upstream %q: decode initialize result: %w", c.name, err)
-	}
-
-	if err := c.notify(ctx, mcp.NotifInitialized, nil); err != nil {
-		return nil, fmt.Errorf("upstream %q: send initialized: %w", c.name, err)
-	}
-	return &res, nil
+	return doInitialize(ctx, c)
 }
 
 // ListTools fetches the upstream's full tool catalog, following pagination via
-// nextCursor. Kept in sync with StdioConn.ListTools (same protocol logic, HTTP
-// transport underneath).
+// nextCursor until exhausted.
 func (c *HTTPConn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	var all []mcp.Tool
-	cursor := ""
-	for {
-		var params json.RawMessage
-		if cursor != "" {
-			params = mcp.MustParams(mcp.ToolsListParams{Cursor: cursor})
-		}
-		resp, err := c.call(ctx, mcp.MethodToolsList, params)
-		if err != nil {
-			return nil, fmt.Errorf("upstream %q: tools/list: %w", c.name, err)
-		}
-		if resp.Error != nil {
-			return nil, fmt.Errorf("upstream %q: tools/list error: %w", c.name, resp.Error)
-		}
-		var res mcp.ToolsListResult
-		if err := json.Unmarshal(resp.Result, &res); err != nil {
-			return nil, fmt.Errorf("upstream %q: decode tools/list: %w", c.name, err)
-		}
-		all = append(all, res.Tools...)
-		if res.NextCursor == "" {
-			return all, nil
-		}
-		cursor = res.NextCursor
-	}
+	return doListTools(ctx, c)
 }
 
-// ListResources fetches the upstream's resource catalog, treating a
-// method-not-found error as an empty catalog (same as StdioConn.ListResources).
+// ListResources fetches the upstream's resource catalog, following pagination,
+// treating a method-not-found error as an empty catalog.
 func (c *HTTPConn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
-	var all []mcp.Resource
-	cursor := ""
-	for {
-		var params json.RawMessage
-		if cursor != "" {
-			params = mcp.MustParams(mcp.ResourceListParams{Cursor: cursor})
-		}
-		resp, err := c.call(ctx, mcp.MethodResourceList, params)
-		if err != nil {
-			return nil, fmt.Errorf("upstream %q: resources/list: %w", c.name, err)
-		}
-		if resp.Error != nil {
-			if resp.Error.Code == mcp.CodeMethodNotFound {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("upstream %q: resources/list error: %w", c.name, resp.Error)
-		}
-		var res mcp.ResourceListResult
-		if err := json.Unmarshal(resp.Result, &res); err != nil {
-			return nil, fmt.Errorf("upstream %q: decode resources/list: %w", c.name, err)
-		}
-		all = append(all, res.Resources...)
-		if res.NextCursor == "" {
-			return all, nil
-		}
-		cursor = res.NextCursor
-	}
+	return doListResources(ctx, c)
 }
 
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name the upstream expects.
 func (c *HTTPConn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
-	return c.call(ctx, mcp.MethodToolsCall, params)
+	return doCallTool(ctx, c, name, arguments)
 }
 
 // Close releases resources. HTTP is connectionless from our side (no child
