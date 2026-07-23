@@ -34,7 +34,9 @@ type transport interface {
 // Conn is a live connection to one upstream MCP server, regardless of
 // transport (stdio or HTTP). Name/Close/Done/call/notify are promoted
 // straight from whichever transport it wraps; Initialize/ListTools/
-// ListResources/CallTool are implemented once here, against transport.
+// ListResources/CallTool are implemented once, directly below, against
+// c.transport — there is exactly one caller of each, so there is no separate
+// package-level function to share between callers that no longer exist.
 type Conn struct {
 	transport
 }
@@ -43,44 +45,13 @@ type Conn struct {
 // `initialize` request and, on success, the `notifications/initialized`
 // notification. It returns the server's InitializeResult.
 func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
-	return doInitialize(ctx, c.transport)
-}
-
-// ListTools fetches the upstream's full tool catalog, following pagination via
-// nextCursor until exhausted.
-func (c *Conn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	return doListTools(ctx, c.transport)
-}
-
-// ListResources fetches the upstream's resource catalog, following pagination.
-// A method-not-found error (upstream declares no resources capability) is
-// treated as an empty catalog rather than a hard failure.
-func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
-	return doListResources(ctx, c.transport)
-}
-
-// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
-// (un-namespaced) tool name expected by the upstream.
-func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	return doCallTool(ctx, c.transport, name, arguments)
-}
-
-var (
-	_ transport = (*stdioTransport)(nil)
-	_ transport = (*httpTransport)(nil)
-)
-
-// doInitialize performs the MCP handshake against an upstream: sends an
-// `initialize` request and, on success, the `notifications/initialized`
-// notification. It returns the server's InitializeResult.
-func doInitialize(ctx context.Context, c transport) (*mcp.InitializeResult, error) {
 	params := mcp.MustParams(mcp.InitializeParams{
 		ProtocolVersion: mcp.ProtocolVersion,
 		Capabilities:    json.RawMessage(`{}`),
 		ClientInfo:      gatewayClientInfo,
 	})
 
-	resp, err := c.call(ctx, mcp.MethodInitialize, params)
+	resp, err := c.transport.call(ctx, mcp.MethodInitialize, params)
 	if err != nil {
 		return nil, fmt.Errorf("upstream %q: initialize: %w", c.Name(), err)
 	}
@@ -93,15 +64,15 @@ func doInitialize(ctx context.Context, c transport) (*mcp.InitializeResult, erro
 		return nil, fmt.Errorf("upstream %q: decode initialize result: %w", c.Name(), err)
 	}
 
-	if err := c.notify(ctx, mcp.NotifInitialized, nil); err != nil {
+	if err := c.transport.notify(ctx, mcp.NotifInitialized, nil); err != nil {
 		return nil, fmt.Errorf("upstream %q: send initialized: %w", c.Name(), err)
 	}
 	return &res, nil
 }
 
-// doListTools fetches the upstream's full tool catalog, following pagination via
+// ListTools fetches the upstream's full tool catalog, following pagination via
 // nextCursor until exhausted.
-func doListTools(ctx context.Context, c transport) ([]mcp.Tool, error) {
+func (c *Conn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 	var all []mcp.Tool
 	cursor := ""
 	for {
@@ -109,7 +80,7 @@ func doListTools(ctx context.Context, c transport) ([]mcp.Tool, error) {
 		if cursor != "" {
 			params = mcp.MustParams(mcp.ToolsListParams{Cursor: cursor})
 		}
-		resp, err := c.call(ctx, mcp.MethodToolsList, params)
+		resp, err := c.transport.call(ctx, mcp.MethodToolsList, params)
 		if err != nil {
 			return nil, fmt.Errorf("upstream %q: tools/list: %w", c.Name(), err)
 		}
@@ -128,10 +99,10 @@ func doListTools(ctx context.Context, c transport) ([]mcp.Tool, error) {
 	}
 }
 
-// doListResources fetches the upstream's resource catalog, following pagination.
+// ListResources fetches the upstream's resource catalog, following pagination.
 // A method-not-found error (upstream declares no resources capability) is
 // treated as an empty catalog rather than a hard failure.
-func doListResources(ctx context.Context, c transport) ([]mcp.Resource, error) {
+func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 	var all []mcp.Resource
 	cursor := ""
 	for {
@@ -139,7 +110,7 @@ func doListResources(ctx context.Context, c transport) ([]mcp.Resource, error) {
 		if cursor != "" {
 			params = mcp.MustParams(mcp.ResourceListParams{Cursor: cursor})
 		}
-		resp, err := c.call(ctx, mcp.MethodResourceList, params)
+		resp, err := c.transport.call(ctx, mcp.MethodResourceList, params)
 		if err != nil {
 			return nil, fmt.Errorf("upstream %q: resources/list: %w", c.Name(), err)
 		}
@@ -161,9 +132,14 @@ func doListResources(ctx context.Context, c transport) ([]mcp.Resource, error) {
 	}
 }
 
-// doCallTool forwards a tools/call to the upstream. name is the ORIGINAL
+// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name expected by the upstream.
-func doCallTool(ctx context.Context, c transport, name string, arguments json.RawMessage) (*mcp.Message, error) {
+func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
 	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
-	return c.call(ctx, mcp.MethodToolsCall, params)
+	return c.transport.call(ctx, mcp.MethodToolsCall, params)
 }
+
+var (
+	_ transport = (*stdioTransport)(nil)
+	_ transport = (*httpTransport)(nil)
+)
