@@ -45,13 +45,10 @@ var defaultHTTPClient = &http.Client{
 	Transport: http.DefaultTransport,
 }
 
-// HTTPConn is a live connection to one upstream MCP server reached over the
-// Streamable HTTP transport (MCP 2025-06-18). It is the second Upstream
-// implementation alongside StdioConn; both satisfy the registry.Upstream
-// interface, which is why no separate upstream.Conn interface is introduced
-// here — the interface the project's "second implementation" rule anticipated
-// already exists in the registry, and this type simply fills it. See
-// docs/MCP_NOTES.md §8.
+// httpTransport is the transport half of a connection to one upstream MCP
+// server reached over the Streamable HTTP transport (MCP 2025-06-18). Protocol
+// logic (Initialize etc.) lives on Conn (protocol.go); this type only knows how
+// to move JSON-RPC messages over HTTP. See docs/MCP_NOTES.md §8.
 //
 // Transport shape (docs/MCP_NOTES.md §8):
 //   - every JSON-RPC message is one HTTP POST to the endpoint URL;
@@ -64,11 +61,11 @@ var defaultHTTPClient = &http.Client{
 //     subsequent requests; the negotiated MCP-Protocol-Version header goes on
 //     every request after initialize.
 //
-// Unlike StdioConn there is no long-lived reader goroutine: HTTP is
+// Unlike stdioTransport there is no long-lived reader goroutine: HTTP is
 // request/response, so each Call owns its own round-trip and id-demultiplexing
 // is unnecessary. Concurrency safety comes from net/http (safe for concurrent
 // use) plus a mutex guarding the session id.
-type HTTPConn struct {
+type httpTransport struct {
 	name     string
 	endpoint string
 	log      *slog.Logger
@@ -84,56 +81,36 @@ type HTTPConn struct {
 	sessionID string // Mcp-Session-Id assigned by the server on initialize, if any
 }
 
-// StartHTTP builds an HTTPConn for endpoint. It performs no network I/O — the
-// handshake happens in Initialize, mirroring StartStdio which likewise defers
-// the handshake. headers are extra per-request headers (e.g. Authorization);
-// their values are treated as secrets and never logged.
-func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client) *HTTPConn {
+// StartHTTP builds a Conn over an httpTransport for endpoint. It performs no
+// network I/O — the handshake happens in Initialize, mirroring StartStdio which
+// likewise defers the handshake. headers are extra per-request headers (e.g.
+// Authorization); their values are treated as secrets and never logged.
+func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client) *Conn {
 	if client == nil {
 		client = defaultHTTPClient
 	}
-	return &HTTPConn{
+	return &Conn{transport: &httpTransport{
 		name:     name,
 		endpoint: endpoint,
 		log:      log,
 		client:   client,
 		headers:  headers,
-	}
+	}}
 }
 
 // Name returns the upstream's stable identifier.
-func (c *HTTPConn) Name() string { return c.name }
+func (c *httpTransport) Name() string { return c.name }
 
-// Initialize performs the MCP handshake over HTTP: POSTs an initialize request,
-// captures any Mcp-Session-Id the server assigns (inside call), then POSTs the
-// notifications/initialized notification (which the server answers with 202).
-func (c *HTTPConn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
-	return doInitialize(ctx, c)
-}
-
-// ListTools fetches the upstream's full tool catalog, following pagination via
-// nextCursor until exhausted.
-func (c *HTTPConn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	return doListTools(ctx, c)
-}
-
-// ListResources fetches the upstream's resource catalog, following pagination,
-// treating a method-not-found error as an empty catalog.
-func (c *HTTPConn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
-	return doListResources(ctx, c)
-}
-
-// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
-// (un-namespaced) tool name the upstream expects.
-func (c *HTTPConn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	return doCallTool(ctx, c, name, arguments)
-}
+// Done reports absence: HTTP has no persistent process to watch, so it honestly
+// returns ok=false rather than faking a channel that would never fire.
+// Unreachability of an HTTP upstream is caught at the next call instead.
+func (c *httpTransport) Done() (<-chan struct{}, bool) { return nil, false }
 
 // Close releases resources. HTTP is connectionless from our side (no child
 // process, no reader goroutine), so there is nothing to tear down beyond
 // idling the transport's connections; the DELETE session-termination request is
 // best-effort and deliberately not sent in the MVP (see docs/MCP_NOTES.md §8).
-func (c *HTTPConn) Close() error {
+func (c *httpTransport) Close() error {
 	if t, ok := c.client.Transport.(*http.Transport); ok {
 		t.CloseIdleConnections()
 	}
@@ -144,7 +121,7 @@ func (c *HTTPConn) Close() error {
 // both response content types the spec allows: a single application/json object,
 // or a text/event-stream SSE stream from which we pull the response frame whose
 // id matches our request.
-func (c *HTTPConn) call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
+func (c *httpTransport) call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
 	id := mcp.IntID(c.nextID.Add(1))
 	req := mcp.NewRequest(id, method, params)
 
@@ -191,7 +168,7 @@ func (c *HTTPConn) call(ctx context.Context, method string, params json.RawMessa
 
 // notify POSTs a one-way JSON-RPC notification (no id). The server answers 202
 // Accepted with no body; any 2xx is treated as success and the body drained.
-func (c *HTTPConn) notify(ctx context.Context, method string, params json.RawMessage) error {
+func (c *httpTransport) notify(ctx context.Context, method string, params json.RawMessage) error {
 	httpResp, err := c.post(ctx, mcp.NewNotification(method, params))
 	if err != nil {
 		return err
@@ -209,7 +186,7 @@ func (c *HTTPConn) notify(ctx context.Context, method string, params json.RawMes
 // post marshals msg and POSTs it to the MCP endpoint with the headers the spec
 // requires (Accept for both content types, the negotiated protocol version, the
 // session id once known) plus any static per-upstream headers (auth).
-func (c *HTTPConn) post(ctx context.Context, msg *mcp.Message) (*http.Response, error) {
+func (c *httpTransport) post(ctx context.Context, msg *mcp.Message) (*http.Response, error) {
 	body, err := mcp.Encode(msg)
 	if err != nil {
 		return nil, fmt.Errorf("upstream %q: encode request: %w", c.name, err)
@@ -270,7 +247,7 @@ func redactedEndpoint(endpoint string) string {
 // SSE framing (WHATWG): events are blank-line-separated; a "data:" line carries
 // the payload. MCP puts one JSON-RPC message per event's data, so we parse each
 // data payload as a Message.
-func (c *HTTPConn) readSSEResponse(body io.Reader, want json.RawMessage) (*mcp.Message, error) {
+func (c *httpTransport) readSSEResponse(body io.Reader, want json.RawMessage) (*mcp.Message, error) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), maxHTTPResponseBytes)
 	for sc.Scan() {

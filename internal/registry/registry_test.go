@@ -71,6 +71,8 @@ func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments json.R
 
 func (f *fakeUpstream) Close() error { return nil }
 
+func (f *fakeUpstream) Done() (<-chan struct{}, bool) { return nil, false }
+
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // noopPayloadLog returns the disabled (no-op) payload log used by tests that do

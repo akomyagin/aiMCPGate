@@ -14,25 +14,66 @@ var gatewayClientInfo = mcp.Implementation{
 	Version: "0.1.0-dev",
 }
 
-// caller is the minimal transport surface the shared MCP protocol logic needs:
-// a request/response round-trip (call) and a one-way notification (notify),
-// plus the upstream name for error messages. *StdioConn and *HTTPConn both
-// satisfy it after Call/Notify were unexported for symmetry with the HTTP side.
-type caller interface {
+// transport is the minimal surface a concrete upstream connection must
+// provide for the shared MCP protocol logic below. Neither stdioTransport
+// nor httpTransport knows anything about Initialize/ListTools/ListResources/
+// CallTool — that logic lives once, here, against this interface.
+type transport interface {
 	call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error)
 	notify(ctx context.Context, method string, params json.RawMessage) error
 	Name() string
+	Close() error
+	// Done reports the "process died" channel for transports backed by a
+	// long-lived process that can die independently of any call (stdio). ok
+	// is false when there is no such channel (HTTP has no persistent
+	// process to watch) — an honest declaration of absence, not a faked
+	// channel that would never fire.
+	Done() (ch <-chan struct{}, ok bool)
+}
+
+// Conn is a live connection to one upstream MCP server, regardless of
+// transport (stdio or HTTP). Name/Close/Done/call/notify are promoted
+// straight from whichever transport it wraps; Initialize/ListTools/
+// ListResources/CallTool are implemented once here, against transport.
+type Conn struct {
+	transport
+}
+
+// Initialize performs the MCP handshake against this upstream: sends an
+// `initialize` request and, on success, the `notifications/initialized`
+// notification. It returns the server's InitializeResult.
+func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
+	return doInitialize(ctx, c.transport)
+}
+
+// ListTools fetches the upstream's full tool catalog, following pagination via
+// nextCursor until exhausted.
+func (c *Conn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
+	return doListTools(ctx, c.transport)
+}
+
+// ListResources fetches the upstream's resource catalog, following pagination.
+// A method-not-found error (upstream declares no resources capability) is
+// treated as an empty catalog rather than a hard failure.
+func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
+	return doListResources(ctx, c.transport)
+}
+
+// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
+// (un-namespaced) tool name expected by the upstream.
+func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+	return doCallTool(ctx, c.transport, name, arguments)
 }
 
 var (
-	_ caller = (*StdioConn)(nil)
-	_ caller = (*HTTPConn)(nil)
+	_ transport = (*stdioTransport)(nil)
+	_ transport = (*httpTransport)(nil)
 )
 
 // doInitialize performs the MCP handshake against an upstream: sends an
 // `initialize` request and, on success, the `notifications/initialized`
 // notification. It returns the server's InitializeResult.
-func doInitialize(ctx context.Context, c caller) (*mcp.InitializeResult, error) {
+func doInitialize(ctx context.Context, c transport) (*mcp.InitializeResult, error) {
 	params := mcp.MustParams(mcp.InitializeParams{
 		ProtocolVersion: mcp.ProtocolVersion,
 		Capabilities:    json.RawMessage(`{}`),
@@ -60,7 +101,7 @@ func doInitialize(ctx context.Context, c caller) (*mcp.InitializeResult, error) 
 
 // doListTools fetches the upstream's full tool catalog, following pagination via
 // nextCursor until exhausted.
-func doListTools(ctx context.Context, c caller) ([]mcp.Tool, error) {
+func doListTools(ctx context.Context, c transport) ([]mcp.Tool, error) {
 	var all []mcp.Tool
 	cursor := ""
 	for {
@@ -90,7 +131,7 @@ func doListTools(ctx context.Context, c caller) ([]mcp.Tool, error) {
 // doListResources fetches the upstream's resource catalog, following pagination.
 // A method-not-found error (upstream declares no resources capability) is
 // treated as an empty catalog rather than a hard failure.
-func doListResources(ctx context.Context, c caller) ([]mcp.Resource, error) {
+func doListResources(ctx context.Context, c transport) ([]mcp.Resource, error) {
 	var all []mcp.Resource
 	cursor := ""
 	for {
@@ -122,7 +163,7 @@ func doListResources(ctx context.Context, c caller) ([]mcp.Resource, error) {
 
 // doCallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name expected by the upstream.
-func doCallTool(ctx context.Context, c caller, name string, arguments json.RawMessage) (*mcp.Message, error) {
+func doCallTool(ctx context.Context, c transport, name string, arguments json.RawMessage) (*mcp.Message, error) {
 	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
 	return c.call(ctx, mcp.MethodToolsCall, params)
 }

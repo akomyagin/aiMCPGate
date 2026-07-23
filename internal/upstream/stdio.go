@@ -1,13 +1,11 @@
 // Package upstream implements connections to individual upstream MCP servers.
 //
-// Stage 1 provides StdioConn: an upstream MCP server launched as a child process
-// (os/exec) and spoken to over its stdin/stdout with JSON-RPC 2.0. A single
-// reader goroutine demultiplexes responses by JSON-RPC id and delivers them to
-// the goroutine that issued the matching call.
-//
-// The upstream.Conn interface is intentionally NOT introduced yet — that lands
-// with the second implementation (httpConn, Phase 2), per the project rule
-// "interface on the second implementation".
+// The public surface is Conn (protocol.go): one type for every transport,
+// wrapping the private transport interface. This file provides stdioTransport:
+// an upstream MCP server launched as a child process (os/exec) and spoken to
+// over its stdin/stdout with JSON-RPC 2.0. A single reader goroutine
+// demultiplexes responses by JSON-RPC id and delivers them to the goroutine
+// that issued the matching call.
 package upstream
 
 import (
@@ -35,7 +33,8 @@ var ErrConnClosed = errors.New("upstream: connection closed")
 // upstream that keeps stdout open must not hang gateway shutdown forever.
 const closeGracePeriod = 5 * time.Second
 
-// StdioConn is a live connection to one stdio upstream MCP server.
+// stdioTransport is the transport half of a connection to one stdio upstream
+// MCP server. Protocol logic (Initialize etc.) lives on Conn (protocol.go).
 //
 // Concurrency model (docs/TECHNICAL_PLAN.md §4.1, SKILL §4):
 //   - writes to the child's stdin are serialized by mcp.Writer's mutex;
@@ -43,7 +42,7 @@ const closeGracePeriod = 5 * time.Second
 //     response to a waiter channel keyed by the gateway-side id;
 //   - call mints a fresh upstream-side id from an atomic counter, so the
 //     gateway's id space is fully separated from any client id space.
-type StdioConn struct {
+type stdioTransport struct {
 	name string
 	log  *slog.Logger
 
@@ -83,41 +82,14 @@ type StdioConn struct {
 }
 
 // Name returns the upstream's stable identifier.
-func (c *StdioConn) Name() string { return c.name }
+func (c *stdioTransport) Name() string { return c.name }
 
-// Initialize performs the MCP handshake against this upstream: sends an
-// `initialize` request and, on success, the `notifications/initialized`
-// notification. It returns the server's InitializeResult.
-func (c *StdioConn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
-	return doInitialize(ctx, c)
-}
-
-// ListTools fetches the upstream's full tool catalog, following pagination via
-// nextCursor until exhausted.
-func (c *StdioConn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	return doListTools(ctx, c)
-}
-
-// ListResources fetches the upstream's resource catalog, following pagination.
-// A method-not-found error (upstream declares no resources capability) is
-// treated as an empty catalog rather than a hard failure.
-func (c *StdioConn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
-	return doListResources(ctx, c)
-}
-
-// CallTool forwards a tools/call to the upstream. name is the ORIGINAL
-// (un-namespaced) tool name expected by the upstream.
-func (c *StdioConn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	return doCallTool(ctx, c, name, arguments)
-}
-
-// Done returns a channel closed when this connection's reader goroutine exits —
+// Done reports a channel closed when this connection's reader goroutine exits —
 // i.e. when the child process has died (its stdout reached EOF) or Close was
 // called. The registry's per-upstream supervisor selects on it to detect a
-// crashed stdio upstream and trigger an auto-restart (Stage 7a). Only stdio
-// upstreams expose this; the registry reaches it by type-assertion so the HTTP
-// upstream (which has no long-lived process to watch) need not implement it.
-func (c *StdioConn) Done() <-chan struct{} { return c.done }
+// crashed stdio upstream and trigger an auto-restart (Stage 7a). ok is always
+// true here: a stdio upstream always has a long-lived process to watch.
+func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 
 // StartStdio launches command with args/env as a child process and starts the
 // reader goroutine. It does NOT perform the MCP handshake — call Initialize.
@@ -133,7 +105,7 @@ func (c *StdioConn) Done() <-chan struct{} { return c.done }
 // the struct literal before that goroutine exists, so no lock is needed. The
 // callback must not block or call back into the connection synchronously
 // (Stage 7b).
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, onNotify func(method string)) (*StdioConn, error) {
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, onNotify func(method string)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -160,7 +132,7 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 		return nil, fmt.Errorf("upstream %q: start: %w", name, err)
 	}
 
-	c := &StdioConn{
+	t := &stdioTransport{
 		name:       name,
 		log:        log,
 		cmd:        cmd,
@@ -170,19 +142,19 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 		waiters:    make(map[string]chan *mcp.Message),
 		done:       make(chan struct{}),
 		stderrDone: make(chan struct{}),
-		onNotify:   onNotify, // must be set before go c.readLoop() below
+		onNotify:   onNotify, // must be set before go t.readLoop() below
 	}
 
-	go c.readLoop()
-	go c.drainStderr(stderr)
+	go t.readLoop()
+	go t.drainStderr(stderr)
 
-	return c, nil
+	return &Conn{transport: t}, nil
 }
 
 // readLoop reads framed messages from the child's stdout and routes each
 // response to its waiter. It runs until stdout closes (child exit), then fails
 // all outstanding waiters.
-func (c *StdioConn) readLoop() {
+func (c *stdioTransport) readLoop() {
 	defer close(c.done)
 	r := mcp.NewReader(c.stdout)
 	for {
@@ -221,7 +193,7 @@ func (c *StdioConn) readLoop() {
 // child exit, so reading from that pipe concurrently with (or after) Wait is
 // a race — "it is thus incorrect to call Wait before all reads from the pipe
 // have completed" (found by code review; done alone only tracked stdout).
-func (c *StdioConn) drainStderr(stderr io.Reader) {
+func (c *stdioTransport) drainStderr(stderr io.Reader) {
 	defer close(c.stderrDone)
 	sc := bufio.NewScanner(stderr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -231,7 +203,7 @@ func (c *StdioConn) drainStderr(stderr io.Reader) {
 }
 
 // deliver routes a response to its waiter (if any) by its id.
-func (c *StdioConn) deliver(msg *mcp.Message) {
+func (c *stdioTransport) deliver(msg *mcp.Message) {
 	key := string(msg.ID)
 	c.mu.Lock()
 	ch, ok := c.waiters[key]
@@ -247,7 +219,7 @@ func (c *StdioConn) deliver(msg *mcp.Message) {
 }
 
 // failAll closes out all pending waiters when the connection dies.
-func (c *StdioConn) failAll() {
+func (c *stdioTransport) failAll() {
 	c.mu.Lock()
 	c.closed = true
 	waiters := c.waiters
@@ -261,7 +233,7 @@ func (c *StdioConn) failAll() {
 // call sends a request with a fresh upstream-side id and waits for its response
 // or ctx cancellation. The returned *mcp.Message is the raw response (which may
 // carry an Error); a nil error means a response was received.
-func (c *StdioConn) call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
+func (c *stdioTransport) call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error) {
 	id := mcp.IntID(c.nextID.Add(1))
 	key := string(id)
 	ch := make(chan *mcp.Message, 1)
@@ -298,8 +270,8 @@ func (c *StdioConn) call(ctx context.Context, method string, params json.RawMess
 
 // notify sends a one-way notification (no id, no response expected). ctx is
 // unused on the stdio side — the write is a local pipe write — and exists only
-// so the signature matches HTTPConn.notify for the shared caller interface.
-func (c *StdioConn) notify(_ context.Context, method string, params json.RawMessage) error {
+// so the signature matches httpTransport.notify for the shared transport interface.
+func (c *stdioTransport) notify(_ context.Context, method string, params json.RawMessage) error {
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
@@ -313,7 +285,7 @@ func (c *StdioConn) notify(_ context.Context, method string, params json.RawMess
 // lifecycle) and waits for it to exit. Safe to call more than once, including
 // CONCURRENTLY from multiple goroutines: the actual teardown runs exactly
 // once (closeOnce); every caller gets the same result.
-func (c *StdioConn) Close() error {
+func (c *stdioTransport) Close() error {
 	c.closeOnce.Do(func() {
 		c.closeErr = c.closeAndWait()
 	})
@@ -321,7 +293,7 @@ func (c *StdioConn) Close() error {
 }
 
 // closeAndWait is Close's one-time body.
-func (c *StdioConn) closeAndWait() error {
+func (c *stdioTransport) closeAndWait() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()

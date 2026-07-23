@@ -97,7 +97,8 @@ type UpstreamStatus struct {
 type upstreamStarter func(ctx context.Context, u config.Upstream) (Upstream, error)
 
 // Upstream is the minimal surface the registry needs from a live upstream
-// connection. *upstream.StdioConn satisfies it; tests provide fakes.
+// connection. *upstream.Conn satisfies it directly for both stdio and HTTP
+// transports — no type-assertions needed; tests provide fakes.
 type Upstream interface {
 	Name() string
 	Initialize(ctx context.Context) (*mcp.InitializeResult, error)
@@ -105,6 +106,10 @@ type Upstream interface {
 	ListResources(ctx context.Context) ([]mcp.Resource, error)
 	CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error)
 	Close() error
+	// Done reports the "process died" channel of an upstream backed by a
+	// long-lived process (stdio); ok is false when there is no such process
+	// to watch (HTTP), so a supervisor is simply not started for it.
+	Done() (ch <-chan struct{}, ok bool)
 }
 
 // Registry owns upstream connections and the aggregated catalog.
@@ -250,10 +255,9 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 func (r *Registry) config() *config.Config { return r.cfg.Load() }
 
 // startUpstream is the production starter: it dispatches to the stdio or HTTP
-// implementation based on the upstream's resolved kind. Both return an Upstream
-// (StdioConn / HTTPConn), so the registry treats them uniformly from here on —
-// the "interface on the second implementation" rule is satisfied by the
-// existing Upstream interface, not a new upstream.Conn (docs/MCP_NOTES.md §8).
+// implementation based on the upstream's resolved kind. Both return an
+// *upstream.Conn, so the registry treats them uniformly from here on
+// (docs/MCP_NOTES.md §8).
 func (r *Registry) startUpstream(ctx context.Context, u config.Upstream) (Upstream, error) {
 	switch u.ResolveKind() {
 	case config.UpstreamHTTP:
@@ -412,19 +416,6 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	return conn, tools, nil
 }
 
-// doneChan reports the "process died" channel of a stdio upstream, if conn is
-// one. HTTP upstreams have no such channel (no long-lived process between
-// calls), so ok is false for them — the same type-assertion trick already used
-// for *http.Transport in HTTPConn.Close, kept out of the Upstream interface so
-// the HTTP implementation need not fake a channel it cannot honour (Stage 7a).
-func doneChan(conn Upstream) (<-chan struct{}, bool) {
-	d, ok := conn.(interface{ Done() <-chan struct{} })
-	if !ok {
-		return nil, false
-	}
-	return d.Done(), true
-}
-
 // superviseUpstream starts (if enabled and applicable) the goroutine that
 // watches one stdio upstream's process and auto-restarts it on death with
 // exponential backoff (Stage 7a). It is a no-op for HTTP upstreams (no process
@@ -444,7 +435,7 @@ func (r *Registry) superviseUpstream(u config.Upstream, conn Upstream) {
 	if policy.Enabled == nil || !*policy.Enabled {
 		return
 	}
-	done, ok := doneChan(conn)
+	done, ok := conn.Done()
 	if !ok {
 		return // HTTP upstream: unreachability is caught at the next CallTool.
 	}
@@ -509,7 +500,7 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 			// restart — just exit. In both cases some other path (Registry.
 			// Close's own loop, or retireAndClose) already owns (or will own)
 			// closing conn, so we must NOT close it here too — that would
-			// double-close via a different goroutine, which StdioConn.Close's
+			// double-close via a different goroutine, which the stdio Close's
 			// sync.Once now tolerates safely, but touching a connection this
 			// code no longer owns is still the wrong call to make.
 			if supCtx.Err() != nil {
@@ -601,10 +592,11 @@ func (r *Registry) restart(u config.Upstream, supCtx context.Context) (Upstream,
 			continue
 		}
 
-		newDone, ok := doneChan(conn)
+		newDone, ok := conn.Done()
 		if !ok {
-			// Should not happen: launch of a stdio upstream yields a *StdioConn.
-			// Guard anyway so a future non-stdio path cannot silently spin.
+			// Should not happen: a relaunched stdio upstream always has a live
+			// process, so its Done must report ok=true. Guard anyway so a future
+			// non-stdio path cannot silently spin.
 			_ = conn.Close()
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
 			return nil, nil, false
