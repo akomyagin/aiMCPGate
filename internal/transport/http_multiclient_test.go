@@ -2,7 +2,7 @@
 // "Этап 11"). These tests add ZERO production code: they exist to prove under
 // -race that the HTTP transport is already safe for concurrent clients — the
 // dispatcher holds no per-connection state, Registry.CallTool only RLocks for
-// the route lookup, and StdioConn.Call multiplexes concurrent calls over one
+// the route lookup, and the stdio transport's call multiplexes concurrent calls over one
 // upstream pipe via atomic ids + mutex-guarded writes.
 //
 // Concurrency-test conventions used here:
@@ -229,7 +229,7 @@ func checkEchoCall(srv *httptest.Server, id json.RawMessage, tool, marker string
 // against ONE shared gateway (one dispatcher, one registry, shared upstream
 // connections). Every response must match its request by id and by echoed
 // content. Its main value is running under -race: a data race anywhere in the
-// shared dispatcher/registry/StdioConn path fails the run.
+// shared dispatcher/registry/stdio transport path fails the run.
 func TestHTTPConcurrentClientsFullCycle(t *testing.T) {
 	const (
 		numUpstreams   = 3
@@ -264,7 +264,7 @@ func TestHTTPConcurrentClientsFullCycle(t *testing.T) {
 
 // TestHTTPConcurrentCallsToSameUpstream stresses the single-upstream
 // multiplexing path specifically: many concurrent tools/call from different
-// "clients" all funnel into ONE StdioConn (one stdin pipe, one reader
+// "clients" all funnel into ONE stdio transport (one stdin pipe, one reader
 // goroutine), exercising its atomic id minting, mutex-serialized writes and the
 // waiters demux map under real contention. Each call must get back its own
 // echoed marker with its own id.

@@ -104,7 +104,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 // countZombieChildren scans /proc for zombie (state Z) processes whose parent
 // is the CURRENT test process — i.e. a stdio-upstream child this test spawned
 // that exited but was never reaped via wait() (cmd.Wait, which only runs
-// inside StdioConn.Close). Skips (not fails) if /proc is unavailable.
+// inside the stdio transport's Close). Skips (not fails) if /proc is unavailable.
 func countZombieChildren(t *testing.T) int {
 	t.Helper()
 	myPID := os.Getpid()

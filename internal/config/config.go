@@ -636,7 +636,6 @@ func validateUpstreamTransport(u Upstream) error {
 			return fmt.Errorf("upstream %q: kind http requires url", u.Name)
 		}
 	case "":
-		// inferred by ResolveKind; nothing to cross-check
 	default:
 		return fmt.Errorf("upstream %q: unknown kind %q (want %q or %q)", u.Name, u.Kind, UpstreamStdio, UpstreamHTTP)
 	}

@@ -81,7 +81,6 @@ func TestLogsTailLimitsCount(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("tail=1 should print 1 line, got %d:\n%s", len(lines), out)
 	}
-	// Most recent record is github__create_issue.
 	if !strings.Contains(out, "github__create_issue") {
 		t.Errorf("tail=1 should show the last record, got:\n%s", out)
 	}

@@ -168,7 +168,7 @@ func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
 	}
 }
 
-func newConn(t *testing.T, f *fakeHTTPServer, headers map[string]string) (*upstream.HTTPConn, func()) {
+func newConn(t *testing.T, f *fakeHTTPServer, headers map[string]string) (*upstream.Conn, func()) {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())
 	conn := upstream.StartHTTP(quietLogger(), "fakehttp", srv.URL, headers, srv.Client())
