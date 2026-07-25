@@ -280,6 +280,15 @@ func (c *stdioTransport) call(ctx context.Context, method string, params json.Ra
 	// it in a goroutine and honor ctx here too instead of only after the write.
 	// The channel is buffered: an abandoned write goroutine can always deliver
 	// its result and exit instead of leaking.
+	//
+	// An abandoned goroutine may also still be inside c.w.Write when
+	// closeAndWait closes stdin from another goroutine. That is safe by
+	// design, not by luck: since Go 1.9 the os package registers pipe FDs
+	// with the runtime poller, and os.File.Close evicts the FD from it
+	// (internal/poll.FD.Close → pd.evict()), failing any pending Write with
+	// a clean "file already closed" error — no undefined behavior, no data
+	// corruption. The goroutine then delivers that error into its buffered
+	// channel (which nobody reads) and exits.
 	writeErr := make(chan error, 1)
 	go func() { writeErr <- c.w.Write(req) }()
 	select {

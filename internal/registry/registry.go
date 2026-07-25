@@ -212,6 +212,18 @@ type Registry struct {
 	relistMu     sync.Mutex
 	relistTimers map[string]*time.Timer
 	relistStates map[string]*relistState
+	relistClosed bool // set by Close (under relistMu) before it waits on relistWG below
+
+	// relistWG counts in-flight runRelist goroutines so Close can wait for
+	// them: a runRelist may be mid-ListTools against a connection Close is
+	// about to tear down, and without the wait its "re-list failed" warning
+	// could land AFTER shutdown reported completion. Registration happens
+	// under relistMu gated by relistClosed — a bare Add racing Wait from a
+	// zero counter is documented WaitGroup misuse (a debounce timer that
+	// fired just before Close stopped it could otherwise Add after Wait
+	// started); the flag makes "no new registrations" and "start waiting"
+	// a single ordered handoff.
+	relistWG sync.WaitGroup
 
 	// supMu guards supCancel, one context.CancelFunc per supervised stdio
 	// upstream (Stage 7d). Each supervisor runs under its own context derived
@@ -228,6 +240,14 @@ type Registry struct {
 // changed from an upstream before re-listing it. Short enough to feel live,
 // long enough to collapse a rapid burst into a single re-list (Stage 7b).
 const relistDebounce = 200 * time.Millisecond
+
+// relistCloseWait bounds how long Close waits for in-flight re-lists to
+// finish (same bounded-wait pattern as closeGracePeriod in upstream/stdio.go).
+// By the time Close waits, procCtx is already cancelled, so a running
+// relistUpstream's ListTools (its ctx derives from procCtx) aborts almost
+// immediately — this timeout only guards against a pathologically stuck one,
+// which must not hang gateway shutdown forever.
+const relistCloseWait = 5 * time.Second
 
 // relistState serializes re-lists for one upstream (guarded by relistMu):
 // running is true while a runRelist call is executing the ListTools/install
@@ -708,6 +728,15 @@ func (r *Registry) onUpstreamNotification(name, method string) {
 // relistMu; only the flag flips are under the lock.
 func (r *Registry) runRelist(name string) {
 	r.relistMu.Lock()
+	if r.relistClosed {
+		// Close is already waiting on relistWG (or done waiting) — registering
+		// now would be Add-vs-Wait misuse, and the re-list would be pointless
+		// anyway (procCtx is cancelled first thing in Close).
+		r.relistMu.Unlock()
+		return
+	}
+	r.relistWG.Add(1)
+	defer r.relistWG.Done()
 	st, ok := r.relistStates[name]
 	if !ok {
 		st = &relistState{}
@@ -891,6 +920,16 @@ func (r *Registry) dropUpstream(name string) {
 	defer r.mu.Unlock()
 	r.dropLocked(name)
 }
+
+// Gated catalog mutations. dropUpstreamIfCurrent, replaceUpstreamIfLive and
+// replaceUpstreamIfCurrent below share a shape — take r.mu, check a gate,
+// mutate — but are deliberately NOT collapsed into one closure-parameterized
+// CAS helper: the gates differ in KIND (connection identity for the two
+// *IfCurrent functions vs supervisor-context liveness for *IfLive, which has
+// no old connection to compare) and the mutations differ (drop vs install),
+// so a generic helper would need both passed as closures, hiding exactly the
+// thing each call site must be explicit about — which race its gate closes.
+// The genuinely shared parts are already factored (dropLocked/installLocked).
 
 // dropUpstreamIfCurrent is dropUpstream with an identity gate, the removal
 // counterpart of replaceUpstreamIfCurrent: it removes name's catalog entry
@@ -1322,6 +1361,14 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 	// NOT retried: the upstream may have executed the (potentially
 	// non-idempotent) tool already, and double execution is worse than an
 	// honest error.
+	//
+	// The retry deliberately reuses the caller's ctx rather than granting
+	// itself fresh time — the client's deadline must bound the WHOLE call,
+	// retries included, or it stops meaning anything. In practice the retry
+	// still gets essentially the full budget: ErrConnClosedBeforeSend comes
+	// only from the pre-write closed-connection check (no I/O, ~zero time
+	// spent), and each attempt gets its own EffectiveCallTimeout inside
+	// callUpstream, capped by ctx.
 	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
 		r.mu.RLock()
 		rt2, ok2 := r.toolRoute[namespaced]
@@ -1499,19 +1546,37 @@ func (r *Registry) Close() error {
 	r.supMu.Unlock()
 
 	// Stop any pending re-list debounce timers so none fires after shutdown.
-	// A timer that already fired is harmless (relistUpstream bails on procCtx
-	// cancellation, and runRelist's dirty re-run checks procCtx too), this just
-	// avoids a needless late wakeup. The relist states are reset for the same
-	// tidiness: a still-running runRelist holds its own *relistState pointer,
-	// so its final flag flips land on the abandoned struct — harmless, never
-	// blocking.
+	// A timer that already fired is harmless (relistClosed below turns a late
+	// runRelist into a no-op, and relistUpstream bails on procCtx cancellation
+	// anyway), this just avoids a needless late wakeup. The relist states are
+	// reset for the same tidiness: a still-running runRelist holds its own
+	// *relistState pointer, so its final flag flips land on the abandoned
+	// struct — harmless, never blocking.
 	r.relistMu.Lock()
+	r.relistClosed = true
 	for _, t := range r.relistTimers {
 		t.Stop()
 	}
 	r.relistTimers = map[string]*time.Timer{}
 	r.relistStates = map[string]*relistState{}
 	r.relistMu.Unlock()
+
+	// Wait (bounded) for in-flight re-lists: a runRelist may still be inside a
+	// blocking ListTools against a connection we are about to Close below, and
+	// its "re-list failed" warning must not land after shutdown reports
+	// completion. procCancel above already aborted those RPCs (their ctx
+	// derives from procCtx), so this normally returns instantly; the timeout
+	// only keeps a pathologically stuck re-list from hanging shutdown.
+	relistDone := make(chan struct{})
+	go func() {
+		r.relistWG.Wait()
+		close(relistDone)
+	}()
+	select {
+	case <-relistDone:
+	case <-time.After(relistCloseWait):
+		r.log.Warn("in-flight re-list did not finish within grace period, proceeding with shutdown")
+	}
 
 	r.mu.Lock()
 	conns := r.conns

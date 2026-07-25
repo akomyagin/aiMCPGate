@@ -244,6 +244,16 @@ func redactedEndpoint(endpoint string) string {
 
 // idsEqual reports whether two raw JSON-RPC ids are the same, tolerating
 // surrounding whitespace. Shared by the JSON and SSE response paths of call.
+//
+// The comparison is deliberately strict — exact bytes, no type coercion. Per
+// JSON-RPC 2.0 the id is not opaque: the request id "MUST contain a String,
+// Number, or NULL value" and the server "MUST reply with the same value in
+// the Response object" — so an upstream echoing our numeric id as a string
+// ("7" for 7) violates the protocol and is rightly rejected here. We always
+// mint ids via mcp.IntID, whose canonical integer bytes a conforming echo
+// reproduces exactly. Before this check existed, ANY decodable JSON object
+// passed as a success (even one without result/error) — such non-conforming
+// upstreams were never actually supported, only unnoticed.
 func idsEqual(a, b json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
 }
