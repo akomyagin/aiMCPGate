@@ -116,9 +116,9 @@ func (u Upstream) SameLaunch(other Upstream) bool {
 	if u.ResolveKind() != other.ResolveKind() ||
 		u.Command != other.Command ||
 		u.URL != other.URL ||
-		!equalStringSlice(u.Args, other.Args) ||
-		!equalStringMap(u.Env, other.Env) ||
-		!equalStringMap(u.Headers, other.Headers) {
+		!slices.Equal(u.Args, other.Args) ||
+		!maps.Equal(u.Env, other.Env) ||
+		!maps.Equal(u.Headers, other.Headers) {
 		return false
 	}
 	return true
@@ -131,33 +131,30 @@ func (u Upstream) SameLaunch(other Upstream) bool {
 // to re-apply a changed filter to the stored raw tool list without relaunching
 // (or even re-listing) an otherwise-identical upstream.
 func (u Upstream) SameFilter(other Upstream) bool {
-	return equalStringSlice(u.Tools.Allow, other.Tools.Allow) &&
-		equalStringSlice(u.Tools.Deny, other.Tools.Deny) &&
-		equalStringMap(u.Tools.Rename, other.Tools.Rename)
+	return slices.Equal(u.Tools.Allow, other.Tools.Allow) &&
+		slices.Equal(u.Tools.Deny, other.Tools.Deny) &&
+		maps.Equal(u.Tools.Rename, other.Tools.Rename)
 }
 
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// AllowSet returns Allow as a lookup set. Both consumers of the filter
+// semantics (the registry's catalog projection and validateToolFilter here)
+// build their sets through this method, so "what counts as allowed" is encoded
+// in one place.
+func (f ToolFilter) AllowSet() map[string]bool {
+	allow := make(map[string]bool, len(f.Allow))
+	for _, a := range f.Allow {
+		allow[a] = true
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return allow
 }
 
-func equalStringMap(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
+// DenySet returns Deny as a lookup set — AllowSet's counterpart.
+func (f ToolFilter) DenySet() map[string]bool {
+	deny := make(map[string]bool, len(f.Deny))
+	for _, d := range f.Deny {
+		deny[d] = true
 	}
-	for k, v := range a {
-		if bv, ok := b[k]; !ok || bv != v {
-			return false
-		}
-	}
-	return true
+	return deny
 }
 
 // ResolveKind returns the effective kind: the explicit Kind if set, otherwise
@@ -536,14 +533,8 @@ func isLoopbackAddr(addr string) bool {
 // via reload must not surface a brand-new collision).
 func validateToolFilter(u Upstream, clientNames map[string]string) error {
 	f := u.Tools
-	allow := make(map[string]bool, len(f.Allow))
-	for _, a := range f.Allow {
-		allow[a] = true
-	}
-	deny := make(map[string]bool, len(f.Deny))
-	for _, d := range f.Deny {
-		deny[d] = true
-	}
+	allow := f.AllowSet()
+	deny := f.DenySet()
 
 	claim := func(clientName, owner string) error {
 		if prev, dup := clientNames[clientName]; dup {

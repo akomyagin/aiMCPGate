@@ -100,7 +100,6 @@ type upstreamStarter func(ctx context.Context, u config.Upstream) (Upstream, err
 // connection. *upstream.Conn satisfies it directly for both stdio and HTTP
 // transports — no type-assertions needed; tests provide fakes.
 type Upstream interface {
-	Name() string
 	Initialize(ctx context.Context) (*mcp.InitializeResult, error)
 	ListTools(ctx context.Context) ([]mcp.Tool, error)
 	ListResources(ctx context.Context) ([]mcp.Resource, error)
@@ -176,10 +175,17 @@ type Registry struct {
 	// re-list. Guarded by the same r.mu as conns/tools/toolRoute because the
 	// four are always mutated together (mergeLocked/dropLocked).
 	rawTools map[string][]mcp.Tool
+	// cachedTools is the sorted catalog slice Tools() hands out, rebuilt lazily
+	// on the first read after a mutation: the catalog changes only at discrete
+	// points (mergeLocked/dropLocked), while tools/list reads it on every client
+	// request — copying and sorting the whole map each time was pure waste.
+	// Guarded by r.mu like the maps it is derived from; cachedToolsValid is
+	// flipped to false by every catalog mutation.
+	cachedTools      []ToolDescriptor
+	cachedToolsValid bool
 
-	failMu   sync.Mutex
-	failures []string         // "<upstream>: <reason>" for upstreams that never came up; sorted when reported
-	report   []UpstreamStatus // per-upstream outcome of the FIRST bring-up pass, for StartReport (Stage 8); shares failMu with failures
+	failMu sync.Mutex
+	report []UpstreamStatus // per-upstream outcome of the FIRST bring-up pass, for StartReport (Stage 8) and failureSummary
 
 	// supervisors tracks the per-stdio-upstream auto-restart goroutines (Stage
 	// 7a) so Close can wait for them all to unwind before returning — otherwise a
@@ -420,13 +426,13 @@ func (r *Registry) Start(ctx context.Context) error {
 	if r.upstreamCount() == 0 {
 		return fmt.Errorf("no upstream MCP server is reachable:\n%s", r.failureSummary())
 	}
-	r.log.Info("registry ready", "upstreams", r.upstreamCount(), "tools", len(r.Tools()))
+	r.log.Info("registry ready", "upstreams", r.upstreamCount(), "tools", r.ToolCount())
 	r.phase = phaseRunning // Reload is admissible from here on (lifecycleMu held).
 	return nil
 }
 
 // launch starts one upstream and runs the full handshake sequence
-// (start → Initialize → ListTools, plus best-effort ListResources), returning
+// (start → Initialize → ListTools), returning
 // the live connection and its tool catalog. It is the single reusable "bring an
 // upstream to a usable state" primitive shared by the first start (Start),
 // the auto-restart supervisor (Stage 7a) and hot-reload (Stage 7d). On any
@@ -438,8 +444,6 @@ func (r *Registry) Start(ctx context.Context) error {
 // ctx bounds only the handshake RPCs so a slow upstream cannot block Start (or
 // a restart) indefinitely.
 func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []mcp.Tool, error) {
-	timeout := r.config().EffectiveCallTimeout()
-
 	conn, err := r.start(r.procCtx, u)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start: %w", err)
@@ -449,32 +453,38 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	// the callback rides into StartStdio itself, so it is set before the reader
 	// goroutine starts and a list_changed arriving immediately is not missed.
 
-	initCtx, cancel := context.WithTimeout(ctx, timeout)
-	info, err := conn.Initialize(initCtx)
-	cancel()
-	if err != nil {
+	var info *mcp.InitializeResult
+	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+		var err error
+		info, err = conn.Initialize(ctx)
+		return err
+	}); err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("handshake failed: %w", err)
 	}
 	r.log.Info("upstream initialized", "upstream", u.Name, "server", info.ServerInfo.Name)
 
-	toolsCtx, cancel := context.WithTimeout(ctx, timeout)
-	tools, err := conn.ListTools(toolsCtx)
-	cancel()
-	if err != nil {
+	var tools []mcp.Tool
+	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+		var err error
+		tools, err = conn.ListTools(ctx)
+		return err
+	}); err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("tools/list failed: %w", err)
 	}
 
-	// resources/list is best-effort: an upstream without resources must not be
-	// dropped over it.
-	resCtx, cancel := context.WithTimeout(ctx, timeout)
-	if _, err := conn.ListResources(resCtx); err != nil {
-		r.log.Debug("upstream resources/list failed (ignored)", "upstream", u.Name, "err", err)
-	}
-	cancel()
-
 	return conn, tools, nil
+}
+
+// withCallTimeout runs fn under a child context bounded by the CURRENT
+// config's call timeout — the one ritual every upstream RPC the registry makes
+// shares (handshake, list, forwarded call). The timeout is re-read from the
+// live config on every use, so a reload takes effect immediately.
+func (r *Registry) withCallTimeout(parent context.Context, fn func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, r.config().EffectiveCallTimeout())
+	defer cancel()
+	return fn(ctx)
 }
 
 // superviseUpstream starts (if enabled and applicable) the goroutine that
@@ -793,10 +803,12 @@ func (r *Registry) relistUpstream(name string) {
 		return // upstream was dropped (e.g. by a failed restart) — nothing to do
 	}
 
-	ctx, cancel := context.WithTimeout(r.procCtx, r.config().EffectiveCallTimeout())
-	tools, err := conn.ListTools(ctx)
-	cancel()
-	if err != nil {
+	var tools []mcp.Tool
+	if err := r.withCallTimeout(r.procCtx, func(ctx context.Context) error {
+		var err error
+		tools, err = conn.ListTools(ctx)
+		return err
+	}); err != nil {
 		r.log.Warn("re-list after upstream list_changed failed", "upstream", name, "err", err)
 		return
 	}
@@ -832,14 +844,8 @@ type toolEntry struct {
 // It is pure — no registry state, no side effects — so the projection can be
 // re-run at any time against the stored raw list (filter-only reload).
 func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter) []toolEntry {
-	allow := make(map[string]bool, len(f.Allow))
-	for _, a := range f.Allow {
-		allow[a] = true
-	}
-	deny := make(map[string]bool, len(f.Deny))
-	for _, d := range f.Deny {
-		deny[d] = true
-	}
+	allow := f.AllowSet()
+	deny := f.DenySet()
 
 	out := make([]toolEntry, 0, len(tools))
 	for _, t := range tools {
@@ -888,6 +894,7 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 // (post-filter, post-dedup) — the count the client really sees, which callers
 // report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
 func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int {
+	r.cachedToolsValid = false
 	r.conns[name] = conn
 	r.rawTools[name] = tools
 	n := 0
@@ -956,6 +963,7 @@ func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
 // dropLocked is dropUpstream's body, assuming r.mu is already held. It exists so
 // installLocked can drop-then-merge under a SINGLE lock acquisition (below).
 func (r *Registry) dropLocked(name string) {
+	r.cachedToolsValid = false
 	delete(r.conns, name)
 	delete(r.rawTools, name)
 	for ns, d := range r.tools {
@@ -1315,16 +1323,29 @@ func enabledByName(cfg *config.Config) map[string]config.Upstream {
 }
 
 // Tools returns the aggregated, namespaced tool catalog, sorted by name for
-// deterministic output.
+// deterministic output. The slice is a cache shared between calls (rebuilt
+// lazily after each catalog mutation) — callers must treat it as read-only.
 func (r *Registry) Tools() []ToolDescriptor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.cachedToolsValid {
+		out := make([]ToolDescriptor, 0, len(r.tools))
+		for _, d := range r.tools {
+			out = append(out, d)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		r.cachedTools = out
+		r.cachedToolsValid = true
+	}
+	return r.cachedTools
+}
+
+// ToolCount reports the catalog size without materializing it — for "ready"
+// log lines that only want the number.
+func (r *Registry) ToolCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]ToolDescriptor, 0, len(r.tools))
-	for _, d := range r.tools {
-		out = append(out, d)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return len(r.tools)
 }
 
 // CallTool routes a namespaced tool call to its owning upstream, rewriting the
@@ -1395,14 +1416,30 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 // CallTool makes is audited separately, the failed first try and the retried
 // second one alike; nothing is hidden from the call journal.
 func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
-	callCtx, cancel := context.WithTimeout(ctx, r.config().EffectiveCallTimeout())
-	defer cancel()
-
 	start := time.Now()
-	resp, err := conn.CallTool(callCtx, rt.original, arguments)
+	var resp *mcp.Message
+	err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+		var err error
+		resp, err = conn.CallTool(ctx, rt.original, arguments)
+		return err
+	})
 	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
 	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
 	return resp, err
+}
+
+// callOutcome derives the shared success/failure verdict of one forwarded call
+// for the audit and payload logs: a call is OK when the transport succeeded AND
+// the response carries no JSON-RPC error; errMsg is the transport error text or
+// the upstream's error message (never the arguments) — empty on success.
+func callOutcome(resp *mcp.Message, err error) (ok bool, errMsg string) {
+	switch {
+	case err != nil:
+		return false, err.Error()
+	case resp != nil && resp.Error != nil:
+		return false, resp.Error.Message
+	}
+	return true, ""
 }
 
 // audit writes one CallRecord. Arguments are never logged (may hold secrets).
@@ -1410,46 +1447,42 @@ func (r *Registry) audit(up, method, tool string, start time.Time, resp *mcp.Mes
 	if r.callLog == nil {
 		return
 	}
-	rec := logging.CallRecord{
+	ok, errMsg := callOutcome(resp, err)
+	r.callLog.Record(logging.CallRecord{
 		Time:     start,
 		Upstream: up,
 		Method:   method,
 		Tool:     tool,
 		Duration: time.Since(start),
-		OK:       err == nil && (resp == nil || resp.Error == nil),
-	}
-	switch {
-	case err != nil:
-		rec.Err = err.Error()
-	case resp != nil && resp.Error != nil:
-		rec.Err = resp.Error.Message // upstream error message; no arguments
-	}
-	r.callLog.Record(rec)
+		OK:       ok,
+		Err:      errMsg, // transport error or upstream error message; no arguments
+	})
 }
 
 // recordPayload writes one PayloadRecord to the OPT-IN payload debug log — the
 // full arguments and result of a call. This is deliberately kept separate from
 // audit (which stays metadata-only): only here, when the operator explicitly
-// enabled payload logging, do raw arguments (possible secrets) hit disk. When
-// payload logging is disabled r.payloadLog is a no-op, so this is a cheap call.
+// enabled payload logging, do raw arguments hit disk — and even then both
+// arguments and result pass through logging.MaskSecrets first, so top-level
+// secret-looking fields (tokens, keys, passwords) are replaced by "***"
+// (SKILL §6). When payload logging is disabled r.payloadLog is a no-op, so
+// this is a cheap call.
 func (r *Registry) recordPayload(up, tool string, arguments json.RawMessage, resp *mcp.Message, err error) {
+	ok, errMsg := callOutcome(resp, err)
 	rec := logging.PayloadRecord{
 		Time:      time.Now(),
 		Upstream:  up,
 		Tool:      tool,
 		Method:    mcp.MethodToolsCall,
-		OK:        err == nil && (resp == nil || resp.Error == nil),
-		Arguments: arguments,
+		OK:        ok,
+		Err:       errMsg,
+		Arguments: logging.MaskSecrets(arguments),
 	}
-	switch {
-	case err != nil:
-		rec.Err = err.Error()
-	case resp != nil && resp.Error != nil:
-		rec.Err = resp.Error.Message
-		rec.ErrorData = resp.Error.Data
-		rec.Result = resp.Result
-	case resp != nil:
-		rec.Result = resp.Result
+	if err == nil && resp != nil {
+		rec.Result = logging.MaskSecrets(resp.Result)
+		if resp.Error != nil {
+			rec.ErrorData = resp.Error.Data
+		}
 	}
 	r.payloadLog.Record(rec)
 }
@@ -1467,7 +1500,6 @@ func (r *Registry) upstreamCount() int {
 func (r *Registry) recordFailure(name, reason string) {
 	r.failMu.Lock()
 	defer r.failMu.Unlock()
-	r.failures = append(r.failures, name+": "+reason)
 	r.report = append(r.report, UpstreamStatus{Name: name, Err: reason})
 }
 
@@ -1499,7 +1531,12 @@ func (r *Registry) StartReport() []UpstreamStatus {
 // are disabled) — a distinct cause from every enabled one failing.
 func (r *Registry) failureSummary() string {
 	r.failMu.Lock()
-	reasons := append([]string(nil), r.failures...)
+	var reasons []string
+	for _, st := range r.report {
+		if !st.OK {
+			reasons = append(reasons, st.Name+": "+st.Err)
+		}
+	}
 	r.failMu.Unlock()
 
 	if len(reasons) == 0 {

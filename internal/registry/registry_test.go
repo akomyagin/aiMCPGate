@@ -49,7 +49,7 @@ func (f *fakeUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
 	}
 	out := make([]mcp.Tool, 0, len(f.tools))
 	for _, t := range f.tools {
-		out = append(out, mcp.Tool{Name: t, Description: "desc " + t, InputSchema: json.RawMessage(`{"type":"object"}`)})
+		out = append(out, mcp.Tool{Name: t, Description: json.RawMessage(`"desc ` + t + `"`), InputSchema: json.RawMessage(`{"type":"object"}`)})
 	}
 	return out, nil
 }
@@ -357,8 +357,10 @@ func TestRegistryCallLogHasNoSecrets(t *testing.T) {
 }
 
 // TestRegistryPayloadLogRecordsArgsAndResult is the Stage 10 end-to-end check:
-// when the opt-in payload log is enabled, CallTool writes the raw arguments AND
-// the upstream result to it (the deliberate difference from the audit log).
+// when the opt-in payload log is enabled, CallTool writes the arguments AND the
+// upstream result to it (the deliberate difference from the audit log) — with
+// secret-looking top-level fields masked to "***" (SKILL §6) while every other
+// field passes through verbatim.
 func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
 	var auditBuf, payloadBuf bytes.Buffer
@@ -373,13 +375,13 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	}
 	defer r.Close()
 
-	const secret = "SUPER_SECRET_TOKEN_abc123"
-	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
+	const secret = "secret123"
+	args := json.RawMessage(`{"api_key":"` + secret + `","query":"hello"}`)
 	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
-	// The payload log DOES carry the raw arguments and a result (opt-in debug).
+	// The payload log carries the arguments and a result (opt-in debug)...
 	var rec logging.PayloadRecord
 	if err := json.Unmarshal([]byte(strings.TrimSpace(payloadBuf.String())), &rec); err != nil {
 		t.Fatalf("decode payload record: %v (line=%q)", err, payloadBuf.String())
@@ -387,11 +389,23 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	if rec.Tool != "web__fetch" || rec.Upstream != "web" || rec.Method != mcp.MethodToolsCall {
 		t.Errorf("payload metadata mismatch: %+v", rec)
 	}
-	if string(rec.Arguments) != string(args) {
-		t.Errorf("payload arguments = %s, want raw %s", rec.Arguments, args)
-	}
 	if len(rec.Result) == 0 {
 		t.Errorf("payload result missing, want the upstream result")
+	}
+
+	// ...but the secret-looking argument is masked, the innocent one kept.
+	var gotArgs map[string]string
+	if err := json.Unmarshal(rec.Arguments, &gotArgs); err != nil {
+		t.Fatalf("decode payload arguments %s: %v", rec.Arguments, err)
+	}
+	if gotArgs["api_key"] != "***" {
+		t.Errorf("api_key = %q in payload log, want masked \"***\"", gotArgs["api_key"])
+	}
+	if gotArgs["query"] != "hello" {
+		t.Errorf("query = %q in payload log, want \"hello\" untouched", gotArgs["query"])
+	}
+	if strings.Contains(payloadBuf.String(), secret) {
+		t.Fatalf("payload log leaked secret:\n%s", payloadBuf.String())
 	}
 
 	// Regression guard (SKILL §6): the AUDIT log still contains no arguments —
@@ -536,7 +550,7 @@ func (l *latchInitUpstream) Initialize(ctx context.Context) (*mcp.InitializeResu
 	return l.fakeUpstream.Initialize(ctx)
 }
 
-// signalListedUpstream closes listed once its FIRST ListResources returns —
+// signalListedUpstream closes listed once its FIRST ListTools returns —
 // the last handshake step of launch(), i.e. "this upstream's launch is done".
 type signalListedUpstream struct {
 	*fakeUpstream
@@ -544,9 +558,9 @@ type signalListedUpstream struct {
 	listed chan struct{}
 }
 
-func (s *signalListedUpstream) ListResources(ctx context.Context) ([]mcp.Resource, error) {
+func (s *signalListedUpstream) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 	defer s.once.Do(func() { close(s.listed) })
-	return s.fakeUpstream.ListResources(ctx)
+	return s.fakeUpstream.ListTools(ctx)
 }
 
 // TestStartParallelMergeOrderDeterministic pins the launch/merge split inside
@@ -766,7 +780,7 @@ func (g *versionedListUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
 	default:
 		name = "c" // v3: the dirty-driven second re-list — the freshest truth
 	}
-	return []mcp.Tool{{Name: name, Description: "desc " + name, InputSchema: json.RawMessage(`{"type":"object"}`)}}, nil
+	return []mcp.Tool{{Name: name, Description: json.RawMessage(`"desc ` + name + `"`), InputSchema: json.RawMessage(`{"type":"object"}`)}}, nil
 }
 
 func (g *versionedListUpstream) callCount() int {
