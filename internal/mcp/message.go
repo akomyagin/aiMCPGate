@@ -109,8 +109,16 @@ func NewResult(id json.RawMessage, result json.RawMessage) *Message {
 	return &Message{JSONRPC: Version, ID: id, Result: result}
 }
 
-// NewError builds an error response echoing id.
+// NewError builds an error response echoing id. Per JSON-RPC 2.0 an error
+// response MUST carry an id; when the original id is unknown (nil/absent —
+// e.g. the request was malformed and never parsed) it MUST be the literal
+// null, so an empty id is normalized to json "null" here. A non-empty
+// RawMessage("null") survives the struct's omitempty and marshals as
+// "id":null instead of dropping the field.
 func NewError(id json.RawMessage, code int, message string, data json.RawMessage) *Message {
+	if len(bytes.TrimSpace(id)) == 0 {
+		id = json.RawMessage("null")
+	}
 	return &Message{JSONRPC: Version, ID: id, Error: &Error{Code: code, Message: message, Data: data}}
 }
 

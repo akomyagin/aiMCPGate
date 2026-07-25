@@ -192,12 +192,25 @@ func TestHTTPServerParseErrorReturns400(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	msg := decodeBody(t, resp)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed body HTTP status = %d, want 400", resp.StatusCode)
 	}
+	var msg mcp.Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
 	if msg.Error == nil || msg.Error.Code != mcp.CodeParseError {
 		t.Fatalf("want parse error, got %+v", msg.Error)
+	}
+	// JSON-RPC 2.0: when the request id could not be determined the error
+	// response MUST carry the literal "id":null — not omit the field.
+	if !strings.Contains(string(body), `"id":null`) {
+		t.Fatalf("parse-error response must contain %q, got: %s", `"id":null`, body)
 	}
 }
 
@@ -215,11 +228,11 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 	cases := []struct {
 		name   string
 		raw    string
-		wantID string // raw id echoed in the error response ("" = omitted)
+		wantID string // raw id echoed in the error response (null when it had none)
 	}{
 		{"int id", `{"jsonrpc":"2.0","id":1,"method":"tools/list","result":{}}`, "1"},
 		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list","result":{}}`, "null"},
-		{"absent id", `{"jsonrpc":"2.0","method":"tools/list","result":{}}`, ""},
+		{"absent id", `{"jsonrpc":"2.0","method":"tools/list","result":{}}`, "null"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,7 +250,7 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 				t.Fatalf("want invalid-request error (-32600), got %+v", msg.Error)
 			}
 			if string(msg.ID) != tc.wantID {
-				t.Fatalf("error response id = %q, want %q (echo the hybrid's own id, null/omitted when it had none)", msg.ID, tc.wantID)
+				t.Fatalf("error response id = %q, want %q (echo the hybrid's own id, null when it had none)", msg.ID, tc.wantID)
 			}
 		})
 	}
