@@ -88,7 +88,7 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 // custom config or a call log.
 func startServerWithConfig(t *testing.T, cfg *config.Config, callLog logging.CallLog) (*fakeClient, context.CancelFunc, <-chan error) {
 	t.Helper()
-	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test")
 
 	clientToSrv, srvIn := io.Pipe() // client writes to srvIn side... (see below)
 	srvOut, clientFromSrv := io.Pipe()
@@ -537,7 +537,7 @@ func oneUpstreamConfig(t *testing.T) *config.Config {
 // Serve instead of busy-looping at 100% CPU on the same error forever.
 func TestStdioFatalReadEndsServe(t *testing.T) {
 	cfg := oneUpstreamConfig(t)
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	in := &failingReader{err: errors.New("boom: client stream broken")}
 	srv := newStdioServer(cfg, reg, quietLogger(), "test", in, io.Discard)
 
@@ -562,7 +562,7 @@ func TestStdioFatalReadEndsServe(t *testing.T) {
 // dispatch loop past shutdown.
 func TestStdioBlockedWriteUnblocksOnCancel(t *testing.T) {
 	cfg := oneUpstreamConfig(t)
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 
 	clientToSrv, srvIn := io.Pipe() // client → server requests
 	// server → client: NOBODY ever reads outR, so the server's reply write

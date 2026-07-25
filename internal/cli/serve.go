@@ -66,7 +66,7 @@ func runServe(parent context.Context, configPath, version string) error {
 		logger.Warn("payload logging ENABLED: request/response bodies (incl. possible secrets) are written to disk; disable in production", "path", cfg.DebugPayloadLog)
 	}
 
-	reg := registry.New(cfg, logger, callLog, payloadLog, true)
+	reg := registry.New(cfg, logger, callLog, payloadLog, true, version)
 	srv := transport.NewServer(cfg, reg, logger, version)
 
 	// Live config reload on SIGHUP (Stage 7d): reload runs in its own goroutine

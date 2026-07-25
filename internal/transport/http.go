@@ -123,7 +123,7 @@ func (s *httpServer) Serve(ctx context.Context) error {
 		return err
 	}
 
-	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", len(s.reg.Tools()))
+	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", s.reg.ToolCount())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()

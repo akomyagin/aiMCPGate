@@ -76,7 +76,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestSupervisorReapsCrashedProcess(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestSupervisorGivesUpAndDrops(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestSupervisorDisabled(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
 		},
 		Upstreams: []config.Upstream{{Name: "up", Enabled: true}},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		startMu.Lock()
 		starts++
@@ -461,7 +461,7 @@ func TestUpstreamListChangedRefreshesCatalog(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -503,7 +503,7 @@ func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

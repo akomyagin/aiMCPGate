@@ -129,6 +129,12 @@ type Registry struct {
 	payloadLog logging.PayloadLog
 	start      upstreamStarter
 
+	// version is the gateway's build version (from -ldflags in main), passed
+	// down to every upstream connection so the initialize handshake reports
+	// the real binary version as clientInfo.version instead of a hardcoded
+	// literal. Set once in New, read-only afterwards.
+	version string
+
 	// autoRestart gates the per-upstream auto-restart supervisor goroutines
 	// (Stage 7a); it is New's supervise parameter. serve runs with true;
 	// `mcp-gate doctor` (Stage 8) runs with false so its single diagnostic pass
@@ -271,14 +277,16 @@ type relistState struct {
 // logging.NewPayloadLog("") for the no-op when payload logging is not wanted
 // (doctor, tests) — it must not be nil. supervise=false disables the
 // auto-restart supervisors entirely (see the field comment) — used by
-// `mcp-gate doctor`, which wants exactly one pass.
-func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool) *Registry {
+// `mcp-gate doctor`, which wants exactly one pass. version is the gateway's
+// build version, reported to upstreams as clientInfo.version in the handshake.
+func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool, version string) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
 		log:          logger,
 		callLog:      callLog,
 		payloadLog:   payloadLog,
 		autoRestart:  supervise,
+		version:      version,
 		conns:        map[string]Upstream{},
 		tools:        map[string]ToolDescriptor{},
 		toolRoute:    map[string]route{},
@@ -331,7 +339,7 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	}
 	name := u.Name
 	onNotify := func(method string) { r.onUpstreamNotification(name, method) }
-	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, onNotify)
+	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify)
 }
 
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
@@ -340,7 +348,7 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 // the Initialize step in launch, exactly like a stdio upstream that fails its
 // handshake.
 func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
-	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil), nil
+	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version), nil
 }
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,

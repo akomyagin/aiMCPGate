@@ -68,7 +68,7 @@ func startHTTPGatewayMulti(t *testing.T, n int) (*httptest.Server, func()) {
 		}})
 	}
 	cfg := &config.Config{Transport: config.TransportHTTP, Upstreams: ups}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}

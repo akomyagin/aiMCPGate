@@ -52,7 +52,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	}
 	defer func() { _ = s.reg.Close() }()
 
-	s.log.Info("stdio transport ready", "tools", len(s.reg.Tools()))
+	s.log.Info("stdio transport ready", "tools", s.reg.ToolCount())
 
 	// Subscribe to runtime catalog changes (Stage 7c): whenever an upstream is
 	// auto-restarted, sends its own list_changed, or the config is reloaded, the

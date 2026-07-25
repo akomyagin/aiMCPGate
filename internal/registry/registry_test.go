@@ -96,7 +96,7 @@ func newTestRegistry(t *testing.T, cfg *config.Config, callLog logging.CallLog, 
 // for the Stage 10 opt-in payload tests.
 func newTestRegistryWithPayload(t *testing.T, cfg *config.Config, callLog logging.CallLog, payloadLog logging.PayloadLog, fakes map[string]*fakeUpstream) *Registry {
 	t.Helper()
-	r := New(cfg, quietLogger(), callLog, payloadLog, true)
+	r := New(cfg, quietLogger(), callLog, payloadLog, true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		f, ok := fakes[u.Name]
 		if !ok {
@@ -588,7 +588,7 @@ func TestStartParallelMergeOrderDeterministic(t *testing.T) {
 		{Name: "first", Enabled: true},
 		{Name: "second", Enabled: true, Tools: config.ToolFilter{Rename: map[string]string{"z": "first__t"}}},
 	}}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		switch u.Name {
 		case "first":
@@ -657,7 +657,7 @@ func TestCallToolRetriesOnceOnConnClosedBeforeSend(t *testing.T) {
 		repl:         live,
 		err:          upstream.ErrConnClosedBeforeSend,
 	}
-	r := New(cfg, quietLogger(), callLog, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test")
 	dead.reg = r
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
 	if err := r.Start(context.Background()); err != nil {
@@ -706,7 +706,7 @@ func TestCallToolNoRetryOnLateConnClosed(t *testing.T) {
 		repl:         live,
 		err:          upstream.ErrConnClosed,
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	dead.reg = r
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
 	if err := r.Start(context.Background()); err != nil {
@@ -733,7 +733,7 @@ func TestCallToolNoRetryOnSameConn(t *testing.T) {
 		repl:         nil, // no swap: the dead conn stays current
 		err:          upstream.ErrConnClosedBeforeSend,
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	dead.reg = r
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
 	if err := r.Start(context.Background()); err != nil {
@@ -807,7 +807,7 @@ func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{{Name: "dyn", Enabled: true}},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return up, nil }
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)

@@ -37,7 +37,7 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -270,7 +270,7 @@ func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, fun
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestHTTPServerOriginCheck(t *testing.T) {
 // a live per-request write deadline in handlePost.
 func TestHTTPServerTimeoutsConfigured(t *testing.T) {
 	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
-	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true), quietLogger(), "test")
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test"), quietLogger(), "test")
 	srv := hs.buildServer(http.NewServeMux())
 
 	if srv.ReadHeaderTimeout <= 0 {
@@ -440,7 +440,7 @@ func TestHTTPServerTimeoutsConfigured(t *testing.T) {
 // The per-request deadline handlePost sets from the live config replaces it.
 func TestBuildServerHasNoStaticWriteTimeout(t *testing.T) {
 	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
-	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true), quietLogger(), "test")
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test"), quietLogger(), "test")
 	srv := hs.buildServer(http.NewServeMux())
 
 	if srv.WriteTimeout != 0 {

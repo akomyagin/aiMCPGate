@@ -32,7 +32,7 @@ func TestReloadBeforeStartRejected(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{{Name: "never", Command: "true", Enabled: true}},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	defer r.Close()
 
 	err := r.Reload(context.Background(), cfg)
@@ -52,7 +52,7 @@ func TestCloseThenReloadRejected(t *testing.T) {
 			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "a"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestConcurrentReloadAndClose(t *testing.T) {
 		},
 		Upstreams: []config.Upstream{up("one", "a")},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
