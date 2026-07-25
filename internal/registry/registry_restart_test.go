@@ -2,10 +2,12 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -325,6 +327,112 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close did not return; supervisor likely not stopped")
+	}
+}
+
+// crashableUpstream is a fakeUpstream with a controllable "process died"
+// channel, so white-box tests can trigger the auto-restart supervisor without
+// spawning real child processes: closing done simulates the crash.
+type crashableUpstream struct {
+	*fakeUpstream
+	done chan struct{}
+}
+
+func (c *crashableUpstream) Done() (<-chan struct{}, bool) { return c.done, true }
+
+// TestRestartGiveUpDoesNotDropReplacedConn pins finding #11: when the
+// supervisor gives up on a crashed upstream (attempts exhausted), it must drop
+// the catalog entry ONLY if that entry still belongs to the dead connection.
+// Here a FRESH connection B is installed under the same name (as a concurrent
+// reload/relaunch would) before the give-up lands — the give-up must leave B
+// and its tools untouched, and must NOT signal a catalog change (nothing
+// changed via this path). Fully deterministic: the crash is a closed channel,
+// the relaunch failures are starter errors, the last allowed attempt signals a
+// latch. Run under -race.
+func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
+	crashA := &crashableUpstream{
+		fakeUpstream: &fakeUpstream{name: "up", tools: []string{"a"}},
+		done:         make(chan struct{}),
+	}
+	lastAttempt := make(chan struct{})
+	var startMu sync.Mutex
+	starts := 0
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     5 * time.Millisecond,
+			MaxAttempts:    1, // one failing relaunch, then give-up
+		},
+		Upstreams: []config.Upstream{{Name: "up", Enabled: true}},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
+		startMu.Lock()
+		starts++
+		n := starts
+		startMu.Unlock()
+		if n == 1 {
+			return crashA, nil // Start's launch: the connection that will crash
+		}
+		if n == 2 {
+			defer close(lastAttempt) // the single allowed relaunch attempt — it fails
+		}
+		return nil, errors.New("relaunch always fails")
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	if !hasTool(r, "up__a") {
+		t.Fatal("precondition: up__a not in catalog after Start")
+	}
+
+	// Install a fresh connection B under the same name BEFORE the crash — the
+	// state a concurrent reload ("unchanged, leave it") plus another installer
+	// can produce by the time the give-up runs. White-box, like the other
+	// reload/restart races in this package.
+	connB := &fakeUpstream{name: "up", tools: []string{"b"}}
+	toolsB, err := connB.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("connB.ListTools: %v", err)
+	}
+	r.mu.Lock()
+	r.installLocked("up", connB, toolsB, "test: fresh conn installed")
+	r.mu.Unlock()
+	if !hasTool(r, "up__b") {
+		t.Fatal("precondition: up__b not in catalog after installing the fresh conn")
+	}
+
+	sub, unsub := r.Subscribe()
+	defer unsub()
+
+	// Crash A: the supervisor reaps it, its single relaunch attempt fails, and
+	// the give-up branch runs — against a catalog that now holds B.
+	close(crashA.done)
+	select {
+	case <-lastAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor never attempted the relaunch")
+	}
+	// The give-up check runs immediately after the failed attempt (no backoff
+	// before the attempt-budget check); give it a generous moment to land.
+	time.Sleep(200 * time.Millisecond)
+
+	if !hasTool(r, "up__b") {
+		t.Fatal("give-up dropped the REPLACED connection's catalog entry — the identity gate (dropUpstreamIfCurrent) failed")
+	}
+	r.mu.RLock()
+	cur := r.conns["up"]
+	r.mu.RUnlock()
+	if cur != Upstream(connB) {
+		t.Fatalf("live connection for %q is %v, want the fresh conn B", "up", cur)
+	}
+	// And no catalog-change signal: this give-up path changed nothing.
+	select {
+	case <-sub:
+		t.Fatal("give-up signalled a catalog change even though it left the catalog untouched")
+	default:
 	}
 }
 

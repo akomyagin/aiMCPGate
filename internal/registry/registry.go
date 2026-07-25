@@ -134,7 +134,7 @@ type Registry struct {
 	// (Stage 7a); it is New's supervise parameter. serve runs with true;
 	// `mcp-gate doctor` (Stage 8) runs with false so its single diagnostic pass
 	// reports a flapping upstream instead of endlessly resurrecting it. This is
-	// the ONLY behavioural difference — Start/bringUp/catalog work identically
+	// the ONLY behavioural difference — Start/launch/catalog work identically
 	// either way. (Named autoRestart, not supervise, because the supervisor loop
 	// method already carries that name.)
 	autoRestart bool
@@ -159,8 +159,8 @@ type Registry struct {
 	// pattern. With all three under one mutex, none of those windows exist.
 	//
 	// Lock ordering: lifecycleMu is the OUTERMOST lock — it is taken first and
-	// only by Start/Reload/Close; everything they call underneath (bringUp,
-	// launch, merge, superviseUpstream, dropUpstream, ...) takes only the inner
+	// only by Start/Reload/Close; everything they call underneath (launch,
+	// merge, superviseUpstream, dropUpstream, ...) takes only the inner
 	// locks (mu, failMu, supMu, ...) and never lifecycleMu, so no cycle exists.
 	lifecycleMu sync.Mutex
 	phase       phase
@@ -178,7 +178,7 @@ type Registry struct {
 	rawTools map[string][]mcp.Tool
 
 	failMu   sync.Mutex
-	failures []string         // "<upstream>: <reason>" for upstreams that never came up; unordered (parallel bringUp), sorted when reported
+	failures []string         // "<upstream>: <reason>" for upstreams that never came up; sorted when reported
 	report   []UpstreamStatus // per-upstream outcome of the FIRST bring-up pass, for StartReport (Stage 8); shares failMu with failures
 
 	// supervisors tracks the per-stdio-upstream auto-restart goroutines (Stage
@@ -199,11 +199,19 @@ type Registry struct {
 	nextSubID   int
 
 	// relistMu guards relistTimers, the per-upstream debounce timers for
-	// tools/list_changed notifications (Stage 7b). A "noisy" upstream firing a
-	// burst of list_changed must not trigger a re-list storm, so each
-	// notification (re)arms a short timer and only its expiry runs the re-list.
+	// tools/list_changed notifications (Stage 7b), and relistStates, the
+	// per-upstream running/dirty flags that serialize the re-lists themselves.
+	// A "noisy" upstream firing a burst of list_changed must not trigger a
+	// re-list storm, so each notification (re)arms a short timer and only its
+	// expiry runs the re-list — and because Reset on an already-fired AfterFunc
+	// is fundamentally racy (the callback may be mid-flight), two timer expiries
+	// CAN overlap for one upstream; runRelist collapses them into "one running
+	// re-list plus at most one queued re-run" so a stale ListTools result can
+	// never overwrite a fresher one (the final re-list always starts after all
+	// earlier ones finished).
 	relistMu     sync.Mutex
 	relistTimers map[string]*time.Timer
+	relistStates map[string]*relistState
 
 	// supMu guards supCancel, one context.CancelFunc per supervised stdio
 	// upstream (Stage 7d). Each supervisor runs under its own context derived
@@ -220,6 +228,16 @@ type Registry struct {
 // changed from an upstream before re-listing it. Short enough to feel live,
 // long enough to collapse a rapid burst into a single re-list (Stage 7b).
 const relistDebounce = 200 * time.Millisecond
+
+// relistState serializes re-lists for one upstream (guarded by relistMu):
+// running is true while a runRelist call is executing the ListTools/install
+// cycle for this upstream; dirty queues exactly one re-run for expiries that
+// arrived meanwhile. See the relistMu field comment for why overlapping timer
+// expiries are possible at all.
+type relistState struct {
+	running bool
+	dirty   bool
+}
 
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
@@ -241,6 +259,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		rawTools:     map[string][]mcp.Tool{},
 		subscribers:  map[int]chan struct{}{},
 		relistTimers: map[string]*time.Timer{},
+		relistStates: map[string]*relistState{},
 		supCancel:    map[string]context.CancelFunc{},
 		procCtx:      procCtx,
 		procCancel:   procCancel,
@@ -286,7 +305,7 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
 // startStdio it does no network I/O here — the handshake runs in Initialize, so
 // StartHTTP never fails and a genuinely unreachable HTTP upstream is isolated at
-// the Initialize step in bringUp, exactly like a stdio upstream that fails its
+// the Initialize step in launch, exactly like a stdio upstream that fails its
 // handshake.
 func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil), nil
@@ -306,22 +325,63 @@ func (r *Registry) Start(ctx context.Context) error {
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 
-	g, gctx := errgroup.WithContext(ctx)
+	// Enabled upstreams in CONFIG order: the sequential apply pass below walks
+	// this slice, so the keep-first winner of a runtime client-facing-name
+	// collision is always the upstream listed first in the config.
+	var enabled []config.Upstream
 	for _, u := range r.config().Upstreams {
-		if !u.Enabled {
-			continue
+		if u.Enabled {
+			enabled = append(enabled, u)
 		}
-		u := u
+	}
+
+	// Launches fan out in parallel (one slow handshake must not serialize the
+	// whole bring-up), but each goroutine ONLY launches and writes its outcome
+	// into its own pre-allocated slot — the catalog MERGE runs sequentially
+	// after g.Wait(), in config order. Merging from inside the goroutines made
+	// the keep-first winner of a client-facing-name collision depend on
+	// goroutine completion order, nondeterministic across runs of an identical
+	// config (the same fix Reload's changed/added pass received earlier).
+	type launchOutcome struct {
+		conn  Upstream
+		tools []mcp.Tool
+		err   error
+	}
+	results := make([]launchOutcome, len(enabled))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, u := range enabled {
+		i, u := i, u
 		g.Go(func() error {
-			r.bringUp(gctx, u)
+			conn, tools, err := r.launch(gctx, u)
+			results[i] = launchOutcome{conn: conn, tools: tools, err: err}
 			return nil // errors are isolated per-upstream, never propagated
 		})
 	}
-	// Wait never returns an error because bringUp swallows them; keep the check
-	// for correctness if that ever changes.
+	// Wait never returns an error because the goroutines swallow them into
+	// results; keep the check for correctness if that ever changes.
 	if err := g.Wait(); err != nil {
 		return err
 	}
+
+	// Sequential apply in config order (see above). Failures are isolated:
+	// logged, recorded for the failure summary / doctor report (Stage 8), the
+	// upstream skipped. Successes merge the catalog and start the auto-restart
+	// supervisor (Stage 7a) for stdio upstreams. This runs BEFORE the ctx.Err()
+	// check so every successfully launched connection lands in r.conns and a
+	// subsequent Close can tear it down — same as when merges ran inside the
+	// goroutines.
+	for i, u := range enabled {
+		res := results[i]
+		if res.err != nil {
+			r.log.Warn("upstream failed to come up", "upstream", u.Name, "err", res.err)
+			r.recordFailure(u.Name, res.err.Error())
+			continue
+		}
+		n := r.merge(u.Name, res.conn, res.tools)
+		r.recordSuccess(u.Name, n)
+		r.superviseUpstream(u, res.conn)
+	}
+
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -339,35 +399,10 @@ func (r *Registry) Start(ctx context.Context) error {
 	return nil
 }
 
-// bringUp starts one upstream, handshakes, and merges its catalog. All failures
-// are isolated: logged, recorded for the Start-time failure summary, and the
-// upstream skipped/torn down. On success it merges the catalog and starts the
-// auto-restart supervisor (Stage 7a) for a stdio upstream.
-//
-// The start-time diagnostics (recordFailure) live here, not in launch, because
-// they feed Start's "every upstream failed" summary and (Stage 8) the doctor
-// report — a mid-run restart via launch has no such summary to feed.
-//
-// ctx bounds only the handshake steps inside launch (Initialize/ListTools/
-// ListResources) — the child process itself is launched under r.procCtx, a
-// long-lived context independent of Start's errgroup context. See the comment
-// on Registry.procCtx for why this distinction is load-bearing.
-func (r *Registry) bringUp(ctx context.Context, u config.Upstream) {
-	conn, tools, err := r.launch(ctx, u)
-	if err != nil {
-		r.log.Warn("upstream failed to come up", "upstream", u.Name, "err", err)
-		r.recordFailure(u.Name, err.Error())
-		return
-	}
-	n := r.merge(u.Name, conn, tools)
-	r.recordSuccess(u.Name, n)
-	r.superviseUpstream(u, conn)
-}
-
 // launch starts one upstream and runs the full handshake sequence
 // (start → Initialize → ListTools, plus best-effort ListResources), returning
 // the live connection and its tool catalog. It is the single reusable "bring an
-// upstream to a usable state" primitive shared by the first start (bringUp),
+// upstream to a usable state" primitive shared by the first start (Start),
 // the auto-restart supervisor (Stage 7a) and hot-reload (Stage 7d). On any
 // failure it tears the connection back down and returns a single error whose
 // message names the failing phase — the caller decides whether to record it as
@@ -512,7 +547,7 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 				r.log.Debug("close crashed upstream", "upstream", u.Name, "err", err)
 			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
-			newConn, newDone, ok := r.restart(u, supCtx)
+			newConn, newDone, ok := r.restart(u, conn, supCtx)
 			if !ok {
 				return // restart gave up (attempts exhausted), retired, or shutting down.
 			}
@@ -542,26 +577,39 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 // upstream from the catalog: by this point its old connection is already
 // closed (supervise reaped the crash before calling restart), so leaving the
 // catalog entry would advertise tools whose every call fails with a transport
-// error instead of an honest "unknown tool" (security-audit finding). The
-// disabled→enabled transition for an upstream whose supervisor was never
-// started (Enabled=false at Start time) is out of scope — it would need a
+// error instead of an honest "unknown tool" (security-audit finding). The drop
+// is identity-gated on the dead connection (dropUpstreamIfCurrent): the catalog
+// entry under this name may by now be a FRESH connection installed by another
+// path (e.g. a reload that judged the upstream "unchanged" from its live
+// snapshot), and dropping by name alone would tear that innocent newcomer down
+// with it. The disabled→enabled transition for an upstream whose supervisor was
+// never started (Enabled=false at Start time) is out of scope — it would need a
 // separate mechanism to start a supervisor post-hoc.
-func (r *Registry) restart(u config.Upstream, supCtx context.Context) (Upstream, <-chan struct{}, bool) {
+//
+// dead is the connection whose crash brought us here — already Closed by
+// supervise, and the identity the give-up branches gate their drop on.
+func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Context) (Upstream, <-chan struct{}, bool) {
 	for attempt := 1; ; attempt++ {
 		policy := r.config().EffectiveRestart()
 		if policy.Enabled == nil || !*policy.Enabled {
 			// Symmetric with the exhausted-attempts branch below: the dead
-			// connection is already closed, so the catalog entry must go too.
-			r.log.Info("stdio upstream restart disabled by reload, dropped from catalog", "upstream", u.Name)
-			r.dropUpstream(u.Name)
-			r.notifyCatalogChanged()
+			// connection is already closed, so its catalog entry must go too.
+			if r.dropUpstreamIfCurrent(u.Name, dead) {
+				r.log.Info("stdio upstream restart disabled by reload, dropped from catalog", "upstream", u.Name)
+				r.notifyCatalogChanged()
+			} else {
+				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
+			}
 			return nil, nil, false
 		}
 		if policy.MaxAttempts != 0 && attempt > policy.MaxAttempts {
-			r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
-				"upstream", u.Name, "max_attempts", policy.MaxAttempts)
-			r.dropUpstream(u.Name)
-			r.notifyCatalogChanged()
+			if r.dropUpstreamIfCurrent(u.Name, dead) {
+				r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
+					"upstream", u.Name, "max_attempts", policy.MaxAttempts)
+				r.notifyCatalogChanged()
+			} else {
+				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
+			}
 			return nil, nil, false
 		}
 		// Backoff for this attempt, derived entirely from the CURRENT policy:
@@ -630,14 +678,57 @@ func (r *Registry) onUpstreamNotification(name, method string) {
 		t.Reset(relistDebounce)
 		return
 	}
-	// AfterFunc fires on its own goroutine, so relistUpstream (which does
-	// blocking RPCs) never runs on the reader goroutine.
+	// AfterFunc fires on its own goroutine, so runRelist (which does blocking
+	// RPCs) never runs on the reader goroutine.
 	r.relistTimers[name] = time.AfterFunc(relistDebounce, func() {
 		r.relistMu.Lock()
 		delete(r.relistTimers, name)
 		r.relistMu.Unlock()
-		r.relistUpstream(name)
+		r.runRelist(name)
 	})
+}
+
+// runRelist serializes relistUpstream per upstream. The t.Reset above cannot
+// prevent overlap: resetting an AfterFunc whose callback is ALREADY mid-flight
+// is inherently racy in Go, so a second expiry can start while a first re-list
+// still has its ListTools RPC pending — and although replaceUpstreamIfCurrent
+// gates the write on connection identity, it cannot tell a stale result from a
+// fresh one on the SAME connection. So instead of fixing the timer, the
+// overlap is made harmless here: if a re-list for this upstream is already
+// running, only mark it dirty and leave; the running call re-runs the re-list
+// once more after it finishes (checking shutdown first). The final ListTools
+// therefore always STARTS after every earlier one returned — its result is the
+// freshest and lands last. The RPC itself (relistUpstream) runs OUTSIDE
+// relistMu; only the flag flips are under the lock.
+func (r *Registry) runRelist(name string) {
+	r.relistMu.Lock()
+	st, ok := r.relistStates[name]
+	if !ok {
+		st = &relistState{}
+		r.relistStates[name] = st
+	}
+	if st.running {
+		st.dirty = true
+		r.relistMu.Unlock()
+		return
+	}
+	st.running = true
+	r.relistMu.Unlock()
+
+	for {
+		r.relistUpstream(name)
+
+		r.relistMu.Lock()
+		if st.dirty && r.procCtx.Err() == nil {
+			st.dirty = false
+			r.relistMu.Unlock()
+			continue // an expiry landed while we were re-listing: go once more.
+		}
+		st.running = false
+		delete(r.relistStates, name) // clean exit: drop the entry so removed upstreams do not accumulate state.
+		r.relistMu.Unlock()
+		return
+	}
 }
 
 // relistUpstream re-fetches one upstream's tools after it announced a change,
@@ -793,6 +884,28 @@ func (r *Registry) dropUpstream(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dropLocked(name)
+}
+
+// dropUpstreamIfCurrent is dropUpstream with an identity gate, the removal
+// counterpart of replaceUpstreamIfCurrent: it removes name's catalog entry
+// ONLY if the live connection is still conn (pointer identity — all Upstream
+// implementations are pointers, so == is identity), under ONE hold of r.mu so
+// the check and the drop are a single atomic step. Returns false — leaving the
+// catalog untouched — when r.conns[name] is already a different (fresh)
+// connection installed by another path; used by restart()'s give-up branches,
+// which must not tear down a newcomer that merely reused the name.
+//
+// It deliberately takes only r.mu, never lifecycleMu: Close holds lifecycleMu
+// while waiting for the supervisors to unwind, and this runs on a supervisor's
+// give-up path — taking lifecycleMu here would deadlock shutdown.
+func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[name] != conn {
+		return false
+	}
+	r.dropLocked(name)
+	return true
 }
 
 // dropLocked is dropUpstream's body, assuming r.mu is already held. It exists so
@@ -1192,13 +1305,28 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 		return nil, fmt.Errorf("unknown tool %q", namespaced)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, r.config().EffectiveCallTimeout())
-	defer cancel()
-
-	start := time.Now()
-	resp, err := conn.CallTool(callCtx, rt.original, arguments)
-	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
-	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
+	resp, err := r.callUpstream(ctx, conn, rt, namespaced, arguments)
+	// The connection can be closed between the RUnlock above and the call — a
+	// concurrent Reload/auto-restart may already have installed a FRESH
+	// connection under the same name. ErrConnClosedBeforeSend guarantees the
+	// request was never written to the upstream, so ONE retry against the
+	// re-resolved connection is safe — but only if it actually resolved to a
+	// DIFFERENT connection (retrying the same dead conn is pointless). A plain
+	// late ErrConnClosed (failure AFTER the request was sent) is deliberately
+	// NOT retried: the upstream may have executed the (potentially
+	// non-idempotent) tool already, and double execution is worse than an
+	// honest error.
+	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+		r.mu.RLock()
+		rt2, ok2 := r.toolRoute[namespaced]
+		conn2 := r.conns[rt2.upstream]
+		r.mu.RUnlock()
+		if ok2 && conn2 != nil && conn2 != conn {
+			r.log.Info("tool call hit a closed connection before send, retrying on the fresh one",
+				"tool", namespaced, "upstream", rt2.upstream)
+			resp, err = r.callUpstream(ctx, conn2, rt2, namespaced, arguments)
+		}
+	}
 	if err != nil {
 		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -1207,6 +1335,21 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 		return nil, fmt.Errorf("call %q failed", namespaced)
 	}
 	return resp, nil
+}
+
+// callUpstream performs ONE forwarding attempt against a resolved connection,
+// with its own timeout, audit record and (opt-in) payload record — each attempt
+// CallTool makes is audited separately, the failed first try and the retried
+// second one alike; nothing is hidden from the call journal.
+func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
+	callCtx, cancel := context.WithTimeout(ctx, r.config().EffectiveCallTimeout())
+	defer cancel()
+
+	start := time.Now()
+	resp, err := conn.CallTool(callCtx, rt.original, arguments)
+	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
+	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
+	return resp, err
 }
 
 // audit writes one CallRecord. Arguments are never logged (may hold secrets).
@@ -1265,8 +1408,8 @@ func (r *Registry) upstreamCount() int {
 }
 
 // recordFailure notes why an upstream never came up, so Start can surface a
-// concrete cause if every upstream fails — not just "check the logs" (bringUp
-// runs upstreams in parallel, so failures are collected here rather than
+// concrete cause if every upstream fails — not just "check the logs" (Start
+// launches upstreams in parallel, so failures are collected here rather than
 // threaded back through errgroup, which discards them by design).
 func (r *Registry) recordFailure(name, reason string) {
 	r.failMu.Lock()
@@ -1287,8 +1430,8 @@ func (r *Registry) recordSuccess(name string, tools int) {
 
 // StartReport returns one UpstreamStatus per enabled upstream, reflecting the
 // state at the end of the very first bring-up pass — call it AFTER Start. The
-// slice is a sorted copy (bringUp runs upstreams in parallel, so the internal
-// order is nondeterministic); mutating it does not affect the registry.
+// slice is a sorted copy, sorted by name for a stable presentation regardless
+// of config order; mutating it does not affect the registry.
 func (r *Registry) StartReport() []UpstreamStatus {
 	r.failMu.Lock()
 	out := append([]UpstreamStatus(nil), r.report...)
@@ -1298,8 +1441,8 @@ func (r *Registry) StartReport() []UpstreamStatus {
 }
 
 // failureSummary renders one "- upstream: reason" line per recorded failure,
-// sorted for deterministic output despite bringUp running upstreams in
-// parallel. Empty when no upstream was even enabled (config has none, or all
+// sorted for deterministic output regardless of config order.
+// Empty when no upstream was even enabled (config has none, or all
 // are disabled) — a distinct cause from every enabled one failing.
 func (r *Registry) failureSummary() string {
 	r.failMu.Lock()
@@ -1351,12 +1494,17 @@ func (r *Registry) Close() error {
 
 	// Stop any pending re-list debounce timers so none fires after shutdown.
 	// A timer that already fired is harmless (relistUpstream bails on procCtx
-	// cancellation), this just avoids a needless late wakeup.
+	// cancellation, and runRelist's dirty re-run checks procCtx too), this just
+	// avoids a needless late wakeup. The relist states are reset for the same
+	// tidiness: a still-running runRelist holds its own *relistState pointer,
+	// so its final flag flips land on the abandoned struct — harmless, never
+	// blocking.
 	r.relistMu.Lock()
 	for _, t := range r.relistTimers {
 		t.Stop()
 	}
 	r.relistTimers = map[string]*time.Timer{}
+	r.relistStates = map[string]*relistState{}
 	r.relistMu.Unlock()
 
 	r.mu.Lock()
