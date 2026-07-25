@@ -192,14 +192,6 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
-	// Per-request write deadline, in place of a static Server.WriteTimeout
-	// (see buildServer): sized from the CURRENT call_timeout so a SIGHUP
-	// reload takes effect on the next request. The error is deliberately
-	// ignored — writers that don't support deadlines (httptest.ResponseRecorder
-	// in tests) return one, and a missing deadline must not fail the request.
-	_ = http.NewResponseController(w).SetWriteDeadline(
-		time.Now().Add(s.cfg().EffectiveCallTimeout() + httpWriteTimeoutSlack))
-
 	var msg mcp.Message
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&msg); err != nil {
@@ -228,6 +220,17 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 // token stops working and the new one is accepted without a restart.
 func (s *httpServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Per-request write deadline, in place of a static Server.WriteTimeout
+		// (see buildServer): sized from the CURRENT call_timeout so a SIGHUP
+		// reload takes effect on the next request. Set here, at the outermost
+		// wrapper for the server's only route, so it covers EVERY response —
+		// including the 401 below and handleMCP's own 403/405 — not just the
+		// happy path inside handlePost. The error is deliberately ignored —
+		// writers that don't support deadlines (httptest.ResponseRecorder in
+		// tests) return one, and a missing deadline must not fail the request.
+		_ = http.NewResponseController(w).SetWriteDeadline(
+			time.Now().Add(s.cfg().EffectiveCallTimeout() + httpWriteTimeoutSlack))
+
 		token := s.cfg().AuthToken
 		if token == "" {
 			next.ServeHTTP(w, r)
