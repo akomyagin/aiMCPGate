@@ -112,7 +112,8 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 //
 // ctx is bound to the process via exec.CommandContext, so cancelling ctx (e.g.
 // on Ctrl-C) terminates the child. env entries are "KEY=VALUE"; they are
-// appended to the current environment.
+// appended to the current environment. gatewayVersion is the gateway's build
+// version, reported to the upstream as clientInfo.version in the handshake.
 //
 // onNotify, when non-nil, is invoked (from the reader goroutine) for each
 // notification the upstream sends. It must be passed here — not installed
@@ -121,7 +122,7 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 // the struct literal before that goroutine exists, so no lock is needed. The
 // callback must not block or call back into the connection synchronously
 // (Stage 7b).
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, onNotify func(method string)) (*Conn, error) {
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -165,7 +166,7 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 	go t.readLoop()
 	go t.drainStderr()
 
-	return &Conn{transport: t}, nil
+	return &Conn{transport: t, gatewayVersion: gatewayVersion}, nil
 }
 
 // readLoop reads framed messages from the child's stdout and routes each
@@ -212,6 +213,17 @@ func (c *stdioTransport) readLoop() {
 // have completed" (found by code review; done alone only tracked stdout).
 func (c *stdioTransport) drainStderr() {
 	defer close(c.stderrDone)
+	// With debug logging off, every scanned line would allocate (sc.Text) and
+	// box its slog arguments only for the handler to discard them immediately.
+	// Check the level ONCE and, when debug is disabled, keep the pipe drained
+	// without any per-line work — the child must never block on a full 64KiB
+	// OS pipe buffer either way. context.Background() because slog.Logger.
+	// Enabled only consults the handler's level; there is no per-call context
+	// on this goroutine.
+	if !c.log.Enabled(context.Background(), slog.LevelDebug) {
+		_, _ = io.Copy(io.Discard, c.stderr)
+		return
+	}
 	sc := bufio.NewScanner(c.stderr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,14 @@ import (
 // or malicious upstream could otherwise force the gateway to buffer an
 // unbounded response into memory.
 const maxHTTPResponseBytes = 32 << 20 // 32 MiB
+
+// errSessionExpired signals that the upstream answered HTTP 404 to a request
+// carrying an Mcp-Session-Id. Per the spec (Streamable HTTP, session
+// management) the server may expire a session at any time, and the client
+// MUST start a new one with a fresh InitializeRequest. call clears the stale
+// session id before returning this error; Conn.CallTool matches it
+// (errors.Is) to re-initialize and retry the call once.
+var errSessionExpired = errors.New("upstream: session expired (HTTP 404), reinitialize required")
 
 // httpTransport is the transport half of a connection to one upstream MCP
 // server reached over the Streamable HTTP transport (MCP 2025-06-18). Protocol
@@ -59,6 +68,12 @@ type httpTransport struct {
 
 	mu        sync.Mutex
 	sessionID string // Mcp-Session-Id assigned by the server on initialize, if any
+	// negotiatedVersion is the protocol version the upstream agreed to in its
+	// initialize result (which may differ from the version we proposed). Once
+	// set — by Conn.Initialize via setNegotiatedVersion — every request
+	// advertises IT in the MCP-Protocol-Version header; until then post falls
+	// back to the package constant (the version we propose in initialize).
+	negotiatedVersion string
 }
 
 // StartHTTP builds a Conn over an httpTransport for endpoint. It performs no
@@ -67,7 +82,7 @@ type httpTransport struct {
 // Authorization); their values are treated as secrets and never logged. A nil
 // client gets a dedicated per-connection client, so Close cannot disturb other
 // upstreams (see below).
-func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client) *Conn {
+func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client, gatewayVersion string) *Conn {
 	if client == nil {
 		// Each connection gets its OWN client with its own cloned transport.
 		// Sharing one package-level client (the previous design) meant Close on
@@ -86,13 +101,24 @@ func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]strin
 			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 		}
 	}
-	return &Conn{transport: &httpTransport{
-		name:     name,
-		endpoint: endpoint,
-		log:      log,
-		client:   client,
-		headers:  headers,
-	}}
+	return &Conn{
+		transport: &httpTransport{
+			name:     name,
+			endpoint: endpoint,
+			log:      log,
+			client:   client,
+			headers:  headers,
+		},
+		gatewayVersion: gatewayVersion,
+	}
+}
+
+// setNegotiatedVersion records the protocol version the upstream agreed to in
+// its initialize result; see the negotiatedVersion field comment.
+func (c *httpTransport) setNegotiatedVersion(v string) {
+	c.mu.Lock()
+	c.negotiatedVersion = v
+	c.mu.Unlock()
 }
 
 // Name returns the upstream's stable identifier.
@@ -126,13 +152,15 @@ func (c *httpTransport) call(ctx context.Context, method string, params json.Raw
 	if err != nil {
 		return nil, err
 	}
-	// Close without draining: for the SSE branch below, the upstream is allowed
-	// to keep the stream open past the response we care about (the spec permits
-	// further server-initiated messages on it), so draining to EOF here would
+	// Close without draining HERE: for the SSE branch below, the upstream is
+	// allowed to keep the stream open past the response we care about (the spec
+	// permits further server-initiated messages on it), so draining to EOF would
 	// block until the call's timeout on a chatty upstream instead of returning
 	// immediately once our response is found. net/http.Response.Body.Close on an
 	// unread stream still tears the connection down cleanly, it just forgoes
 	// keep-alive reuse for this one request (found by independent /code-review).
+	// The JSON branch, by contrast, DOES drain its (bounded) remainder before
+	// returning, so those connections stay reusable — see below.
 	defer func() { _ = httpResp.Body.Close() }()
 
 	// initialize may hand back a session id we must echo from now on.
@@ -145,6 +173,20 @@ func (c *httpTransport) call(ctx context.Context, method string, params json.Raw
 	}
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		if httpResp.StatusCode == http.StatusNotFound {
+			// 404 on a request that carried our session id means the server
+			// expired the session (spec: the client MUST re-initialize). Keeping
+			// the dead id would poison every future request until a gateway
+			// restart — clear it, and report the distinctive error so
+			// Conn.CallTool can re-initialize and retry once.
+			c.mu.Lock()
+			hadSession := c.sessionID != ""
+			c.sessionID = ""
+			c.mu.Unlock()
+			if hadSession {
+				return nil, fmt.Errorf("upstream %q: %s: %w", c.name, method, errSessionExpired)
+			}
+		}
 		return nil, fmt.Errorf("upstream %q: %s: HTTP %d", c.name, method, httpResp.StatusCode)
 	}
 
@@ -166,6 +208,13 @@ func (c *httpTransport) call(ctx context.Context, method string, params json.Raw
 		if !msg.IsResponse() || !idsEqual(msg.ID, id) {
 			return nil, fmt.Errorf("upstream %q: %s: body is not a JSON-RPC response to id %s (got id %q)", c.name, method, id, msg.ID)
 		}
+		// Drain the remainder (trailing whitespace after the JSON object) so
+		// net/http can return the connection to the keep-alive pool — Close on
+		// an un-drained body forfeits reuse. Reading from limited, not the raw
+		// body, keeps the drain bounded by the same size cap as the decode.
+		// JSON branch only: the SSE branch deliberately abandons its stream
+		// (see the deferred Close above).
+		_, _ = io.Copy(io.Discard, limited)
 		return &msg, nil
 	}
 }
@@ -204,11 +253,17 @@ func (c *httpTransport) post(ctx context.Context, msg *mcp.Message) (*http.Respo
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	httpReq.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
 
 	c.mu.Lock()
 	sid := c.sessionID
+	pv := c.negotiatedVersion
 	c.mu.Unlock()
+	if pv == "" {
+		// Before the handshake completes (or if the upstream never stated a
+		// version) advertise the version we ourselves propose in initialize.
+		pv = mcp.ProtocolVersion
+	}
+	httpReq.Header.Set("MCP-Protocol-Version", pv)
 	if sid != "" {
 		httpReq.Header.Set("Mcp-Session-Id", sid)
 	}
@@ -264,39 +319,76 @@ func idsEqual(a, b json.RawMessage) bool {
 // carry a different id (or none) and are skipped. The stream is abandoned (the
 // deferred Body.Close in call closes it) once the response is found.
 //
-// SSE framing (WHATWG): events are blank-line-separated; a "data:" line carries
-// the payload. MCP puts one JSON-RPC message per event's data, so we parse each
-// data payload as a Message.
+// SSE framing (WHATWG): events are blank-line-separated; consecutive "data:"
+// lines within one event are CONCATENATED (joined with "\n") into a single
+// payload, dispatched at the event boundary. MCP puts one JSON-RPC message per
+// event's data, so the accumulated payload of each event is parsed as one
+// Message — parsing each data: line on its own (the previous behaviour) broke
+// any upstream that splits a message across several data: lines.
 func (c *httpTransport) readSSEResponse(body io.Reader, want json.RawMessage) (*mcp.Message, error) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), maxHTTPResponseBytes)
-	for sc.Scan() {
-		line := sc.Text()
-		// Only data lines carry the JSON-RPC payload; event:/id:/retry:/comment
-		// lines and blank separators are ignored for our purposes.
-		data, ok := strings.CutPrefix(line, "data:")
-		if !ok {
-			continue
-		}
-		data = strings.TrimSpace(data)
-		if data == "" {
-			continue
+
+	var data []byte // this event's accumulated data payload
+
+	// dispatch parses the accumulated event data as one JSON-RPC message and
+	// resets the buffer. It returns the message when it is the response to our
+	// request; anything else (empty event, non-JSON payload, interleaved
+	// server->client traffic — not handled in the MVP, MCP_NOTES §7) is logged
+	// where useful and skipped.
+	dispatch := func() *mcp.Message {
+		payload := data
+		data = data[:0]
+		if len(payload) == 0 {
+			return nil
 		}
 		var msg mcp.Message
-		if err := json.Unmarshal([]byte(data), &msg); err != nil {
+		if err := json.Unmarshal(payload, &msg); err != nil {
 			c.log.Debug("upstream SSE frame not JSON-RPC (ignored)", "upstream", c.name, "err", err)
-			continue
+			return nil
 		}
 		if msg.IsResponse() && idsEqual(msg.ID, want) {
-			return &msg, nil
+			return &msg
 		}
-		// An interleaved server->client request/notification: not handled in the
-		// MVP (no client-feature proxying — MCP_NOTES §7), so log and keep reading
-		// for our response.
 		c.log.Debug("upstream SSE interleaved message ignored", "upstream", c.name, "method", msg.Method)
+		return nil
+	}
+
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			// Blank line: end of event — dispatch what was accumulated.
+			if msg := dispatch(); msg != nil {
+				return msg, nil
+			}
+			continue
+		}
+		d, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			// event:/id:/retry:/comment lines do not affect the data buffer.
+			continue
+		}
+		// Per the SSE spec, a single leading space after the colon is stripped;
+		// further whitespace is part of the payload.
+		d = strings.TrimPrefix(d, " ")
+		if len(data) > 0 {
+			data = append(data, '\n')
+		}
+		data = append(data, d...)
+		if len(data) > maxHTTPResponseBytes {
+			// The scanner caps each LINE; this caps the event's accumulated
+			// payload, so many small lines cannot add up past the same limit.
+			return nil, fmt.Errorf("upstream %q: SSE event data exceeds %d bytes", c.name, maxHTTPResponseBytes)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("upstream %q: read SSE: %w", c.name, err)
+	}
+	// End of stream terminates the final event even without a trailing blank
+	// line (a lenient reading — the spec discards an unterminated event, but a
+	// well-formed response should not be lost to a missing final newline).
+	if msg := dispatch(); msg != nil {
+		return msg, nil
 	}
 	return nil, fmt.Errorf("upstream %q: SSE stream ended without a response for id %s", c.name, want)
 }

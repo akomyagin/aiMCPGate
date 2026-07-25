@@ -21,8 +21,8 @@ import (
 // from the registry's context, see StartHTTP).
 func TestStartHTTPNilClientGetsDedicatedTransport(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	connA := StartHTTP(log, "a", "http://127.0.0.1:1/mcp", nil, nil)
-	connB := StartHTTP(log, "b", "http://127.0.0.2:1/mcp", nil, nil)
+	connA := StartHTTP(log, "a", "http://127.0.0.1:1/mcp", nil, nil, "0.0.0-test")
+	connB := StartHTTP(log, "b", "http://127.0.0.2:1/mcp", nil, nil, "0.0.0-test")
 	defer func() { _ = connA.Close(); _ = connB.Close() }()
 
 	clientA := connA.transport.(*httpTransport).client

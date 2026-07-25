@@ -19,8 +19,11 @@ import (
 func TestDrainStderrSurvivesOverlongLine(t *testing.T) {
 	pr, pw := io.Pipe()
 	c := &stdioTransport{
-		name:       "overlong",
-		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		name: "overlong",
+		// Debug level ON, deliberately: with debug off drainStderr now takes a
+		// raw io.Copy path and never runs the scanner whose failure mode this
+		// test pins down.
+		log:        slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		stderr:     pr,
 		stderrDone: make(chan struct{}),
 	}
