@@ -3,6 +3,7 @@ package upstream_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os/exec"
@@ -16,6 +17,15 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 	"github.com/akomyagin/aiMCPGate/internal/upstream"
 )
+
+// requireTool skips the test when a POSIX tool it depends on is not in PATH
+// (e.g. on Windows).
+func requireTool(t *testing.T, name string) {
+	t.Helper()
+	if _, err := exec.LookPath(name); err != nil {
+		t.Skipf("%s not available: %v", name, err)
+	}
+}
 
 // buildFakeServer compiles internal/upstream/testdata/fakeserver into a temp
 // binary once per test and returns its path.
@@ -289,6 +299,98 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("notification callback was not invoked for the startup list_changed")
+	}
+}
+
+// TestCloseDoesNotHangOnGrandchildHoldingPipes is a regression test for
+// finding #8: after the grace-period Kill, Close used to wait for the reader
+// goroutines with NO timeout. Process.Kill reaches only the DIRECT child —
+// here `cat` (exec'd by sh) dies the moment stdin closes, but the
+// backgrounded `sleep 30` grandchild inherits the stdout/stderr write ends
+// and keeps them open, so readLoop never saw EOF and Close hung until the
+// grandchild exited (30s here; forever for a daemon). The fix bounds each
+// post-kill wait with killWaitTimeout and force-closes the gateway's read
+// ends, so Close must return in closeGracePeriod + 2*killWaitTimeout (~9s).
+func TestCloseDoesNotHangOnGrandchildHoldingPipes(t *testing.T) {
+	requireTool(t, "sh")
+	ctx := context.Background()
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "wrap", "sh",
+		[]string{"-c", "sleep 30 & exec cat"}, nil, nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- conn.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(15 * time.Second): // 9s of designed timeouts + CI slack, well below the 30s sleep
+		t.Fatal("Close hung on a grandchild holding the pipes; want a bounded return (grace period + kill waits)")
+	}
+}
+
+// TestCallUnblocksOnContextWhenStdinBlocked is a regression test for finding
+// #9: call used to issue a plain blocking Write to the child's stdin and check
+// ctx only afterwards. An upstream that never reads stdin (`sleep 30` here;
+// SIGSTOPped/deadlocked in real life) lets the 64KiB OS pipe buffer fill, so
+// a large-enough request blocked the write — and with it this call and every
+// later call queued on the writer mutex — until the child died.
+func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
+	requireTool(t, "sleep")
+	ctx, cancel := context.WithCancel(context.Background())
+	// sleep is launched DIRECTLY (no sh wrapper) so the cleanup's cancel can
+	// kill it as the immediate child and Close returns without grace periods.
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "stuck", "sleep",
+		[]string{"30"}, nil, nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel() // kill the child via CommandContext so Close returns promptly
+		_ = conn.Close()
+	})
+
+	// ~1MiB of arguments — far beyond the pipe buffer, so the write MUST block.
+	big := json.RawMessage(`{"data":"` + strings.Repeat("x", 1<<20) + `"}`)
+	callCtx, callCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer callCancel()
+
+	start := time.Now()
+	_, err = conn.CallTool(callCtx, "t", big)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool err=%v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("CallTool took %v to honor its context; a blocked stdin write must not delay it", elapsed)
+	}
+}
+
+// TestCallOnClosedConnReturnsBeforeSendSentinel checks the failure-point
+// distinction introduced with finding #9: when call bails out on the
+// closed-connection check, the request is GUARANTEED not to have been sent,
+// and the error must say so — matching BOTH ErrConnClosedBeforeSend and the
+// plain ErrConnClosed it wraps (the safe-to-retry signal for finding #3).
+func TestCallOnClosedConnReturnsBeforeSendSentinel(t *testing.T) {
+	requireTool(t, "cat")
+	ctx := context.Background()
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "c", "cat", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, err = conn.CallTool(ctx, "t", nil)
+	if !errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+		t.Errorf("err=%v, want errors.Is(err, ErrConnClosedBeforeSend)", err)
+	}
+	if !errors.Is(err, upstream.ErrConnClosed) {
+		t.Errorf("err=%v, want errors.Is(err, ErrConnClosed)", err)
 	}
 }
 
