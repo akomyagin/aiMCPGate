@@ -349,6 +349,74 @@ func TestHTTPCallOversizedJSONResponseIsRejected(t *testing.T) {
 	}
 }
 
+// TestCallRejectsNonResponseBody is a regression test: the application/json
+// branch of call() used to return whatever decoded as a Message, even a body
+// with neither result nor error (not a response at all) — unlike the SSE
+// branch, which always checked IsResponse(). Such a body must be an error.
+func TestCallRejectsNonResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0"}`)
+	}))
+	defer srv.Close()
+
+	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client())
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.CallTool(context.Background(), "fetch", nil); err == nil {
+		t.Fatal("body without result/error: want an error, got success")
+	}
+}
+
+// TestCallRejectsMismatchedID: a JSON body answering a DIFFERENT request id
+// must not be accepted as our response (the SSE branch already skipped such
+// frames; the JSON branch used to take them verbatim).
+func TestCallRejectsMismatchedID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":424242,"result":{}}`)
+	}))
+	defer srv.Close()
+
+	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client())
+	defer func() { _ = conn.Close() }()
+
+	_, err := conn.CallTool(context.Background(), "fetch", nil)
+	if err == nil {
+		t.Fatal("response with a mismatched id: want an error, got success")
+	}
+	if !strings.Contains(err.Error(), "424242") {
+		t.Errorf("error should mention the mismatched id, got: %v", err)
+	}
+}
+
+// TestCallAcceptsNullResult is the control case for the two tests above: an
+// explicit "result": null is a perfectly valid JSON-RPC response (RawMessage
+// keeps the null bytes, so IsResponse() holds) and must NOT be rejected.
+func TestCallAcceptsNullResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req mcp.Message
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":null}`, req.ID)
+	}))
+	defer srv.Close()
+
+	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client())
+	defer func() { _ = conn.Close() }()
+
+	resp, err := conn.CallTool(context.Background(), "fetch", nil)
+	if err != nil {
+		t.Fatalf(`"result": null is a valid response, got error: %v`, err)
+	}
+	if got := strings.TrimSpace(string(resp.Result)); got != "null" {
+		t.Errorf("result passed through wrong: got %q, want %q", got, "null")
+	}
+}
+
 // stringWriter adapts a strings.Builder to io.Writer with a mutex, since the
 // slog handler may be written from the HTTP client's connection goroutines.
 type stringWriter struct{ b *strings.Builder }

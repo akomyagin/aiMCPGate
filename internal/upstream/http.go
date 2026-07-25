@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
@@ -25,25 +24,6 @@ import (
 // or malicious upstream could otherwise force the gateway to buffer an
 // unbounded response into memory.
 const maxHTTPResponseBytes = 32 << 20 // 32 MiB
-
-// defaultHTTPClientTimeout bounds a whole request round-trip on the fallback
-// client below. It mirrors config.DefaultCallTimeout (30s) without importing
-// the config package here; it is a BACKSTOP under the per-call context
-// deadline every current caller already applies (registry wraps each call in
-// context.WithTimeout), not the primary timeout mechanism — it just guarantees
-// a future caller that forgets a deadline cannot hang a request forever.
-const defaultHTTPClientTimeout = 30 * time.Second
-
-// defaultHTTPClient is used when StartHTTP's caller passes no client. It is a
-// dedicated client — NOT http.DefaultClient, which is process-global, shared,
-// and has no Timeout at all. Transport is set explicitly to http.DefaultTransport
-// (the zero field would make Close's *http.Transport assertion fail, turning
-// CloseIdleConnections into a silent no-op) so idle connections are actually
-// released on Close.
-var defaultHTTPClient = &http.Client{
-	Timeout:   defaultHTTPClientTimeout,
-	Transport: http.DefaultTransport,
-}
 
 // httpTransport is the transport half of a connection to one upstream MCP
 // server reached over the Streamable HTTP transport (MCP 2025-06-18). Protocol
@@ -84,10 +64,27 @@ type httpTransport struct {
 // StartHTTP builds a Conn over an httpTransport for endpoint. It performs no
 // network I/O — the handshake happens in Initialize, mirroring StartStdio which
 // likewise defers the handshake. headers are extra per-request headers (e.g.
-// Authorization); their values are treated as secrets and never logged.
+// Authorization); their values are treated as secrets and never logged. A nil
+// client gets a dedicated per-connection client, so Close cannot disturb other
+// upstreams (see below).
 func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client) *Conn {
 	if client == nil {
-		client = defaultHTTPClient
+		// Each connection gets its OWN client with its own cloned transport.
+		// Sharing one package-level client (the previous design) meant Close on
+		// ONE upstream tore down the keep-alive pool of EVERY other HTTP
+		// upstream — and, worse, its CloseIdleConnections hit the process-global
+		// http.DefaultTransport shared with all other code in the binary.
+		//
+		// Timeout is deliberately left 0 (no client-wide limit): every call is
+		// already bounded by context.WithTimeout(ctx, EffectiveCallTimeout())
+		// in the registry — a live, reload-aware deadline — whereas
+		// http.Client.Timeout covers the whole round-trip INCLUDING body reads,
+		// so a static value here would cut long SSE streams even when the
+		// operator explicitly configured call_timeout above it. It would not be
+		// a harmless backstop but an active source of drift from the config.
+		client = &http.Client{
+			Transport: http.DefaultTransport.(*http.Transport).Clone(),
+		}
 	}
 	return &Conn{transport: &httpTransport{
 		name:     name,
@@ -156,11 +153,18 @@ func (c *httpTransport) call(ctx context.Context, method string, params json.Raw
 	case strings.HasPrefix(ct, "text/event-stream"):
 		return c.readSSEResponse(httpResp.Body, id)
 	default:
-		// application/json (or unspecified): a single JSON-RPC object.
+		// application/json (or unspecified): a single JSON-RPC object. Same
+		// sanity checks the SSE branch applies: the body must actually BE a
+		// response (carry result or error — note an explicit "result": null
+		// still counts, RawMessage keeps the null bytes) and answer OUR id, not
+		// echo something unrelated.
 		var msg mcp.Message
 		limited := io.LimitReader(httpResp.Body, maxHTTPResponseBytes+1)
 		if err := json.NewDecoder(limited).Decode(&msg); err != nil {
 			return nil, fmt.Errorf("upstream %q: %s: decode response: %w", c.name, method, err)
+		}
+		if !msg.IsResponse() || !idsEqual(msg.ID, id) {
+			return nil, fmt.Errorf("upstream %q: %s: body is not a JSON-RPC response to id %s (got id %q)", c.name, method, id, msg.ID)
 		}
 		return &msg, nil
 	}
@@ -238,6 +242,12 @@ func redactedEndpoint(endpoint string) string {
 	return u.Redacted()
 }
 
+// idsEqual reports whether two raw JSON-RPC ids are the same, tolerating
+// surrounding whitespace. Shared by the JSON and SSE response paths of call.
+func idsEqual(a, b json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
+}
+
 // readSSEResponse reads an SSE stream and returns the first JSON-RPC message
 // whose id matches want (the response to our request). Per the spec the server
 // MAY interleave unrelated requests/notifications before the response; those
@@ -267,7 +277,7 @@ func (c *httpTransport) readSSEResponse(body io.Reader, want json.RawMessage) (*
 			c.log.Debug("upstream SSE frame not JSON-RPC (ignored)", "upstream", c.name, "err", err)
 			continue
 		}
-		if msg.IsResponse() && bytes.Equal(bytes.TrimSpace(msg.ID), bytes.TrimSpace(want)) {
+		if msg.IsResponse() && idsEqual(msg.ID, want) {
 			return &msg, nil
 		}
 		// An interleaved server->client request/notification: not handled in the
