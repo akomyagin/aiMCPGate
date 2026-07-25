@@ -6,12 +6,10 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-
-	"github.com/akomyagin/aiMCPGate/internal/config"
 )
 
 func newTokenCmd() *cobra.Command {
-	var configPath string
+	var configPath *string
 	var generate bool
 
 	cmd := &cobra.Command{
@@ -33,9 +31,9 @@ func newTokenCmd() *cobra.Command {
 				return nil
 			}
 
-			cfg, err := config.Load(configPath)
+			cfg, err := loadConfig(*configPath)
 			if err != nil {
-				return fmt.Errorf("load config: %w", err)
+				return err
 			}
 			if cfg.AuthToken == "" {
 				return fmt.Errorf("auth_token is not set in config (use --generate to create one)")
@@ -44,7 +42,7 @@ func newTokenCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	configPath = addConfigFlag(cmd)
 	cmd.Flags().BoolVar(&generate, "generate", false, "generate and print a new random token")
 	return cmd
 }

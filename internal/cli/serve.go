@@ -22,15 +22,15 @@ import (
 // the client until the process is cancelled (Ctrl-C / SIGTERM). This is the
 // gateway's main run loop; keeping it here keeps main.go trivial (SKILL §1).
 func newServeCmd(version string) *cobra.Command {
-	var configPath string
+	var configPath *string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the gateway, serving one client and multiplexing upstream MCP servers",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runServe(cmd.Context(), configPath, version)
+			return runServe(cmd.Context(), *configPath, version)
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	configPath = addConfigFlag(cmd)
 	return cmd
 }
 
@@ -40,9 +40,9 @@ func runServe(parent context.Context, configPath, version string) error {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, err := config.Load(configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return err
 	}
 
 	logger := logging.New(cfg.LogLevel, os.Stderr)

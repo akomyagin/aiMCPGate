@@ -11,7 +11,7 @@ import (
 )
 
 func newClientConfigCmd() *cobra.Command {
-	var configPath string
+	var configPath *string
 
 	cmd := &cobra.Command{
 		Use:   "client-config",
@@ -19,9 +19,9 @@ func newClientConfigCmd() *cobra.Command {
 		Long: "Reads listen_addr and auth_token from the gateway config and prints ready-to-use\n" +
 			"JSON snippets for adding aiMCPGate to Claude Code, Cursor, and other MCP clients.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(configPath)
+			cfg, err := loadConfig(*configPath)
 			if err != nil {
-				return fmt.Errorf("load config: %w", err)
+				return err
 			}
 			if cfg.Transport != config.TransportHTTP {
 				return fmt.Errorf("client-config is for transport: http; current transport is %q", cfg.Transport)
@@ -84,6 +84,6 @@ func newClientConfigCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	configPath = addConfigFlag(cmd)
 	return cmd
 }

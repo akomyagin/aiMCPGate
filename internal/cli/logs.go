@@ -9,7 +9,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/logging"
 )
 
@@ -20,7 +19,7 @@ import (
 // touches the running gateway.
 func newLogsCmd() *cobra.Command {
 	var (
-		configPath   string
+		configPath   *string
 		file         string
 		tail         int
 		upstreamFilt string
@@ -34,7 +33,7 @@ func newLogsCmd() *cobra.Command {
 			"config, or stderr if unset — pass --file to read a specific file). It prints\n" +
 			"the most recent records, optionally filtered by upstream, tool, or ok status.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			path, err := resolveLogFile(file, configPath)
+			path, err := resolveLogFile(file, *configPath)
 			if err != nil {
 				return err
 			}
@@ -45,7 +44,7 @@ func newLogsCmd() *cobra.Command {
 			return runLogs(cmd, path, tail, upstreamFilt, toolFilt, ok)
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "config file to read log_file from (if --file is not given)")
+	configPath = addConfigFlag(cmd)
 	cmd.Flags().StringVarP(&file, "file", "f", "", "path to the JSON-lines call log (overrides config's log_file)")
 	cmd.Flags().IntVarP(&tail, "tail", "n", 50, "show at most the last N matching records (0 = all)")
 	cmd.Flags().StringVar(&upstreamFilt, "upstream", "", "only records for this upstream")
@@ -62,9 +61,9 @@ func resolveLogFile(file, configPath string) (string, error) {
 	if file != "" {
 		return file, nil
 	}
-	cfg, err := config.Load(configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return "", fmt.Errorf("load config: %w", err)
+		return "", err
 	}
 	if cfg.LogFile == "" {
 		return "", fmt.Errorf("config has no log_file (the gateway logged to stderr, which cannot be read back)")
