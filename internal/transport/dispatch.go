@@ -76,7 +76,7 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 	// IsResponse requires an actual result/error. NewError echoes whatever id
 	// the message carried — null when there was none, which is what JSON-RPC
 	// prescribes when the request id cannot be determined.
-	if msg.Method != "" && msg.IsResponse() {
+	if msg.IsMalformedHybrid() {
 		return mcp.NewError(msg.ID, mcp.CodeInvalidRequest,
 			"message is not a valid request: carries both a method and a result/error", nil)
 	}

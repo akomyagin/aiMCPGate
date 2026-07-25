@@ -369,6 +369,40 @@ func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
 	}
 }
 
+// TestStdioConnHybridResponseNotDelivered checks the readLoop side of the
+// shared IsMalformedHybrid predicate: an upstream that answers a call with a
+// MALFORMED hybrid message (method AND result together, echoing the request
+// id) used to have it classified as a valid response by IsResponse() and
+// delivered to the waiter as a successful answer — diverging from the client
+// dispatcher and the demo stub, which reject the same shape as invalid. The
+// reader must now drop it, so the pending call sees no answer at all and
+// times out on its own ctx, exactly as if the upstream had stayed silent.
+func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "hybrid", bin, nil,
+		[]string{"FAKE_TOOLS=t", "FAKE_HYBRID_CALL=1"}, "0.0.0-test", nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	callCtx, callCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer callCancel()
+	resp, err := conn.CallTool(callCtx, "t", nil)
+	if err == nil {
+		t.Fatalf("CallTool delivered the malformed hybrid as a valid response: %+v", resp)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool err=%v, want context.DeadlineExceeded (dropped hybrid → ctx timeout)", err)
+	}
+}
+
 // TestCallOnClosedConnReturnsBeforeSendSentinel checks the failure-point
 // distinction introduced with finding #9: when call bails out on the
 // closed-connection check, the request is GUARANTEED not to have been sent,

@@ -85,6 +85,15 @@ func (m *Message) IsRequest() bool {
 	return !isNullID(m.ID) && m.Method != "" && !m.IsResponse()
 }
 
+// IsMalformedHybrid reports whether m carries both a method (request/
+// notification shape) and a result or error (response shape) — a shape
+// JSON-RPC 2.0 does not allow. All three message classifiers (the client
+// dispatcher, the demo stub, the upstream reader) must agree on rejecting
+// this, so the check lives once, here.
+func (m *Message) IsMalformedHybrid() bool {
+	return m.Method != "" && m.IsResponse()
+}
+
 // isNullID reports whether a raw ID is absent or the JSON literal null. Any
 // surrounding whitespace is tolerated.
 func isNullID(raw json.RawMessage) bool {

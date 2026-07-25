@@ -185,6 +185,15 @@ func (c *stdioTransport) readLoop() {
 			return
 		}
 		switch {
+		case msg.IsMalformedHybrid():
+			// Both a method (request shape) and a result/error (response shape):
+			// a shape JSON-RPC 2.0 does not allow. The other two classifiers
+			// (client dispatcher, demo stub) reject it as invalid; the reader
+			// must not disagree by treating it as a valid response and handing
+			// it to a waiter. Drop it — the pending call (if any) then times out
+			// on its own ctx, exactly as if the upstream had never answered.
+			c.log.Warn("upstream sent malformed hybrid message (method and result/error together), dropping",
+				"upstream", c.name, "method", msg.Method, "id", string(msg.ID))
 		case msg.IsResponse():
 			c.deliver(msg)
 		case msg.IsNotification():

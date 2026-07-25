@@ -110,7 +110,7 @@ func handle(msg *mcp.Message, version string) *mcp.Message {
 	// (response shape) — must be answered with an explicit invalid-request
 	// error, not silently dropped (same check as the gateway's own dispatcher,
 	// internal/transport/dispatch.go).
-	if msg.Method != "" && msg.IsResponse() {
+	if msg.IsMalformedHybrid() {
 		return mcp.NewError(msg.ID, mcp.CodeInvalidRequest,
 			"message is not a valid request: carries both a method and a result/error", nil)
 	}

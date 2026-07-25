@@ -65,3 +65,30 @@ func TestNewErrorNilIDMarshalsNullID(t *testing.T) {
 		}
 	})
 }
+
+// TestIsMalformedHybrid pins the shared predicate all three message
+// classifiers (client dispatcher, demo stub, upstream reader) rely on: a
+// message carrying BOTH a method (request/notification shape) and a
+// result/error (response shape) is malformed per JSON-RPC 2.0; every
+// well-formed shape is not.
+func TestIsMalformedHybrid(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  Message
+		want bool
+	}{
+		{"method and result", Message{Method: "tools/call", Result: json.RawMessage(`{}`)}, true},
+		{"method and error", Message{Method: "tools/call", Error: &Error{Code: CodeInternalError, Message: "boom"}}, true},
+		{"method only (request/notification)", Message{Method: "tools/call"}, false},
+		{"result only (response)", Message{Result: json.RawMessage(`{}`)}, false},
+		{"error only (response)", Message{Error: &Error{Code: CodeInternalError, Message: "boom"}}, false},
+		{"empty message", Message{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.msg.IsMalformedHybrid(); got != tc.want {
+				t.Errorf("IsMalformedHybrid() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
