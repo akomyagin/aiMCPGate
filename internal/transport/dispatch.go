@@ -86,9 +86,17 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 		return nil
 	}
 	if !msg.IsRequest() {
-		// A response from the client (unexpected in the server role) — ignore.
-		d.log.Debug("unexpected client message ignored", "method", msg.Method)
-		return nil
+		if msg.IsResponse() {
+			// A response from the client (unexpected in the server role) — ignore.
+			d.log.Debug("unexpected client message ignored", "method", msg.Method)
+			return nil
+		}
+		// Not a notification (it has an id), not a response (no result/error),
+		// not a request (no method): a request-shaped message with an id but no
+		// method. JSON-RPC 2.0 requires answering it with -32600 Invalid Request
+		// under that id, not dropping it silently (found by audit).
+		return mcp.NewError(msg.ID, mcp.CodeInvalidRequest,
+			"message is not a valid request: missing method", nil)
 	}
 
 	switch msg.Method {

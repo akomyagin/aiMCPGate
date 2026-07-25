@@ -17,6 +17,7 @@ package demo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
@@ -74,17 +75,22 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, version string)
 }
 
 // serve is the sequential request loop: read one framed message, answer it.
-// Only EOF ends the loop; a single corrupt line yields a parse error but does
-// not desynchronize the stream (mcp.Reader's contract), so the loop keeps
+// EOF ends the loop cleanly; a single corrupt line yields a parse error but
+// does not desynchronize the stream (mcp.Reader's contract), so the loop keeps
 // serving subsequent lines — same policy as the gateway's own transport layer
 // (internal/transport/stdio.go). Being a minimal stub with no logger, it
-// skips the bad line silently.
+// skips the bad line silently. A fatal reader error (mcp.ErrFatalRead — the
+// scanner is permanently broken, every retry fails identically) ends the loop
+// with that error instead: retrying it would busy-loop at 100% CPU.
 func serve(r *mcp.Reader, w *mcp.Writer, version string) error {
 	for {
 		msg, err := r.Read()
 		if err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			if errors.Is(err, mcp.ErrFatalRead) {
+				return err
 			}
 			continue // one bad line — keep reading the next
 		}

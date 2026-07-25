@@ -168,6 +168,58 @@ func TestReaderSkipsBlankLines(t *testing.T) {
 	}
 }
 
+// failingReader always fails with its configured error, simulating a broken
+// underlying stream (the same terminal scanner state a >maxLineBytes frame or
+// an I/O error produces, without generating gigabytes of input).
+type failingReader struct{ err error }
+
+func (r *failingReader) Read(p []byte) (int, error) { return 0, r.err }
+
+// TestReaderScannerErrorIsFatal: an error from the underlying stream (scanner
+// error) must be wrapped with ErrFatalRead so callers stop retrying — the
+// scanner is permanently broken and every subsequent Read fails identically.
+func TestReaderScannerErrorIsFatal(t *testing.T) {
+	underlying := errors.New("boom: stream broken")
+	r := NewReader(&failingReader{err: underlying})
+
+	for i := 0; i < 2; i++ { // the error must be permanent across Reads
+		_, err := r.Read()
+		if err == nil {
+			t.Fatalf("Read #%d: expected error, got nil", i)
+		}
+		if !errors.Is(err, ErrFatalRead) {
+			t.Errorf("Read #%d: errors.Is(err, ErrFatalRead) = false, err = %v", i, err)
+		}
+		if !errors.Is(err, underlying) {
+			t.Errorf("Read #%d: underlying error not wrapped, err = %v", i, err)
+		}
+	}
+}
+
+// TestReaderDecodeErrorIsNotFatal: bad JSON on one well-framed line is a
+// retryable per-line error — it must NOT carry ErrFatalRead, and the stream
+// stays readable afterwards.
+func TestReaderDecodeErrorIsNotFatal(t *testing.T) {
+	in := "{not json}\n" + `{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n"
+	r := NewReader(strings.NewReader(in))
+
+	_, err := r.Read()
+	if err == nil {
+		t.Fatal("expected decode error for bad JSON line, got nil")
+	}
+	if errors.Is(err, ErrFatalRead) {
+		t.Errorf("per-line decode error must not carry ErrFatalRead, err = %v", err)
+	}
+
+	m, err := r.Read()
+	if err != nil {
+		t.Fatalf("stream desynchronized after one bad line: %v", err)
+	}
+	if m.Method != "ping" {
+		t.Fatalf("Method=%q want ping", m.Method)
+	}
+}
+
 func TestWriterConcurrentFramesIntact(t *testing.T) {
 	// Concurrent writes must not interleave bytes: every line read back must be
 	// valid JSON. This exercises the writer mutex under -race.

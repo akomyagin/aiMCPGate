@@ -4,10 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 )
+
+// ErrFatalRead marks a Reader error as PERMANENT: the underlying bufio.Scanner
+// has errored (e.g. bufio.ErrTooLong, or an I/O error from the stream) and every
+// subsequent Read will fail the same way. Callers that retry per-frame decode
+// errors MUST check errors.Is(err, ErrFatalRead) and stop reading instead of
+// looping — retrying a fatal error is a busy-loop. Per-line decode errors (bad
+// JSON in a well-framed line) do NOT carry this sentinel and are retryable.
+var ErrFatalRead = errors.New("mcp: reader failed permanently")
 
 // maxLineBytes bounds a single framed message. MCP stdio framing is one JSON
 // message per line; the default bufio.Scanner token limit (64 KiB) is too small
@@ -45,19 +54,22 @@ func NewReader(r io.Reader) *Reader {
 // yields a parse error but does not desynchronize the stream — the caller may
 // keep reading subsequent lines.
 //
-// A frame exceeding maxLineBytes (bufio.ErrTooLong) is different: it is a fatal
+// A scanner error (e.g. a frame exceeding maxLineBytes — bufio.ErrTooLong — or
+// an I/O error from the underlying stream) is different: it is a fatal
 // transport error for THIS connection — bufio.Scanner cannot recover from it,
-// so every subsequent Read fails too. The caller (the stdio reader loop in
-// internal/upstream) treats any such error like a dead stream: it tears the
-// connection down (done channel closes, pending calls fail), and the registry's
-// auto-restart supervisor — when enabled — relaunches the upstream fresh. That
-// "tear down and relaunch" is the intended recovery path, not per-scanner
-// resynchronization, which bufio.Scanner does not support.
+// so every subsequent Read fails too. Such errors are wrapped with ErrFatalRead
+// so callers can distinguish them (errors.Is) from retryable per-line decode
+// errors. The caller (the stdio reader loop in internal/upstream) treats any
+// such error like a dead stream: it tears the connection down (done channel
+// closes, pending calls fail), and the registry's auto-restart supervisor —
+// when enabled — relaunches the upstream fresh. That "tear down and relaunch"
+// is the intended recovery path, not per-scanner resynchronization, which
+// bufio.Scanner does not support.
 func (r *Reader) Read() (*Message, error) {
 	for {
 		if !r.sc.Scan() {
 			if err := r.sc.Err(); err != nil {
-				return nil, fmt.Errorf("mcp: read frame: %w", err)
+				return nil, fmt.Errorf("mcp: read frame: %w: %w", ErrFatalRead, err)
 			}
 			return nil, io.EOF
 		}
