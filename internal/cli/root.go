@@ -5,7 +5,11 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
+
+	"github.com/akomyagin/aiMCPGate/internal/config"
 )
 
 // Build assembles the root command and its subcommands. version is the build
@@ -21,7 +25,7 @@ func Build(version string) *cobra.Command {
 		SilenceUsage: true,
 	}
 	root.AddCommand(newServeCmd(version))
-	root.AddCommand(newDoctorCmd())
+	root.AddCommand(newDoctorCmd(version))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newVersionCmd(version))
 	root.AddCommand(newTokenCmd())
@@ -29,4 +33,26 @@ func Build(version string) *cobra.Command {
 	root.AddCommand(newSkillCmd())
 	root.AddCommand(newDemoServerCmd(version))
 	return root
+}
+
+// addConfigFlag registers the shared --config/-c flag on cmd and returns a
+// pointer to the bound path variable. Every config-reading command registers
+// the flag through this helper so the name, shorthand and help text stay
+// identical across the whole command tree.
+func addConfigFlag(cmd *cobra.Command) *string {
+	var configPath string
+	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	return &configPath
+}
+
+// loadConfig is the shared config-loading prologue: config.Load plus the
+// uniform error prefix every command used to spell out by hand. The original
+// error is wrapped with %w, so callers that need to distinguish failure kinds
+// (e.g. errors.Is(err, fs.ErrNotExist)) still can.
+func loadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	return cfg, nil
 }

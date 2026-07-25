@@ -5,8 +5,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-
-	"github.com/akomyagin/aiMCPGate/internal/config"
 )
 
 // skillBody is a generic, deployment-independent guide for an AI agent talking
@@ -79,7 +77,7 @@ logging for every call — bypassing it defeats both.
 `
 
 func newSkillCmd() *cobra.Command {
-	var configPath string
+	var configPath *string
 	cmd := &cobra.Command{
 		Use:   "skill",
 		Short: "Print a SKILL.md teaching an agent how to use mcp-gate's aggregated catalog",
@@ -90,9 +88,9 @@ func newSkillCmd() *cobra.Command {
 			"copy this command's default output as a starting point.\n\n" +
 			"Typical use: mcp-gate skill > .claude/skills/mcp-gate/SKILL.md",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(configPath)
+			cfg, err := loadConfig(*configPath)
 			if err != nil {
-				if configPath == "" {
+				if *configPath == "" {
 					// No --config given and no default config next to the
 					// binary either: unlike serve, skill needs no real
 					// deployment to be useful, so fall back to the built-in
@@ -101,7 +99,7 @@ func newSkillCmd() *cobra.Command {
 					cmd.Print(skillBody)
 					return nil
 				}
-				return fmt.Errorf("load config: %w", err)
+				return err
 			}
 			if cfg.SkillFile == "" {
 				cmd.Print(skillBody)
@@ -115,6 +113,6 @@ func newSkillCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	configPath = addConfigFlag(cmd)
 	return cmd
 }

@@ -42,6 +42,11 @@
 //	                   list_changed to stdout, then truncates the file so it fires
 //	                   once per touch — used to test the gateway's reaction to an
 //	                   upstream list_changed (Stage 7b).
+//	FAKE_HYBRID_CALL  if "1", tools/call is answered with a MALFORMED hybrid
+//	                   message carrying both a method and a result — a shape
+//	                   JSON-RPC 2.0 forbids — instead of an honest response;
+//	                   used to test that the gateway's reader drops it rather
+//	                   than delivering it to the waiter as a valid answer.
 //	FAKE_NOTIFY_ON_START  if "1", the server writes one notifications/tools/
 //	                   list_changed to stdout immediately on startup, before
 //	                   reading any request — reproduces an upstream that
@@ -97,6 +102,7 @@ func main() {
 		listDelay, _ = time.ParseDuration(raw)
 	}
 	exitAfter, _ := strconv.Atoi(os.Getenv("FAKE_EXIT_AFTER"))
+	hybridCall := os.Getenv("FAKE_HYBRID_CALL") == "1"
 	toolsFile := os.Getenv("FAKE_TOOLS_FILE")
 	notifyFile := os.Getenv("FAKE_NOTIFY_FILE")
 
@@ -176,6 +182,13 @@ func main() {
 		case "tools/call":
 			if callDelay > 0 {
 				time.Sleep(callDelay)
+			}
+			if hybridCall {
+				// Malformed on purpose: method AND result together, echoing the
+				// request id — the exact shape the gateway's reader must refuse
+				// to deliver as a valid response.
+				write(message{ID: req.ID, Method: "tools/call", Result: json.RawMessage(callResult(req.Params, echo))})
+				continue
 			}
 			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
 			callCount++

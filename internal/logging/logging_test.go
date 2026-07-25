@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -48,11 +49,13 @@ func TestReadRecordsSkipsTrailingGarbage(t *testing.T) {
 }
 
 // TestPayloadLogRecord writes a PayloadRecord and checks the JSON line carries
-// the raw arguments and result verbatim (the opt-in Stage 10 debug log).
+// the raw arguments and result verbatim (the opt-in Stage 10 debug log; secret
+// masking happens in the caller — registry.recordPayload — not in the writer).
 func TestPayloadLogRecord(t *testing.T) {
 	var buf bytes.Buffer
 	log := NewPayloadLogWriter(&buf)
 	log.Record(PayloadRecord{
+		Time:      time.Now(),
 		Upstream:  "github",
 		Tool:      "github__search",
 		Method:    "tools/call",
@@ -74,8 +77,64 @@ func TestPayloadLogRecord(t *testing.T) {
 	if string(rec.Result) != `{"items":[1,2,3]}` {
 		t.Errorf("result = %s, want raw passthrough", rec.Result)
 	}
-	if rec.Time.IsZero() {
-		t.Error("Record should stamp a non-zero time")
+}
+
+// TestMaskSecrets pins the SKILL §6 payload masking: values of top-level keys
+// whose names look secret-carrying are replaced by "***", every other field is
+// preserved, and non-object payloads pass through untouched.
+func TestMaskSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "suspicious keys masked, others kept",
+			in:   `{"api_key":"secret123","query":"hello"}`,
+			want: `{"api_key":"***","query":"hello"}`,
+		},
+		{
+			name: "case-insensitive markers",
+			in:   `{"Authorization":"Bearer abc","AccessToken":"t","PASSWORD":"p"}`,
+			want: `{"AccessToken":"***","Authorization":"***","PASSWORD":"***"}`,
+		},
+		{
+			name: "no suspicious keys returns original bytes",
+			in:   `{"q":"secret-token","n":1}`,
+			want: `{"q":"secret-token","n":1}`, // value may look secret; only KEY names matter
+		},
+		{
+			name: "nested objects are not descended into",
+			in:   `{"config":{"token":"inner"},"query":"x"}`,
+			want: `{"config":{"token":"inner"},"query":"x"}`,
+		},
+		{name: "array passthrough", in: `[{"token":"t"}]`, want: `[{"token":"t"}]`},
+		{name: "scalar passthrough", in: `"token"`, want: `"token"`},
+		{name: "null passthrough", in: `null`, want: `null`},
+		{name: "malformed passthrough", in: `{"token":`, want: `{"token":`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MaskSecrets(json.RawMessage(tt.in))
+			// Compare semantically where the output is re-marshaled (map key
+			// order is not stable), byte-for-byte where passthrough is claimed.
+			if tt.in == tt.want {
+				if string(got) != tt.want {
+					t.Fatalf("MaskSecrets(%s) = %s, want unchanged", tt.in, got)
+				}
+				return
+			}
+			var gotV, wantV map[string]any
+			if err := json.Unmarshal(got, &gotV); err != nil {
+				t.Fatalf("MaskSecrets(%s) produced invalid JSON %s: %v", tt.in, got, err)
+			}
+			if err := json.Unmarshal([]byte(tt.want), &wantV); err != nil {
+				t.Fatalf("bad want %s: %v", tt.want, err)
+			}
+			if !reflect.DeepEqual(gotV, wantV) {
+				t.Fatalf("MaskSecrets(%s) = %s, want %s", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 

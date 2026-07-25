@@ -8,12 +8,15 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
+	"github.com/akomyagin/aiMCPGate/internal/upstream"
 )
 
 // fakeUpstream is an in-process Upstream used to test the multiplexer without
@@ -46,7 +49,7 @@ func (f *fakeUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
 	}
 	out := make([]mcp.Tool, 0, len(f.tools))
 	for _, t := range f.tools {
-		out = append(out, mcp.Tool{Name: t, Description: "desc " + t, InputSchema: json.RawMessage(`{"type":"object"}`)})
+		out = append(out, mcp.Tool{Name: t, Description: json.RawMessage(`"desc ` + t + `"`), InputSchema: json.RawMessage(`{"type":"object"}`)})
 	}
 	return out, nil
 }
@@ -93,7 +96,7 @@ func newTestRegistry(t *testing.T, cfg *config.Config, callLog logging.CallLog, 
 // for the Stage 10 opt-in payload tests.
 func newTestRegistryWithPayload(t *testing.T, cfg *config.Config, callLog logging.CallLog, payloadLog logging.PayloadLog, fakes map[string]*fakeUpstream) *Registry {
 	t.Helper()
-	r := New(cfg, quietLogger(), callLog, payloadLog, true)
+	r := New(cfg, quietLogger(), callLog, payloadLog, true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		f, ok := fakes[u.Name]
 		if !ok {
@@ -354,8 +357,10 @@ func TestRegistryCallLogHasNoSecrets(t *testing.T) {
 }
 
 // TestRegistryPayloadLogRecordsArgsAndResult is the Stage 10 end-to-end check:
-// when the opt-in payload log is enabled, CallTool writes the raw arguments AND
-// the upstream result to it (the deliberate difference from the audit log).
+// when the opt-in payload log is enabled, CallTool writes the arguments AND the
+// upstream result to it (the deliberate difference from the audit log) — with
+// secret-looking top-level fields masked to "***" (SKILL §6) while every other
+// field passes through verbatim.
 func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
 	var auditBuf, payloadBuf bytes.Buffer
@@ -370,13 +375,13 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	}
 	defer r.Close()
 
-	const secret = "SUPER_SECRET_TOKEN_abc123"
-	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
+	const secret = "secret123"
+	args := json.RawMessage(`{"api_key":"` + secret + `","query":"hello"}`)
 	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
-	// The payload log DOES carry the raw arguments and a result (opt-in debug).
+	// The payload log carries the arguments and a result (opt-in debug)...
 	var rec logging.PayloadRecord
 	if err := json.Unmarshal([]byte(strings.TrimSpace(payloadBuf.String())), &rec); err != nil {
 		t.Fatalf("decode payload record: %v (line=%q)", err, payloadBuf.String())
@@ -384,11 +389,23 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 	if rec.Tool != "web__fetch" || rec.Upstream != "web" || rec.Method != mcp.MethodToolsCall {
 		t.Errorf("payload metadata mismatch: %+v", rec)
 	}
-	if string(rec.Arguments) != string(args) {
-		t.Errorf("payload arguments = %s, want raw %s", rec.Arguments, args)
-	}
 	if len(rec.Result) == 0 {
 		t.Errorf("payload result missing, want the upstream result")
+	}
+
+	// ...but the secret-looking argument is masked, the innocent one kept.
+	var gotArgs map[string]string
+	if err := json.Unmarshal(rec.Arguments, &gotArgs); err != nil {
+		t.Fatalf("decode payload arguments %s: %v", rec.Arguments, err)
+	}
+	if gotArgs["api_key"] != "***" {
+		t.Errorf("api_key = %q in payload log, want masked \"***\"", gotArgs["api_key"])
+	}
+	if gotArgs["query"] != "hello" {
+		t.Errorf("query = %q in payload log, want \"hello\" untouched", gotArgs["query"])
+	}
+	if strings.Contains(payloadBuf.String(), secret) {
+		t.Fatalf("payload log leaked secret:\n%s", payloadBuf.String())
 	}
 
 	// Regression guard (SKILL §6): the AUDIT log still contains no arguments —
@@ -514,6 +531,334 @@ func TestRegistryPayloadLogRecordsErrorData(t *testing.T) {
 	}
 	if string(rec.ErrorData) != string(errData) {
 		t.Errorf("PayloadRecord.ErrorData = %s, want verbatim %s", rec.ErrorData, errData)
+	}
+}
+
+// latchInitUpstream blocks Initialize until gate is closed, so a test can force
+// this upstream's launch to finish strictly AFTER another's.
+type latchInitUpstream struct {
+	*fakeUpstream
+	gate <-chan struct{}
+}
+
+func (l *latchInitUpstream) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
+	select {
+	case <-l.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return l.fakeUpstream.Initialize(ctx)
+}
+
+// signalListedUpstream closes listed once its FIRST ListTools returns —
+// the last handshake step of launch(), i.e. "this upstream's launch is done".
+type signalListedUpstream struct {
+	*fakeUpstream
+	once   sync.Once
+	listed chan struct{}
+}
+
+func (s *signalListedUpstream) ListTools(ctx context.Context) ([]mcp.Tool, error) {
+	defer s.once.Do(func() { close(s.listed) })
+	return s.fakeUpstream.ListTools(ctx)
+}
+
+// TestStartParallelMergeOrderDeterministic pins the launch/merge split inside
+// Start, the same property TestReloadParallelMergeOrderDeterministic pins for
+// Reload: launches fan out in parallel, but the catalog merge runs sequentially
+// after g.Wait(), in CONFIG order. Two upstreams collide on the client-facing
+// name "first__t" — "first" advertises tool "t" under the default namespaced
+// name, "second" renames its tool "z" onto that same name. "first" is listed
+// FIRST in the config but is forced (via a latch, no timing luck involved) to
+// finish its handshake strictly AFTER "second": with the old merge-inside-
+// goroutine bring-up the winner would be "second" (completion order); with the
+// deterministic post-Wait merge it must be "first" (config order), on every
+// run. Run under -race.
+func TestStartParallelMergeOrderDeterministic(t *testing.T) {
+	secondListed := make(chan struct{})
+	first := &latchInitUpstream{
+		fakeUpstream: &fakeUpstream{name: "first", tools: []string{"t"}},
+		gate:         secondListed,
+	}
+	second := &signalListedUpstream{
+		fakeUpstream: &fakeUpstream{name: "second", tools: []string{"z"}},
+		listed:       secondListed,
+	}
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "first", Enabled: true},
+		{Name: "second", Enabled: true, Tools: config.ToolFilter{Rename: map[string]string{"z": "first__t"}}},
+	}}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
+		switch u.Name {
+		case "first":
+			return first, nil
+		case "second":
+			return second, nil
+		}
+		return nil, errors.New("no fake for " + u.Name)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	var owner string
+	for _, d := range r.Tools() {
+		if d.Name == "first__t" {
+			owner = d.Upstream
+		}
+	}
+	if owner != "first" {
+		t.Fatalf("collided name first__t owned by %q, want %q (Start's merge must follow config order, not goroutine completion order)", owner, "first")
+	}
+}
+
+// swapConnOnCallUpstream returns err from every CallTool; on the FIRST call it
+// also installs repl under its own name in the registry's connection map —
+// modelling a concurrent reload/auto-restart that replaced the connection in
+// the window between CallTool's route lookup and the actual RPC.
+type swapConnOnCallUpstream struct {
+	*fakeUpstream
+	reg   *Registry
+	repl  Upstream // nil: no swap, the dead conn stays current
+	err   error
+	once  sync.Once
+	calls atomic.Int64
+}
+
+func (s *swapConnOnCallUpstream) CallTool(context.Context, string, json.RawMessage) (*mcp.Message, error) {
+	s.calls.Add(1)
+	s.once.Do(func() {
+		if s.repl == nil {
+			return
+		}
+		s.reg.mu.Lock()
+		s.reg.conns[s.fakeUpstream.name] = s.repl
+		s.reg.mu.Unlock()
+	})
+	return nil, s.err
+}
+
+// TestCallToolRetriesOnceOnConnClosedBeforeSend covers finding #3's happy path:
+// CallTool resolves a connection, but by the time it calls, that connection was
+// closed by a concurrent reload/restart — which has ALREADY installed a fresh
+// one under the same name. ErrConnClosedBeforeSend guarantees the request never
+// reached the upstream, so CallTool must re-resolve and retry ONCE against the
+// fresh connection — and both attempts must be audited.
+func TestCallToolRetriesOnceOnConnClosedBeforeSend(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var buf bytes.Buffer
+	callLog := logging.NewCallLogWriter(&buf)
+
+	live := &fakeUpstream{name: "web", tools: []string{"fetch"}}
+	dead := &swapConnOnCallUpstream{
+		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
+		repl:         live,
+		err:          upstream.ErrConnClosedBeforeSend,
+	}
+	r := New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test")
+	dead.reg = r
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	resp, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{"q":1}`))
+	if err != nil {
+		t.Fatalf("CallTool should have retried on the fresh connection, got error: %v", err)
+	}
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("unexpected response after retry: %+v", resp)
+	}
+	if live.lastNamed != "fetch" {
+		t.Errorf("fresh connection received name %q, want original %q", live.lastNamed, "fetch")
+	}
+	if got := dead.calls.Load(); got != 1 {
+		t.Errorf("dead connection called %d times, want exactly 1", got)
+	}
+
+	// Every attempt is audited separately — the failed first try AND the
+	// successful retry; nothing is hidden from the call journal.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("audit log has %d records, want 2 (failed attempt + retried success):\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], `"ok":false`) {
+		t.Errorf("first audit record should mark the failed attempt: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], `"ok":true`) {
+		t.Errorf("second audit record should mark the retried success: %s", lines[1])
+	}
+}
+
+// TestCallToolNoRetryOnLateConnClosed is the control for finding #3: a plain
+// late ErrConnClosed (NOT the BeforeSend variant) means the request may have
+// reached the upstream before the connection died — retrying could execute a
+// non-idempotent tool twice, so CallTool must return the error immediately even
+// though a fresh connection is already available under the same name.
+func TestCallToolNoRetryOnLateConnClosed(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	live := &fakeUpstream{name: "web", tools: []string{"fetch"}}
+	dead := &swapConnOnCallUpstream{
+		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
+		repl:         live,
+		err:          upstream.ErrConnClosed,
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	dead.reg = r
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.CallTool(context.Background(), "web__fetch", nil); err == nil {
+		t.Fatal("expected error for a late ErrConnClosed, got success — a post-send failure must never be retried")
+	}
+	if live.lastNamed != "" {
+		t.Errorf("fresh connection was called (name=%q) — a post-send failure must never be retried", live.lastNamed)
+	}
+}
+
+// TestCallToolNoRetryOnSameConn: the BeforeSend error is retryable in
+// principle, but if re-resolving yields the SAME (dead) connection there is
+// nothing sensible to retry against — CallTool must return the error after
+// exactly one attempt instead of hammering the corpse.
+func TestCallToolNoRetryOnSameConn(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	dead := &swapConnOnCallUpstream{
+		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
+		repl:         nil, // no swap: the dead conn stays current
+		err:          upstream.ErrConnClosedBeforeSend,
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	dead.reg = r
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	if _, err := r.CallTool(context.Background(), "web__fetch", nil); err == nil {
+		t.Fatal("expected error when the re-resolved connection is the same dead one")
+	}
+	if got := dead.calls.Load(); got != 1 {
+		t.Errorf("dead connection called %d times, want exactly 1 (no retry against the same conn)", got)
+	}
+}
+
+// versionedListUpstream serves a DIFFERENT catalog on each ListTools call
+// (v1 for Start's initial list, v2 for the first re-list, v3 afterwards) and
+// lets the test hold the first re-list "in flight": call 2 signals entered and
+// then blocks until release is closed. This stages finding #13's overlapping
+// re-lists deterministically — no timing luck involved.
+type versionedListUpstream struct {
+	*fakeUpstream
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{} // receives one value when the gated (2nd) ListTools starts
+	release chan struct{} // the gated ListTools proceeds once this is closed
+}
+
+func (g *versionedListUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
+	g.mu.Lock()
+	g.calls++
+	n := g.calls
+	g.mu.Unlock()
+	if n == 2 { // the first RE-list (call 1 is Start's initial list): hold it in flight
+		g.entered <- struct{}{}
+		<-g.release
+	}
+	var name string
+	switch n {
+	case 1:
+		name = "a" // v1: Start's initial catalog
+	case 2:
+		name = "b" // v2: the first re-list — already stale by the time it returns
+	default:
+		name = "c" // v3: the dirty-driven second re-list — the freshest truth
+	}
+	return []mcp.Tool{{Name: name, Description: json.RawMessage(`"desc ` + name + `"`), InputSchema: json.RawMessage(`{"type":"object"}`)}}, nil
+}
+
+func (g *versionedListUpstream) callCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+// TestRelistOverlappingNotificationsSerialized pins finding #13: two
+// tools/list_changed notifications whose debounce expiries overlap must NOT run
+// two concurrent re-lists (a stale result could then land after a fresher one).
+// Instead the second expiry marks the running re-list dirty, and when the first
+// re-list finishes (returning the already-stale v2), a SECOND re-list runs
+// immediately — no new debounce wait — and its result (v3) is final. Exactly
+// two re-list RPCs total: the dirty re-run happened, and nothing beyond it.
+// Run under -race.
+func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
+	up := &versionedListUpstream{
+		fakeUpstream: &fakeUpstream{name: "dyn"},
+		entered:      make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	cfg := &config.Config{
+		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{{Name: "dyn", Enabled: true}},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return up, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	if !hasTool(r, "dyn__a") {
+		t.Fatal("precondition: dyn__a not in catalog after Start")
+	}
+
+	// Notification #1: its debounce timer fires and the re-list's ListTools
+	// (call 2) blocks on the latch, in flight.
+	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged)
+	select {
+	case <-up.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first re-list never started after notification #1")
+	}
+
+	// Notification #2 lands while the first re-list is still in flight: its
+	// expiry must only mark the upstream dirty, not start a parallel re-list.
+	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.relistMu.Lock()
+		st := r.relistStates["dyn"]
+		dirty := st != nil && st.dirty
+		r.relistMu.Unlock()
+		if dirty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second notification's expiry never marked the running re-list dirty")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Release the first re-list: it returns the already-stale v2; the dirty
+	// flag must immediately drive a second re-list, which returns v3 — and v3
+	// must be what the catalog converges to.
+	close(up.release)
+	waitForTool(t, r, "dyn__c", 5*time.Second)
+
+	// Let any (wrong) extra re-list surface before counting.
+	time.Sleep(300 * time.Millisecond)
+	if got := up.callCount(); got != 3 {
+		t.Errorf("ListTools called %d times total, want exactly 3 (Start's initial + 2 serialized re-lists)", got)
+	}
+	for _, ns := range []string{"dyn__a", "dyn__b"} {
+		if hasTool(r, ns) {
+			t.Errorf("stale catalog entry %q survived; final catalog must be v3 only: %+v", ns, r.Tools())
+		}
 	}
 }
 

@@ -52,30 +52,35 @@ const httpReadTimeout = 30 * time.Second
 const httpIdleTimeout = 120 * time.Second
 
 // httpWriteTimeoutSlack is added on top of the configured call_timeout to
-// size WriteTimeout: net/http.Server.WriteTimeout covers the whole handler,
-// not just the network write, so it must comfortably exceed the slowest
-// legitimate upstream call (bounded by call_timeout) plus the gateway's own
-// dispatch/auth overhead — otherwise a deliberately slow (but legitimate)
-// upstream tool call would be cut off before EffectiveCallTimeout ever fires.
+// size the per-request write deadline (handlePost): the deadline covers the
+// whole handler, not just the network write, so it must comfortably exceed
+// the slowest legitimate upstream call (bounded by call_timeout) plus the
+// gateway's own dispatch/auth overhead — otherwise a deliberately slow (but
+// legitimate) upstream tool call would be cut off before
+// EffectiveCallTimeout ever fires.
 const httpWriteTimeoutSlack = 10 * time.Second
 
+// httpServer reads auth_token and call_timeout through cfg on every request,
+// so a SIGHUP reload (which swaps the config inside Registry) takes effect
+// live — no transport rebuild needed. listen_addr is the deliberate
+// exception: the listener is bound once in Serve, so changing the
+// address/port still requires a full process restart (a known, accepted
+// limitation) — token rotation and timeout changes do not.
 type httpServer struct {
-	reg         *registry.Registry
-	log         *slog.Logger
-	d           *dispatcher
-	addr        string
-	authToken   string
-	callTimeout time.Duration
+	reg  *registry.Registry
+	log  *slog.Logger
+	d    *dispatcher
+	addr string
+	cfg  func() *config.Config
 }
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
 	return &httpServer{
-		reg:         reg,
-		log:         log,
-		d:           newDispatcher(reg, log, version, false), // HTTP is POST-only: no server→client channel
-		addr:        cfg.EffectiveListenAddr(),
-		authToken:   cfg.AuthToken,
-		callTimeout: cfg.EffectiveCallTimeout(),
+		reg:  reg,
+		log:  log,
+		d:    newDispatcher(reg, log, version, false), // HTTP is POST-only: no server→client channel
+		addr: cfg.EffectiveListenAddr(),
+		cfg:  reg.ConfigSnapshot,
 	}
 }
 
@@ -88,8 +93,13 @@ func (s *httpServer) buildServer(mux http.Handler) *http.Server {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       httpReadTimeout,
-		WriteTimeout:      s.callTimeout + httpWriteTimeoutSlack,
-		IdleTimeout:       httpIdleTimeout,
+		// WriteTimeout is deliberately 0: it is a static *http.Server field
+		// computed once at startup, so it could never follow a SIGHUP reload
+		// of call_timeout. handlePost instead sets a live per-request write
+		// deadline from the current config (call_timeout + slack) — the
+		// slow-client protection is preserved, but it now reacts to reload.
+		WriteTimeout: 0,
+		IdleTimeout:  httpIdleTimeout,
 	}
 }
 
@@ -113,7 +123,7 @@ func (s *httpServer) Serve(ctx context.Context) error {
 		return err
 	}
 
-	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", len(s.reg.Tools()))
+	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", s.reg.ToolCount())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -204,13 +214,29 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 // header when AuthToken is configured. Skipped entirely when AuthToken is empty
 // (loopback-only deployments). Uses constant-time comparison to prevent timing
 // attacks even though tokens are not cryptographic secrets in practice.
+//
+// The token is read from the live config snapshot on EVERY request, so
+// rotating auth_token via SIGHUP reload takes effect immediately: the old
+// token stops working and the new one is accepted without a restart.
 func (s *httpServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.authToken == "" {
+		// Per-request write deadline, in place of a static Server.WriteTimeout
+		// (see buildServer): sized from the CURRENT call_timeout so a SIGHUP
+		// reload takes effect on the next request. Set here, at the outermost
+		// wrapper for the server's only route, so it covers EVERY response —
+		// including the 401 below and handleMCP's own 403/405 — not just the
+		// happy path inside handlePost. The error is deliberately ignored —
+		// writers that don't support deadlines (httptest.ResponseRecorder in
+		// tests) return one, and a missing deadline must not fail the request.
+		_ = http.NewResponseController(w).SetWriteDeadline(
+			time.Now().Add(s.cfg().EffectiveCallTimeout() + httpWriteTimeoutSlack))
+
+		token := s.cfg().AuthToken
+		if token == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		want := "Bearer " + s.authToken
+		want := "Bearer " + token
 		got := r.Header.Get("Authorization")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
@@ -18,8 +17,8 @@ import (
 // prints a per-upstream OK/FAIL table. Unlike serve it never supervises or
 // auto-restarts anything: a flapping upstream must be REPORTED as it is, not
 // resurrected mid-diagnosis (Stage 8).
-func newDoctorCmd() *cobra.Command {
-	var configPath string
+func newDoctorCmd(version string) *cobra.Command {
+	var configPath *string
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check every enabled upstream once and report OK/FAIL per upstream",
@@ -28,17 +27,17 @@ func newDoctorCmd() *cobra.Command {
 			"failure reason. No auto-restart, no call logging: one pass, then exit. The exit\n" +
 			"code is non-zero if any upstream failed, so it is scriptable (CI, cron).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runDoctor(cmd, configPath)
+			return runDoctor(cmd, *configPath, version)
 		},
 	}
-	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file")
+	configPath = addConfigFlag(cmd)
 	return cmd
 }
 
-func runDoctor(cmd *cobra.Command, configPath string) error {
-	cfg, err := config.Load(configPath)
+func runDoctor(cmd *cobra.Command, configPath, version string) error {
+	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return err
 	}
 
 	logger := logging.New(cfg.LogLevel, os.Stderr)
@@ -47,7 +46,7 @@ func runDoctor(cmd *cobra.Command, configPath string) error {
 	// Registry.supervise). callLog=nil: doctor performs no tool calls, so there
 	// is nothing to audit; the payload log is the no-op (empty path never errors).
 	payloadLog, _ := logging.NewPayloadLog("")
-	reg := registry.New(cfg, logger, nil, payloadLog, false)
+	reg := registry.New(cfg, logger, nil, payloadLog, false, version)
 	defer func() { _ = reg.Close() }()
 
 	// Start's error for the all-upstreams-failed case is deliberately NOT

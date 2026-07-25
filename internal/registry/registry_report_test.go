@@ -13,8 +13,8 @@ import (
 // TestStartReportListsSuccessesAndFailures is the Stage 8 contract test for
 // StartReport: after Start, the report must carry one entry per enabled
 // upstream — successes with their tool count, failures with the same reason
-// text recordFailure captured — sorted by name (bringUp runs in parallel, so
-// sorting is the only way the order can be asserted at all).
+// text recordFailure captured — sorted by name (StartReport sorts its copy, so
+// the assertion does not depend on config order).
 func TestStartReportListsSuccessesAndFailures(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
 		{Name: "good", Enabled: true},
@@ -100,7 +100,7 @@ func TestNoSuperviseSkipsRestart(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), false)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

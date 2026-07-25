@@ -50,12 +50,15 @@ type InitializeResult struct {
 
 // Tool is one entry in a tools/list result.
 //
-// InputSchema/OutputSchema are RawMessage so the exact JSON Schema is proxied to
-// the client verbatim (same contract the upstream advertises).
+// Description and InputSchema/OutputSchema are RawMessage so the exact JSON is
+// proxied to the client verbatim (same contract the upstream advertises). For
+// Description a plain string would be re-normalized on remarshal — e.g. an
+// explicit `"description": ""` from an upstream would be dropped by omitempty —
+// while omitempty on a RawMessage fires only when the field was truly absent.
 type Tool struct {
 	Name         string          `json:"name"`
 	Title        string          `json:"title,omitempty"`
-	Description  string          `json:"description,omitempty"`
+	Description  json.RawMessage `json:"description,omitempty"`
 	InputSchema  json.RawMessage `json:"inputSchema,omitempty"`
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 	Annotations  json.RawMessage `json:"annotations,omitempty"`

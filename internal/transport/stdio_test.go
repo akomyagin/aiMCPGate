@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os/exec"
@@ -87,7 +88,7 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 // custom config or a call log.
 func startServerWithConfig(t *testing.T, cfg *config.Config, callLog logging.CallLog) (*fakeClient, context.CancelFunc, <-chan error) {
 	t.Helper()
-	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test")
 
 	clientToSrv, srvIn := io.Pipe() // client writes to srvIn side... (see below)
 	srvOut, clientFromSrv := io.Pipe()
@@ -508,6 +509,94 @@ func TestStdioClientDisconnectEndsServe(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Serve did not return after client disconnect")
+	}
+}
+
+// failingReader always fails with its configured error, simulating a client
+// stream whose scanner is permanently broken (e.g. a frame over the codec's
+// line limit) without generating gigabytes of input.
+type failingReader struct{ err error }
+
+func (r *failingReader) Read(p []byte) (int, error) { return 0, r.err }
+
+// oneUpstreamConfig builds the minimal single-fakeserver config the low-level
+// Serve tests need (Registry.Start fail-fasts on zero upstreams).
+func oneUpstreamConfig(t *testing.T) *config.Config {
+	t.Helper()
+	bin := buildFakeServer(t)
+	return &config.Config{Upstreams: []config.Upstream{
+		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_NAME":  "web",
+			"FAKE_TOOLS": "fetch",
+		}},
+	}}
+}
+
+// TestStdioFatalReadEndsServe: a PERMANENT reader error (mcp.ErrFatalRead —
+// the scanner never recovers, every retry fails identically) must terminate
+// Serve instead of busy-looping at 100% CPU on the same error forever.
+func TestStdioFatalReadEndsServe(t *testing.T) {
+	cfg := oneUpstreamConfig(t)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	in := &failingReader{err: errors.New("boom: client stream broken")}
+	srv := newStdioServer(cfg, reg, quietLogger(), "test", in, io.Discard)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned error on fatal read: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve busy-looped on a fatal reader error instead of returning")
+	}
+}
+
+// TestStdioBlockedWriteUnblocksOnCancel: when the client stops draining the
+// server's stdout (write to the pipe blocks forever), ctx cancellation
+// (SIGTERM/Ctrl-C) must still make Serve return — the write must not pin the
+// dispatch loop past shutdown.
+func TestStdioBlockedWriteUnblocksOnCancel(t *testing.T) {
+	cfg := oneUpstreamConfig(t)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+
+	clientToSrv, srvIn := io.Pipe() // client → server requests
+	// server → client: NOBODY ever reads outR, so the server's reply write
+	// physically blocks forever (io.Pipe is unbuffered and synchronous).
+	outR, outW := io.Pipe()
+	defer outR.Close() // unblocks the abandoned writer goroutine after the test
+
+	srv := newStdioServer(cfg, reg, quietLogger(), "test", clientToSrv, outW)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	// One valid request: its reply write blocks on the unread pipe.
+	w := mcp.NewWriter(srvIn)
+	if err := w.Write(mcp.NewRequest(mcp.IntID(1), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "0"},
+	}))); err != nil {
+		t.Fatalf("client write initialize: %v", err)
+	}
+
+	// Give Serve time to reach the blocked write, then request shutdown.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned error after cancel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve hung in a blocked client write after ctx cancellation")
 	}
 }
 

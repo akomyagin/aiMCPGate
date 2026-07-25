@@ -52,7 +52,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	}
 	defer func() { _ = s.reg.Close() }()
 
-	s.log.Info("stdio transport ready", "tools", len(s.reg.Tools()))
+	s.log.Info("stdio transport ready", "tools", s.reg.ToolCount())
 
 	// Subscribe to runtime catalog changes (Stage 7c): whenever an upstream is
 	// auto-restarted, sends its own list_changed, or the config is reloaded, the
@@ -97,7 +97,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				pendingListChanged = true
 				continue
 			}
-			if err := s.pushListChanged(); err != nil {
+			if err := s.pushListChanged(ctx); err != nil {
 				return nil
 			}
 		case fr, ok := <-frames:
@@ -107,8 +107,15 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 			}
 			if fr.err != nil {
 				// A single malformed line is not fatal: the codec resynchronizes
-				// on the next newline, so log and keep serving.
-				s.log.Warn("read client message", "err", fr.err)
+				// on the next newline, so log and keep serving. A fatal reader
+				// error (mcp.ErrFatalRead) is different — readFrames has already
+				// stopped and closed the channel, so the next receive here ends
+				// Serve; log it louder because the connection is dying.
+				if errors.Is(fr.err, mcp.ErrFatalRead) {
+					s.log.Error("client stream failed permanently", "err", fr.err)
+				} else {
+					s.log.Warn("read client message", "err", fr.err)
+				}
 				continue
 			}
 			isInitialize := fr.msg.IsRequest() && fr.msg.Method == mcp.MethodInitialize
@@ -116,8 +123,9 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 			if reply == nil {
 				continue // notification or ignored message: nothing to write
 			}
-			if err := s.w.Write(reply); err != nil {
-				// A write failure means the client pipe is gone — stop serving.
+			if err := s.writeOrBail(ctx, reply); err != nil {
+				// A write failure means the client pipe is gone (or ctx was
+				// cancelled mid-write) — stop serving.
 				s.log.Warn("write reply failed", "err", err)
 				return nil
 			}
@@ -128,7 +136,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				initialized = true
 				if pendingListChanged {
 					pendingListChanged = false
-					if err := s.pushListChanged(); err != nil {
+					if err := s.pushListChanged(ctx); err != nil {
 						return nil
 					}
 				}
@@ -141,12 +149,32 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 // client. Writes to s.w are serialized by mcp.Writer's own mutex, so this is
 // safe alongside the reply writes in Serve. A write failure means the client
 // pipe is gone — the caller stops serving (same as a failed reply).
-func (s *stdioServer) pushListChanged() error {
-	if err := s.w.Write(mcp.NewNotification(mcp.NotifToolsListChanged, nil)); err != nil {
+func (s *stdioServer) pushListChanged(ctx context.Context) error {
+	if err := s.writeOrBail(ctx, mcp.NewNotification(mcp.NotifToolsListChanged, nil)); err != nil {
 		s.log.Warn("write list_changed failed", "err", err)
 		return err
 	}
 	return nil
+}
+
+// writeOrBail writes msg to the client but gives up when ctx is cancelled.
+// s.w.Write is a plain blocking write: if the client stops draining its end of
+// the pipe (full OS pipe buffer), the write hangs forever and — without this
+// helper — SIGTERM/Ctrl-C (ctx cancellation) could never unblock Serve. The
+// write runs in a short-lived goroutine; on cancellation that goroutine leaks
+// until its Write eventually returns, which is acceptable: the same cancelled
+// ctx is already shutting the whole process down. The result channel is
+// buffered (cap 1) so the abandoned writer can deposit its error and exit
+// instead of blocking on the send forever.
+func (s *stdioServer) writeOrBail(ctx context.Context, msg *mcp.Message) error {
+	done := make(chan error, 1)
+	go func() { done <- s.w.Write(msg) }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
 }
 
 // readResult carries one decoded frame or a per-line decode error from the
@@ -157,8 +185,11 @@ type readResult struct {
 }
 
 // readFrames reads framed client messages and pushes them onto frames until the
-// stream ends (EOF), then closes the channel. A decode error for one line is
-// forwarded (non-fatal, the stream stays framed); EOF closes the channel.
+// stream ends (EOF) or the reader fails permanently, then closes the channel.
+// A decode error for one line is forwarded (non-fatal, the stream stays framed)
+// and reading continues; a fatal reader error (mcp.ErrFatalRead — the scanner
+// is permanently broken and every retry would fail the same way) is forwarded
+// once and ends the loop, otherwise this would busy-loop at 100% CPU.
 func (s *stdioServer) readFrames(frames chan<- readResult) {
 	defer close(frames)
 	for {
@@ -168,6 +199,9 @@ func (s *stdioServer) readFrames(frames chan<- readResult) {
 				return
 			}
 			frames <- readResult{err: err}
+			if errors.Is(err, mcp.ErrFatalRead) {
+				return
+			}
 			continue
 		}
 		frames <- readResult{msg: msg}

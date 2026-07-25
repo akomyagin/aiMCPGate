@@ -41,7 +41,7 @@ func TestReloadAddsAndRemovesUpstreams(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base("alpha", "a")},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestReloadChangedUpstreamRelaunches(t *testing.T) {
 			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{up},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestReloadDisabledUpstreamRemoved(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{on, stay},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestReloadNotifiesSubscribers(t *testing.T) {
 			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "1"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestReloadRetiredSupervisorDoesNotRestart(t *testing.T) {
 			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestReloadRemovedUpstreamNotResurrectedByRestart(t *testing.T) {
 			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestReloadChangedUpstreamNotDoubledByRestart(t *testing.T) {
 			}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestReloadUpdatesRestartPolicyForUnchangedUpstream(t *testing.T) {
 		},
 		Upstreams: []config.Upstream{up},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestReloadParallelBringUpManyUpstreams(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestReloadRemovedFreedNameReusedByAdded(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{first},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestReloadParallelMergeOrderDeterministic(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -669,7 +669,7 @@ func TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch(t *testing.T) 
 			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -772,7 +772,7 @@ func TestRelistStaleResultDiscardedAfterReloadRemoved(t *testing.T) {
 			{Name: "keep", Enabled: true},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
 		switch u.Name {
 		case "dyn":
@@ -842,7 +842,7 @@ func TestRelistStaleResultDiscardedAfterReloadChanged(t *testing.T) {
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{{Name: "dyn", Enabled: true}},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	var startMu sync.Mutex
 	dynLaunches := 0
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
@@ -939,7 +939,7 @@ func TestReloadRemovedUpstreamNotResurrectedByStaleRelist(t *testing.T) {
 			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -1015,7 +1015,7 @@ func TestReloadDisablesRunningSupervisor(t *testing.T) {
 		},
 		Upstreams: []config.Upstream{up},
 	}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

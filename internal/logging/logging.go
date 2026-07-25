@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,7 +46,6 @@ type CallRecord struct {
 	Upstream string        `json:"upstream"` // which upstream served the call
 	Method   string        `json:"method"`   // JSON-RPC method, e.g. "tools/call"
 	Tool     string        `json:"tool"`     // tool/resource name, if applicable
-	Client   string        `json:"client"`   // client identity (Phase 2 access policy)
 	Duration time.Duration `json:"duration_ns"`
 	OK       bool          `json:"ok"`
 	Err      string        `json:"error,omitempty"` // sanitized error, no secrets
@@ -72,29 +72,29 @@ type CallLog interface {
 // under mu) rather than relying on the OS silently rejecting a write to a
 // closed file. Draining such late records gracefully is a deeper lifecycle
 // concern deliberately out of scope here — the flag just makes the loss cheap
-// (no marshal, no syscall) and intentional.
+// (no syscall) and intentional.
 type jsonLog[T any] struct {
 	mu     sync.Mutex
 	w      io.Writer
 	closer io.Closer // non-nil only when we opened a file we own
 	closed bool      // set by Close (under mu); Record becomes a no-op after
-	stamp  func(*T)  // fills a zero timestamp with time.Now(); set by the constructor
 }
 
+// Record marshals r and appends it as one JSON line. The record's Time is the
+// caller's responsibility: Record never stamps it (registry.audit passes the
+// call start, recordPayload passes time.Now()). Marshaling happens outside the
+// mutex — r is a local copy, so concurrent Records only serialize on the write.
 func (l *jsonLog[T]) Record(r T) {
-	if l.stamp != nil {
-		l.stamp(&r)
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		return // dropped explicitly: no marshal, no write to a closed file
-	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return // records are normally marshalable; ignore defensively
 	}
 	b = append(b, '\n')
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return // dropped explicitly: no write to a closed file
+	}
 	_, _ = l.w.Write(b)
 }
 
@@ -116,18 +116,6 @@ type (
 	jsonPayloadLog = jsonLog[PayloadRecord]
 )
 
-func stampCall(r *CallRecord) {
-	if r.Time.IsZero() {
-		r.Time = time.Now()
-	}
-}
-
-func stampPayload(r *PayloadRecord) {
-	if r.Time.IsZero() {
-		r.Time = time.Now()
-	}
-}
-
 // openAppendFile opens path for append (creating it if missing) with 0600 —
 // the shared file-opening contract for both the audit log and the payload
 // debug log: callers only differ in what error-message prefix to use.
@@ -143,26 +131,28 @@ func openAppendFile(path string) (*os.File, error) {
 // stderr; otherwise the file is opened for append (created if missing).
 func NewCallLog(logFile string) (CallLog, error) {
 	if logFile == "" {
-		return &jsonCallLog{w: os.Stderr, stamp: stampCall}, nil
+		return &jsonCallLog{w: os.Stderr}, nil
 	}
 	f, err := openAppendFile(logFile)
 	if err != nil {
 		return nil, fmt.Errorf("open call log %q: %w", logFile, err)
 	}
-	return &jsonCallLog{w: f, closer: f, stamp: stampCall}, nil
+	return &jsonCallLog{w: f, closer: f}, nil
 }
 
 // NewCallLogWriter builds a call log over an arbitrary writer (used in tests).
 func NewCallLogWriter(w io.Writer) CallLog {
-	return &jsonCallLog{w: w, stamp: stampCall}
+	return &jsonCallLog{w: w}
 }
 
 // PayloadRecord is one entry of the OPT-IN payload debug log — the full
 // arguments and result of a tool call. Unlike CallRecord (metadata only), this
-// deliberately carries the raw request/response bodies, which may contain
-// secrets; it exists strictly for debugging and is off by default (SKILL §6,
-// Stage 10). Arguments/Result are json.RawMessage so payloads pass through
-// verbatim; a nil raw message is emitted as JSON null.
+// deliberately carries the raw request/response bodies; it exists strictly for
+// debugging and is off by default (SKILL §6, Stage 10). Arguments/Result are
+// json.RawMessage so payloads pass through verbatim — except that the writer
+// (registry.recordPayload) runs both through MaskSecrets first, so top-level
+// secret-looking fields never hit disk. A nil raw message is emitted as JSON
+// null.
 type PayloadRecord struct {
 	Time      time.Time       `json:"time"`
 	Upstream  string          `json:"upstream"`
@@ -173,6 +163,49 @@ type PayloadRecord struct {
 	Result    json.RawMessage `json:"result,omitempty"`
 	Err       string          `json:"error,omitempty"`
 	ErrorData json.RawMessage `json:"error_data,omitempty"` // JSON-RPC error.data, if the upstream sent one
+}
+
+// secretKeyMarkers flag a top-level JSON key as secret-carrying when the key
+// name contains one of them (case-insensitive). The list follows the kinds of
+// values the config layer documents as secrets — auth_token, Authorization
+// headers, upstream env entries holding API keys (config.go, SKILL §6).
+var secretKeyMarkers = []string{"token", "secret", "password", "key", "authorization"}
+
+// maskedValue is what a secret-carrying field's value becomes in the payload log.
+var maskedValue = json.RawMessage(`"***"`)
+
+// MaskSecrets returns raw with the values of secret-looking top-level object
+// keys (per secretKeyMarkers) replaced by "***", leaving every other field
+// intact. This is the SKILL §6 masking pass for the opt-in payload debug log.
+// It is deliberately a shallow, best-effort guard: only a top-level walk over
+// a JSON object — nested objects are not descended into, and anything that is
+// not a JSON object (array, scalar, null, malformed) is returned unchanged
+// rather than second-guessed. If nothing matched, raw is returned as-is, byte
+// for byte.
+func MaskSecrets(raw json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return raw // not a JSON object (or JSON null) — pass through verbatim
+	}
+	masked := false
+	for k := range obj {
+		lower := strings.ToLower(k)
+		for _, marker := range secretKeyMarkers {
+			if strings.Contains(lower, marker) {
+				obj[k] = maskedValue
+				masked = true
+				break
+			}
+		}
+	}
+	if !masked {
+		return raw // keep the original bytes (and key order) untouched
+	}
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return raw // unreachable in practice: obj came from valid JSON
+	}
+	return b
 }
 
 // PayloadLog persists PayloadRecords. Implementations must be safe for
@@ -201,12 +234,12 @@ func NewPayloadLog(path string) (PayloadLog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open payload log %q: %w", path, err)
 	}
-	return &jsonPayloadLog{w: f, closer: f, stamp: stampPayload}, nil
+	return &jsonPayloadLog{w: f, closer: f}, nil
 }
 
 // NewPayloadLogWriter builds a payload log over an arbitrary writer (tests).
 func NewPayloadLogWriter(w io.Writer) PayloadLog {
-	return &jsonPayloadLog{w: w, stamp: stampPayload}
+	return &jsonPayloadLog{w: w}
 }
 
 // ReadRecords decodes CallRecords from a JSON-lines stream (the format

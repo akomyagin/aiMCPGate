@@ -15,7 +15,6 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 )
 
@@ -86,6 +85,15 @@ func (m *Message) IsRequest() bool {
 	return !isNullID(m.ID) && m.Method != "" && !m.IsResponse()
 }
 
+// IsMalformedHybrid reports whether m carries both a method (request/
+// notification shape) and a result or error (response shape) — a shape
+// JSON-RPC 2.0 does not allow. All three message classifiers (the client
+// dispatcher, the demo stub, the upstream reader) must agree on rejecting
+// this, so the check lives once, here.
+func (m *Message) IsMalformedHybrid() bool {
+	return m.Method != "" && m.IsResponse()
+}
+
 // isNullID reports whether a raw ID is absent or the JSON literal null. Any
 // surrounding whitespace is tolerated.
 func isNullID(raw json.RawMessage) bool {
@@ -109,8 +117,16 @@ func NewResult(id json.RawMessage, result json.RawMessage) *Message {
 	return &Message{JSONRPC: Version, ID: id, Result: result}
 }
 
-// NewError builds an error response echoing id.
+// NewError builds an error response echoing id. Per JSON-RPC 2.0 an error
+// response MUST carry an id; when the original id is unknown (nil/absent —
+// e.g. the request was malformed and never parsed) it MUST be the literal
+// null, so an empty id is normalized to json "null" here. A non-empty
+// RawMessage("null") survives the struct's omitempty and marshals as
+// "id":null instead of dropping the field.
 func NewError(id json.RawMessage, code int, message string, data json.RawMessage) *Message {
+	if len(bytes.TrimSpace(id)) == 0 {
+		id = json.RawMessage("null")
+	}
 	return &Message{JSONRPC: Version, ID: id, Error: &Error{Code: code, Message: message, Data: data}}
 }
 
@@ -119,6 +135,3 @@ func NewError(id json.RawMessage, code int, message string, data json.RawMessage
 func IntID(n int64) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf("%d", n))
 }
-
-// ErrEmptyMessage is returned by decoders for a blank/whitespace-only line.
-var ErrEmptyMessage = errors.New("mcp: empty message")

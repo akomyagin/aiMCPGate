@@ -37,7 +37,7 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -192,12 +192,25 @@ func TestHTTPServerParseErrorReturns400(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	msg := decodeBody(t, resp)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed body HTTP status = %d, want 400", resp.StatusCode)
 	}
+	var msg mcp.Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
 	if msg.Error == nil || msg.Error.Code != mcp.CodeParseError {
 		t.Fatalf("want parse error, got %+v", msg.Error)
+	}
+	// JSON-RPC 2.0: when the request id could not be determined the error
+	// response MUST carry the literal "id":null — not omit the field.
+	if !strings.Contains(string(body), `"id":null`) {
+		t.Fatalf("parse-error response must contain %q, got: %s", `"id":null`, body)
 	}
 }
 
@@ -215,11 +228,11 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 	cases := []struct {
 		name   string
 		raw    string
-		wantID string // raw id echoed in the error response ("" = omitted)
+		wantID string // raw id echoed in the error response (null when it had none)
 	}{
 		{"int id", `{"jsonrpc":"2.0","id":1,"method":"tools/list","result":{}}`, "1"},
 		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list","result":{}}`, "null"},
-		{"absent id", `{"jsonrpc":"2.0","method":"tools/list","result":{}}`, ""},
+		{"absent id", `{"jsonrpc":"2.0","method":"tools/list","result":{}}`, "null"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,7 +250,7 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 				t.Fatalf("want invalid-request error (-32600), got %+v", msg.Error)
 			}
 			if string(msg.ID) != tc.wantID {
-				t.Fatalf("error response id = %q, want %q (echo the hybrid's own id, null/omitted when it had none)", msg.ID, tc.wantID)
+				t.Fatalf("error response id = %q, want %q (echo the hybrid's own id, null when it had none)", msg.ID, tc.wantID)
 			}
 		})
 	}
@@ -257,7 +270,7 @@ func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, fun
 			}},
 		},
 	}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true)
+	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	if err := reg.Start(context.Background()); err != nil {
 		t.Fatalf("registry Start: %v", err)
 	}
@@ -400,9 +413,14 @@ func TestHTTPServerOriginCheck(t *testing.T) {
 // used to set only ReadHeaderTimeout, leaving the body-read phase and idle
 // keep-alive connections unbounded — a slow-body/slowloris-style DoS vector
 // once listen_addr is widened past loopback (found by code review).
+//
+// WriteTimeout is checked in TestBuildServerHasNoStaticWriteTimeout: it used
+// to be call_timeout + slack computed once at startup, but that could never
+// follow a SIGHUP reload of call_timeout, so slow-client protection moved to
+// a live per-request write deadline in handlePost.
 func TestHTTPServerTimeoutsConfigured(t *testing.T) {
 	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
-	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true), quietLogger(), "test")
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test"), quietLogger(), "test")
 	srv := hs.buildServer(http.NewServeMux())
 
 	if srv.ReadHeaderTimeout <= 0 {
@@ -414,15 +432,61 @@ func TestHTTPServerTimeoutsConfigured(t *testing.T) {
 	if srv.IdleTimeout <= 0 {
 		t.Error("IdleTimeout must be set")
 	}
-	// WriteTimeout covers the whole handler (net/http docs), not just the
-	// network write, so it must comfortably exceed the configured
-	// call_timeout — otherwise a legitimate slow upstream call gets cut off
-	// before EffectiveCallTimeout ever has a chance to fire.
-	wantWrite := cfg.CallTimeout + httpWriteTimeoutSlack
-	if srv.WriteTimeout != wantWrite {
-		t.Errorf("WriteTimeout = %v, want %v (call_timeout + slack)", srv.WriteTimeout, wantWrite)
+}
+
+// TestBuildServerHasNoStaticWriteTimeout pins the reload-aware timeout
+// design: buildServer must NOT bake call_timeout into the static
+// Server.WriteTimeout (it is computed once and would ignore SIGHUP reloads).
+// The per-request deadline handlePost sets from the live config replaces it.
+func TestBuildServerHasNoStaticWriteTimeout(t *testing.T) {
+	cfg := &config.Config{Transport: config.TransportHTTP, CallTimeout: 45 * time.Second}
+	hs := newHTTPServer(cfg, registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test"), quietLogger(), "test")
+	srv := hs.buildServer(http.NewServeMux())
+
+	if srv.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %v, want 0 (slow-client protection is the live per-request deadline in handlePost, not a static field)", srv.WriteTimeout)
 	}
-	if srv.WriteTimeout <= cfg.CallTimeout {
-		t.Errorf("WriteTimeout (%v) must exceed call_timeout (%v), or legitimate slow calls get cut off first", srv.WriteTimeout, cfg.CallTimeout)
+}
+
+// TestAuthMiddlewareReadsLiveConfig verifies the SIGHUP-reload fix for token
+// rotation: authMiddleware must read auth_token from the config function on
+// every request, so swapping the config (as Registry.Reload does behind its
+// atomic pointer) immediately invalidates the old token and accepts the new
+// one — without rebuilding the transport.
+func TestAuthMiddlewareReadsLiveConfig(t *testing.T) {
+	current := &config.Config{AuthToken: "A"}
+	hs := &httpServer{
+		log: quietLogger(),
+		cfg: func() *config.Config { return current },
+	}
+	handler := hs.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	do := func(token string) int {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// Config says token A: A passes, B is rejected.
+	if got := do("A"); got != http.StatusOK {
+		t.Fatalf("token A before rotation: status = %d, want 200", got)
+	}
+	if got := do("B"); got != http.StatusUnauthorized {
+		t.Fatalf("token B before rotation: status = %d, want 401", got)
+	}
+
+	// Rotate the token by swapping what cfg() returns — no server rebuild,
+	// exactly what a SIGHUP reload does to the Registry's config pointer.
+	current = &config.Config{AuthToken: "B"}
+
+	if got := do("A"); got != http.StatusUnauthorized {
+		t.Fatalf("token A after rotation: status = %d, want 401 (old token must stop working)", got)
+	}
+	if got := do("B"); got != http.StatusOK {
+		t.Fatalf("token B after rotation: status = %d, want 200 (new token must work without restart)", got)
 	}
 }

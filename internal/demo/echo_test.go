@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -192,6 +193,34 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+// failingReader always fails with its configured error, simulating a stdin
+// whose scanner is permanently broken (e.g. a frame over the codec's line
+// limit) without generating gigabytes of input.
+type failingReader struct{ err error }
+
+func (r *failingReader) Read(p []byte) (int, error) { return 0, r.err }
+
+// TestServeStopsOnFatalReadError: a PERMANENT reader error (mcp.ErrFatalRead —
+// every retry fails identically) must end serve with that error instead of
+// busy-looping at 100% CPU on `continue`. Only per-line decode errors are
+// retryable.
+func TestServeStopsOnFatalReadError(t *testing.T) {
+	r := mcp.NewReader(&failingReader{err: errors.New("boom: stdin broken")})
+	w := mcp.NewWriter(&bytes.Buffer{})
+
+	done := make(chan error, 1)
+	go func() { done <- serve(r, w, "v") }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, mcp.ErrFatalRead) {
+			t.Fatalf("serve returned %v, want an error wrapping mcp.ErrFatalRead", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve busy-looped on a fatal reader error instead of returning")
 	}
 }
 

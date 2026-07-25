@@ -17,6 +17,7 @@ package demo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
@@ -74,17 +75,22 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, version string)
 }
 
 // serve is the sequential request loop: read one framed message, answer it.
-// Only EOF ends the loop; a single corrupt line yields a parse error but does
-// not desynchronize the stream (mcp.Reader's contract), so the loop keeps
+// EOF ends the loop cleanly; a single corrupt line yields a parse error but
+// does not desynchronize the stream (mcp.Reader's contract), so the loop keeps
 // serving subsequent lines — same policy as the gateway's own transport layer
 // (internal/transport/stdio.go). Being a minimal stub with no logger, it
-// skips the bad line silently.
+// skips the bad line silently. A fatal reader error (mcp.ErrFatalRead — the
+// scanner is permanently broken, every retry fails identically) ends the loop
+// with that error instead: retrying it would busy-loop at 100% CPU.
 func serve(r *mcp.Reader, w *mcp.Writer, version string) error {
 	for {
 		msg, err := r.Read()
 		if err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			if errors.Is(err, mcp.ErrFatalRead) {
+				return err
 			}
 			continue // one bad line — keep reading the next
 		}
@@ -104,7 +110,7 @@ func handle(msg *mcp.Message, version string) *mcp.Message {
 	// (response shape) — must be answered with an explicit invalid-request
 	// error, not silently dropped (same check as the gateway's own dispatcher,
 	// internal/transport/dispatch.go).
-	if msg.Method != "" && msg.IsResponse() {
+	if msg.IsMalformedHybrid() {
 		return mcp.NewError(msg.ID, mcp.CodeInvalidRequest,
 			"message is not a valid request: carries both a method and a result/error", nil)
 	}
@@ -130,12 +136,12 @@ func handle(msg *mcp.Message, version string) *mcp.Message {
 		result := mcp.ToolsListResult{Tools: []mcp.Tool{
 			{
 				Name:        "echo",
-				Description: "Echo the given text back verbatim.",
+				Description: json.RawMessage(`"Echo the given text back verbatim."`),
 				InputSchema: echoInputSchema,
 			},
 			{
 				Name:        "ping",
-				Description: "Health check: always returns \"pong\".",
+				Description: json.RawMessage(`"Health check: always returns \"pong\"."`),
 				InputSchema: pingInputSchema,
 			},
 		}}

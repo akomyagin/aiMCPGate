@@ -4,10 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 )
+
+// ErrFatalRead marks a Reader error as PERMANENT: the underlying bufio.Scanner
+// has errored (e.g. bufio.ErrTooLong, or an I/O error from the stream) and every
+// subsequent Read will fail the same way. Callers that retry per-frame decode
+// errors MUST check errors.Is(err, ErrFatalRead) and stop reading instead of
+// looping — retrying a fatal error is a busy-loop. Per-line decode errors (bad
+// JSON in a well-framed line) do NOT carry this sentinel and are retryable.
+var ErrFatalRead = errors.New("mcp: reader failed permanently")
 
 // maxLineBytes bounds a single framed message. MCP stdio framing is one JSON
 // message per line; the default bufio.Scanner token limit (64 KiB) is too small
@@ -45,19 +54,22 @@ func NewReader(r io.Reader) *Reader {
 // yields a parse error but does not desynchronize the stream — the caller may
 // keep reading subsequent lines.
 //
-// A frame exceeding maxLineBytes (bufio.ErrTooLong) is different: it is a fatal
+// A scanner error (e.g. a frame exceeding maxLineBytes — bufio.ErrTooLong — or
+// an I/O error from the underlying stream) is different: it is a fatal
 // transport error for THIS connection — bufio.Scanner cannot recover from it,
-// so every subsequent Read fails too. The caller (the stdio reader loop in
-// internal/upstream) treats any such error like a dead stream: it tears the
-// connection down (done channel closes, pending calls fail), and the registry's
-// auto-restart supervisor — when enabled — relaunches the upstream fresh. That
-// "tear down and relaunch" is the intended recovery path, not per-scanner
-// resynchronization, which bufio.Scanner does not support.
+// so every subsequent Read fails too. Such errors are wrapped with ErrFatalRead
+// so callers can distinguish them (errors.Is) from retryable per-line decode
+// errors. The caller (the stdio reader loop in internal/upstream) treats any
+// such error like a dead stream: it tears the connection down (done channel
+// closes, pending calls fail), and the registry's auto-restart supervisor —
+// when enabled — relaunches the upstream fresh. That "tear down and relaunch"
+// is the intended recovery path, not per-scanner resynchronization, which
+// bufio.Scanner does not support.
 func (r *Reader) Read() (*Message, error) {
 	for {
 		if !r.sc.Scan() {
 			if err := r.sc.Err(); err != nil {
-				return nil, fmt.Errorf("mcp: read frame: %w", err)
+				return nil, fmt.Errorf("mcp: read frame: %w: %w", ErrFatalRead, err)
 			}
 			return nil, io.EOF
 		}
@@ -83,62 +95,49 @@ func decodeLine(line []byte) (*Message, error) {
 	return &m, nil
 }
 
-// Decode parses a single framed line (without the trailing newline) into a
-// Message. Useful for tests and callers that already have line boundaries.
-func Decode(line []byte) (*Message, error) {
-	t := bytes.TrimSpace(line)
-	if len(t) == 0 {
-		return nil, ErrEmptyMessage
-	}
-	return decodeLine(t)
-}
-
 // Writer encodes MCP messages as newline-delimited JSON to an underlying stream.
 //
 // Writes are serialized by a mutex: many upstream calls run on separate
 // goroutines and concurrent writes to one stdin would interleave bytes.
 type Writer struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu  sync.Mutex
+	enc *json.Encoder
 }
 
 // NewWriter wraps w with MCP framing and write serialization.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w}
+	return &Writer{enc: json.NewEncoder(w)}
 }
 
 // Write encodes m as one line (json + '\n') and writes it atomically w.r.t.
-// other Write calls on the same Writer.
+// other Write calls on the same Writer. json.Encoder appends the '\n' frame
+// delimiter inside its own (pooled) buffer and emits the whole frame as one
+// underlying Write — no extra copy, no partial frame.
 //
-// json.Marshal escapes control characters (including any '\n' inside string
-// values) as \uXXXX / \n escapes, so the encoded body is guaranteed single-line;
-// the appended '\n' is purely the frame delimiter.
+// The encoder escapes control characters (including any '\n' inside string
+// values) as \uXXXX / \n escapes, so the encoded body is guaranteed
+// single-line; the trailing '\n' is purely the frame delimiter.
 func (w *Writer) Write(m *Message) error {
 	if m.JSONRPC == "" {
 		m.JSONRPC = Version
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return fmt.Errorf("mcp: marshal message: %w", err)
-	}
-	b = append(b, '\n')
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := w.w.Write(b); err != nil {
+	if err := w.enc.Encode(m); err != nil {
 		return fmt.Errorf("mcp: write frame: %w", err)
 	}
 	return nil
 }
 
-// Encode renders m as a single framed line (json + '\n'). Test/helper convenience.
+// Encode renders m as a single framed line (json + '\n'). Used where a whole
+// frame is needed as a byte slice (HTTP request bodies) and in tests.
 func Encode(m *Message) ([]byte, error) {
 	if m.JSONRPC == "" {
 		m.JSONRPC = Version
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(m); err != nil {
 		return nil, fmt.Errorf("mcp: marshal message: %w", err)
 	}
-	return append(b, '\n'), nil
+	return buf.Bytes(), nil
 }
