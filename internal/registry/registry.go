@@ -273,6 +273,12 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 // New. Callers get a consistent pointer even while Reload swaps the config.
 func (r *Registry) config() *config.Config { return r.cfg.Load() }
 
+// ConfigSnapshot returns the current config, safe to call from any goroutine.
+// It exists so other components (the HTTP transport) can read live config
+// values (e.g. after a SIGHUP reload) without duplicating the atomic-pointer
+// plumbing Registry already has.
+func (r *Registry) ConfigSnapshot() *config.Config { return r.config() }
+
 // startUpstream is the production starter: it dispatches to the stdio or HTTP
 // implementation based on the upstream's resolved kind. Both return an
 // *upstream.Conn, so the registry treats them uniformly from here on
