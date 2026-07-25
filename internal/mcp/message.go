@@ -15,7 +15,6 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 )
 
@@ -127,6 +126,3 @@ func NewError(id json.RawMessage, code int, message string, data json.RawMessage
 func IntID(n int64) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf("%d", n))
 }
-
-// ErrEmptyMessage is returned by decoders for a blank/whitespace-only line.
-var ErrEmptyMessage = errors.New("mcp: empty message")

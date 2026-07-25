@@ -95,62 +95,49 @@ func decodeLine(line []byte) (*Message, error) {
 	return &m, nil
 }
 
-// Decode parses a single framed line (without the trailing newline) into a
-// Message. Useful for tests and callers that already have line boundaries.
-func Decode(line []byte) (*Message, error) {
-	t := bytes.TrimSpace(line)
-	if len(t) == 0 {
-		return nil, ErrEmptyMessage
-	}
-	return decodeLine(t)
-}
-
 // Writer encodes MCP messages as newline-delimited JSON to an underlying stream.
 //
 // Writes are serialized by a mutex: many upstream calls run on separate
 // goroutines and concurrent writes to one stdin would interleave bytes.
 type Writer struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu  sync.Mutex
+	enc *json.Encoder
 }
 
 // NewWriter wraps w with MCP framing and write serialization.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w}
+	return &Writer{enc: json.NewEncoder(w)}
 }
 
 // Write encodes m as one line (json + '\n') and writes it atomically w.r.t.
-// other Write calls on the same Writer.
+// other Write calls on the same Writer. json.Encoder appends the '\n' frame
+// delimiter inside its own (pooled) buffer and emits the whole frame as one
+// underlying Write — no extra copy, no partial frame.
 //
-// json.Marshal escapes control characters (including any '\n' inside string
-// values) as \uXXXX / \n escapes, so the encoded body is guaranteed single-line;
-// the appended '\n' is purely the frame delimiter.
+// The encoder escapes control characters (including any '\n' inside string
+// values) as \uXXXX / \n escapes, so the encoded body is guaranteed
+// single-line; the trailing '\n' is purely the frame delimiter.
 func (w *Writer) Write(m *Message) error {
 	if m.JSONRPC == "" {
 		m.JSONRPC = Version
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return fmt.Errorf("mcp: marshal message: %w", err)
-	}
-	b = append(b, '\n')
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := w.w.Write(b); err != nil {
+	if err := w.enc.Encode(m); err != nil {
 		return fmt.Errorf("mcp: write frame: %w", err)
 	}
 	return nil
 }
 
-// Encode renders m as a single framed line (json + '\n'). Test/helper convenience.
+// Encode renders m as a single framed line (json + '\n'). Used where a whole
+// frame is needed as a byte slice (HTTP request bodies) and in tests.
 func Encode(m *Message) ([]byte, error) {
 	if m.JSONRPC == "" {
 		m.JSONRPC = Version
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(m); err != nil {
 		return nil, fmt.Errorf("mcp: marshal message: %w", err)
 	}
-	return append(b, '\n'), nil
+	return buf.Bytes(), nil
 }

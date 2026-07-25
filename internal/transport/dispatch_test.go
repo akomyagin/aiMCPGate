@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
@@ -11,11 +12,11 @@ import (
 // any decode error — these tests exercise dispatch classification, not framing.
 func mustDecode(t *testing.T, line string) *mcp.Message {
 	t.Helper()
-	m, err := mcp.Decode([]byte(line))
-	if err != nil {
+	var m mcp.Message
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
 		t.Fatalf("decode %s: %v", line, err)
 	}
-	return m
+	return &m
 }
 
 // The classification tests below never reach a method handler, so the

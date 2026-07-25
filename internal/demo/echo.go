@@ -136,12 +136,12 @@ func handle(msg *mcp.Message, version string) *mcp.Message {
 		result := mcp.ToolsListResult{Tools: []mcp.Tool{
 			{
 				Name:        "echo",
-				Description: "Echo the given text back verbatim.",
+				Description: json.RawMessage(`"Echo the given text back verbatim."`),
 				InputSchema: echoInputSchema,
 			},
 			{
 				Name:        "ping",
-				Description: "Health check: always returns \"pong\".",
+				Description: json.RawMessage(`"Health check: always returns \"pong\"."`),
 				InputSchema: pingInputSchema,
 			},
 		}}

@@ -10,6 +10,17 @@ import (
 	"testing"
 )
 
+// decode is a test-only helper mirroring what Reader.Read does with one framed
+// line: trim, reject blank input, then parse via decodeLine. It exists so the
+// table tests below can feed single lines without spinning up a Reader.
+func decode(line []byte) (*Message, error) {
+	t := bytes.TrimSpace(line)
+	if len(t) == 0 {
+		return nil, errors.New("empty message")
+	}
+	return decodeLine(t)
+}
+
 func TestDecodeClassifies(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -59,9 +70,9 @@ func TestDecodeClassifies(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			m, err := Decode([]byte(tc.line))
+			m, err := decode([]byte(tc.line))
 			if err != nil {
-				t.Fatalf("Decode: %v", err)
+				t.Fatalf("decode: %v", err)
 			}
 			if got := m.IsRequest(); got != tc.wantRequest {
 				t.Errorf("IsRequest=%v want %v", got, tc.wantRequest)
@@ -94,7 +105,7 @@ func TestDecodeErrors(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Decode([]byte(tc.line)); err == nil {
+			if _, err := decode([]byte(tc.line)); err == nil {
 				t.Fatalf("expected error, got nil")
 			}
 		})
