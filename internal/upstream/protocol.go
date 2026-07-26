@@ -313,6 +313,26 @@ func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Messa
 	return c.transport.call(ctx, mcp.MethodCompletionComplete, params)
 }
 
+// RespondUpstreamRequest writes msg — a response to a request the UPSTREAM
+// itself initiated (elicitation/create, Round 14) — into the upstream's stdin.
+// msg.ID must already be the upstream's ORIGINAL request id (the registry
+// rewrites it back from the gateway-minted client-facing id before calling).
+//
+// Only the stdio transport supports server-initiated requests today; for an
+// HTTP upstream this returns an explicit error instead of silently dropping —
+// the caller logs it and the upstream simply times out on its own answer,
+// which is the documented out-of-scope behaviour of Round 14. A type assertion
+// rather than a transport-interface method, same rationale as
+// setNegotiatedVersion above: the shared interface is not widened for the need
+// of exactly one transport.
+func (c *Conn) RespondUpstreamRequest(msg *mcp.Message) error {
+	st, ok := c.transport.(*stdioTransport)
+	if !ok {
+		return fmt.Errorf("upstream %q: responding to an upstream-initiated request is not supported for this transport", c.Name())
+	}
+	return st.respond(msg)
+}
+
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name expected by the upstream. meta is the client's
 // optional `_meta` object (progressToken etc.), forwarded verbatim — nil when

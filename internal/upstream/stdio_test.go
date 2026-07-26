@@ -52,7 +52,7 @@ func TestStdioConnHandshakeAndCatalog(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "github", bin, nil,
-		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"}, "0.0.0-test", nil)
+		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestStdioConnCallToolEcho(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "web", bin, nil,
-		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "fs", bin, nil,
-		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 
 func TestStdioConnMissingCommand(t *testing.T) {
 	ctx := context.Background()
-	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil, "0.0.0-test", nil)
+	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil, "0.0.0-test", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for missing command")
 	}
@@ -169,7 +169,7 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 	// not hang.
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 	conn, err := upstream.StartStdio(ctx, logger, "z", bin, nil, []string{
 		"FAKE_TOOLS=t",
 		"FAKE_STDERR_LINES=" + strconv.Itoa(lines),
-	}, "0.0.0-test", nil)
+	}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 func TestStdioConnCloseIsSafeForConcurrentCallers(t *testing.T) {
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 	notified := make(chan string, 4)
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "eager", bin, nil,
 		[]string{"FAKE_TOOLS=t", "FAKE_NOTIFY_ON_START=1"}, "0.0.0-test",
-		func(method string, _ json.RawMessage) { notified <- method })
+		func(method string, _ json.RawMessage) { notified <- method }, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestStdioCallCancellationNotifiesUpstream(t *testing.T) {
 			"FAKE_CALL_DELAY=30s",
 			"FAKE_ASYNC_CALLS=1",
 			"FAKE_CANCEL_FILE=" + cancelFile,
-		}, "0.0.0-test", nil)
+		}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestCloseDoesNotHangOnGrandchildHoldingPipes(t *testing.T) {
 	requireTool(t, "sh")
 	ctx := context.Background()
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "wrap", "sh",
-		[]string{"-c", "sleep 30 & exec cat"}, nil, "0.0.0-test", nil)
+		[]string{"-c", "sleep 30 & exec cat"}, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
 	// sleep is launched DIRECTLY (no sh wrapper) so the cleanup's cancel can
 	// kill it as the immediate child and Close returns without grace periods.
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "stuck", "sleep",
-		[]string{"30"}, nil, "0.0.0-test", nil)
+		[]string{"30"}, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "hybrid", bin, nil,
-		[]string{"FAKE_TOOLS=t", "FAKE_HYBRID_CALL=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=t", "FAKE_HYBRID_CALL=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 func TestCallOnClosedConnReturnsBeforeSendSentinel(t *testing.T) {
 	requireTool(t, "cat")
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "c", "cat", nil, nil, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "c", "cat", nil, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestStderrTailCapturedWithDebugOff(t *testing.T) {
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "tailed", bin, nil, []string{
 		"FAKE_TOOLS=t",
 		"FAKE_STDERR_LINES=3",
-	}, "0.0.0-test", nil)
+	}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
