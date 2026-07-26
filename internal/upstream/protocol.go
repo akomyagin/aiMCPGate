@@ -236,6 +236,22 @@ func (c *Conn) GetPrompt(ctx context.Context, name string, arguments json.RawMes
 	return c.transport.call(ctx, mcp.MethodPromptsGet, params)
 }
 
+// SetLogLevel forwards a logging/setLevel to the upstream (Round 3). The level
+// string travels verbatim — validation is the upstream's job (see
+// mcp.LoggingSetLevelParams). A JSON-RPC error from the upstream (e.g. an
+// unknown level rejected) is surfaced as an error; the registry's fan-out
+// Warn-logs it per upstream instead of failing the client's request.
+func (c *Conn) SetLogLevel(ctx context.Context, level string) error {
+	resp, err := c.transport.call(ctx, mcp.MethodLoggingSetLevel, mcp.MustParams(mcp.LoggingSetLevelParams{Level: level}))
+	if err != nil {
+		return fmt.Errorf("upstream %q: logging/setLevel: %w", c.Name(), err)
+	}
+	if resp.Error != nil {
+		return fmt.Errorf("upstream %q: logging/setLevel rejected: %w", c.Name(), resp.Error)
+	}
+	return nil
+}
+
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name expected by the upstream. meta is the client's
 // optional `_meta` object (progressToken etc.), forwarded verbatim — nil when

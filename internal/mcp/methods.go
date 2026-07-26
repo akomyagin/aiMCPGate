@@ -15,6 +15,12 @@ const (
 	MethodPromptsList  = "prompts/list"
 	MethodPromptsGet   = "prompts/get"
 
+	// MethodLoggingSetLevel asks a server to start emitting log notifications
+	// at or above the given severity. The gateway RECEIVES it from its client
+	// and fans it out to every upstream that declared the logging capability
+	// (Round 3); the level value travels verbatim, never validated en route.
+	MethodLoggingSetLevel = "logging/setLevel"
+
 	// MethodPing is the liveness check either side may send at any time —
 	// including BEFORE the initialize handshake completes (the only request the
 	// spec allows there, docs/MCP_NOTES.md §4). The receiver MUST answer
@@ -37,6 +43,14 @@ const (
 	// space, never rewritten (Round 2).
 	NotifProgress = "notifications/progress"
 
+	// NotifMessage carries one log message from a server to its client. The
+	// gateway RECEIVES it from a stdio upstream and forwards it to its own
+	// client over the same channel progress travels (Round 3) — the params are
+	// not interpreted beyond stamping the emitting upstream's name into the
+	// spec's optional `logger` field, so the client can tell N multiplexed
+	// upstream log streams apart.
+	NotifMessage = "notifications/message"
+
 	// NotifCancelled asks the peer to abandon an in-flight request, identified
 	// by requestId in the SENDER's id space. The gateway both RECEIVES it from
 	// its client (cancelling the matching in-flight tools/call's context) and
@@ -53,6 +67,17 @@ const (
 type CancelledParams struct {
 	RequestID json.RawMessage `json:"requestId"`
 	Reason    string          `json:"reason,omitempty"`
+}
+
+// LoggingSetLevelParams is the params object of a logging/setLevel request.
+// Level is one of the RFC 5424 syslog severities per the MCP spec (debug/info/
+// notice/warning/error/critical/alert/emergency), but the gateway deliberately
+// does NOT validate the value: it forwards it verbatim to every logging-capable
+// upstream, and an upstream that rejects an unknown level answers with its own
+// JSON-RPC error — inventing a stricter gate here would only drift from
+// whatever set the upstreams actually accept.
+type LoggingSetLevelParams struct {
+	Level string `json:"level"`
 }
 
 // Implementation identifies a client or server (clientInfo / serverInfo).

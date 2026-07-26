@@ -82,6 +82,22 @@
 //	                   notifications/cancelled's params to (one JSON line) —
 //	                   used to assert the gateway forwarded a cancellation with
 //	                   its own upstream-side request id (Round 2).
+//	FAKE_LOGGING     if "1", the initialize result declares the "logging"
+//	                   capability and logging/setLevel is answered with an empty
+//	                   result; without it the method falls through to
+//	                   method-not-found (Round 3).
+//	FAKE_LOG_FILE    path to a file the server polls (like FAKE_PROGRESS_FILE);
+//	                   when it appears non-empty the server emits one
+//	                   notifications/message with fixed level/data params (and
+//	                   NO logger field — so gateway tests can assert the gateway
+//	                   stamped the upstream name in), then truncates the file so
+//	                   each "touch" fires exactly once (Round 3 test hook).
+//	FAKE_SETLEVEL_FILE  path the server APPENDS each received logging/setLevel's
+//	                   level to (one line per call), REGARDLESS of FAKE_LOGGING —
+//	                   so a test can prove the gateway never sent setLevel to an
+//	                   upstream that declared no logging capability (the file
+//	                   stays absent/empty), and with WHICH level it reached a
+//	                   capable one (Round 3).
 //	FAKE_ASYNC_CALLS  if "1", each tools/call is answered on its OWN goroutine
 //	                   (FAKE_CALL_DELAY sleeps there), so the main read loop
 //	                   keeps consuming stdin meanwhile — required by the
@@ -150,6 +166,9 @@ func main() {
 	progressFile := os.Getenv("FAKE_PROGRESS_FILE")
 	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
 	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
+	logging := os.Getenv("FAKE_LOGGING") == "1"
+	logFile := os.Getenv("FAKE_LOG_FILE")
+	setLevelFile := os.Getenv("FAKE_SETLEVEL_FILE")
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -214,6 +233,26 @@ func main() {
 		}()
 	}
 
+	// log-message poller: when logFile becomes non-empty, emit one
+	// notifications/message and truncate the file so each "touch" fires exactly
+	// once (Round 3 test hook, same shape as progressFile). Deliberately no
+	// `logger` field in the params: the gateway is expected to stamp the
+	// upstream name in, and tests assert exactly that.
+	if logFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Millisecond)
+				data, err := os.ReadFile(logFile)
+				if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+					continue
+				}
+				_ = os.WriteFile(logFile, nil, 0o600)
+				write(message{Method: "notifications/message",
+					Params: json.RawMessage(`{"level":"info","data":"fake log line"}`)})
+			}
+		}()
+	}
+
 	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -229,10 +268,14 @@ func main() {
 			if initDelay > 0 {
 				time.Sleep(initDelay)
 			}
-			caps := `{"tools":{}}`
+			caps := `{"tools":{}`
 			if len(prompts) > 0 {
-				caps = `{"tools":{},"prompts":{}}`
+				caps += `,"prompts":{}`
 			}
+			if logging {
+				caps += `,"logging":{}`
+			}
+			caps += `}`
 			result := fmt.Sprintf(
 				`{"protocolVersion":"2025-06-18","capabilities":%s,"serverInfo":{"name":%q,"version":"1.0.0"}`,
 				caps, name)
@@ -262,6 +305,26 @@ func main() {
 					f.Close()
 				}
 			}
+		case "logging/setLevel":
+			// Record the received level FIRST, capability or not: a test proves
+			// the gateway respected the capability gate by this file staying
+			// empty for an upstream that never declared logging.
+			if setLevelFile != "" {
+				var p struct {
+					Level string `json:"level"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				f, err := os.OpenFile(setLevelFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintln(f, p.Level)
+					f.Close()
+				}
+			}
+			if !logging {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: logging/setLevel"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(`{}`)})
 		case "prompts/list":
 			if len(prompts) == 0 {
 				// No FAKE_PROMPTS: behave like a server without the prompts

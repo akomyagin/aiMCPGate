@@ -39,9 +39,10 @@ func (fakeUpstreamBase) CallTool(context.Context, string, json.RawMessage, json.
 func (fakeUpstreamBase) GetPrompt(context.Context, string, json.RawMessage) (*mcp.Message, error) {
 	return nil, nil
 }
-func (fakeUpstreamBase) Close() error                  { return nil }
-func (fakeUpstreamBase) Done() (<-chan struct{}, bool) { return nil, false }
-func (fakeUpstreamBase) StderrTail() ([]string, bool)  { return nil, false }
+func (fakeUpstreamBase) SetLogLevel(context.Context, string) error { return nil }
+func (fakeUpstreamBase) Close() error                              { return nil }
+func (fakeUpstreamBase) Done() (<-chan struct{}, bool)             { return nil, false }
+func (fakeUpstreamBase) StderrTail() ([]string, bool)              { return nil, false }
 
 // fakeUpstream is an in-process Upstream used to test the multiplexer without
 // spawning processes. Each fake mints its own call-side ids from a private
@@ -68,6 +69,28 @@ type fakeUpstream struct {
 	promptsErr     error    // if set, ListPrompts fails
 	lastPromptName string
 	lastPromptArgs json.RawMessage
+
+	// Logging (Round 3). levels records every SetLogLevel the registry made
+	// against this fake — mutex-guarded because the fan-out is parallel. A fake
+	// whose caps do NOT declare "logging" asserts non-delivery by this slice
+	// staying empty. setLevelErr makes the call fail (partial-failure tests).
+	levelsMu    sync.Mutex
+	levels      []string
+	setLevelErr error
+}
+
+func (f *fakeUpstream) SetLogLevel(_ context.Context, level string) error {
+	f.levelsMu.Lock()
+	f.levels = append(f.levels, level)
+	f.levelsMu.Unlock()
+	return f.setLevelErr
+}
+
+// setLevels returns a snapshot of the recorded SetLogLevel calls.
+func (f *fakeUpstream) setLevels() []string {
+	f.levelsMu.Lock()
+	defer f.levelsMu.Unlock()
+	return append([]string(nil), f.levels...)
 }
 
 func (f *fakeUpstream) Name() string { return f.name }

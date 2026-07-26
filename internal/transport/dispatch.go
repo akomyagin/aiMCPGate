@@ -43,6 +43,13 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 	if reg != nil && reg.HasUpstreamCapability("prompts") {
 		caps["prompts"] = map[string]any{"listChanged": false}
 	}
+	// logging (Round 3) is CONDITIONAL for the same honesty reason as prompts:
+	// declared only when at least one live upstream declared it — with zero
+	// logging-capable upstreams a logging/setLevel would be a silent no-op and
+	// no notifications/message could ever arrive.
+	if reg != nil && reg.HasUpstreamCapability("logging") {
+		caps["logging"] = map[string]any{}
+	}
 	b, err := json.Marshal(caps)
 	if err != nil {
 		// Unreachable for a map of plain bools; keep initialize alive anyway.
@@ -166,6 +173,8 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 		return d.handlePromptsList(msg)
 	case mcp.MethodPromptsGet:
 		return d.handlePromptsGet(ctx, msg)
+	case mcp.MethodLoggingSetLevel:
+		return d.handleLoggingSetLevel(ctx, msg)
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
@@ -367,6 +376,30 @@ func (d *dispatcher) handlePromptsGet(ctx context.Context, req *mcp.Message) *mc
 		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
 	}
 	return mcp.NewResult(req.ID, resp.Result)
+}
+
+// handleLoggingSetLevel fans the client's logging/setLevel out to every
+// logging-capable upstream via the registry (Round 3). The level VALUE is not
+// validated here — it travels verbatim, and an upstream that rejects an
+// unknown level does so with its own JSON-RPC error, Warn-logged per upstream
+// inside the registry. Per the spec the reply is an empty result; a partial
+// upstream failure does NOT fail the client's request (see Registry.
+// SetLogLevel). Only a structurally broken request — unparseable params or a
+// missing level — is answered with invalid-params: there is nothing to fan out.
+func (d *dispatcher) handleLoggingSetLevel(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.LoggingSetLevelParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid logging/setLevel params: "+err.Error(), nil)
+	}
+	if params.Level == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "logging/setLevel missing level", nil)
+	}
+	if err := d.reg.SetLogLevel(ctx, params.Level); err != nil {
+		// Unreachable today (SetLogLevel always returns nil); kept so a future
+		// aggregate-failure policy surfaces cleanly.
+		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+	}
+	return mcp.NewResult(req.ID, json.RawMessage("{}"))
 }
 
 // handleResourcesList returns an empty resource catalog. Resource aggregation

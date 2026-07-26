@@ -126,6 +126,10 @@ type Upstream interface {
 	// GetPrompt forwards one prompts/get with the upstream's ORIGINAL prompt
 	// name (the registry resolves the namespace before calling).
 	GetPrompt(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error)
+	// SetLogLevel forwards one logging/setLevel with the client's level string
+	// verbatim (Round 3). The registry calls it only for upstreams that
+	// declared the logging capability in initialize — never as a blind probe.
+	SetLogLevel(ctx context.Context, level string) error
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
 	// long-lived process (stdio); ok is false when there is no such process
@@ -829,16 +833,24 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 }
 
 // onUpstreamNotification handles a notification pushed by a stdio upstream
-// (Stage 7b, Round 2). It runs on that upstream's single reader goroutine, so
-// it must not block or re-enter the connection: for tools/list_changed it only
-// (re)arms a debounce timer whose expiry does the actual re-list on a fresh
-// goroutine; for notifications/progress it forwards the params VERBATIM to the
-// notification subscribers via a non-blocking send (the progressToken was
-// minted by the client, the gateway never rewrites it). Other notification
-// methods are ignored (resources are not aggregated yet).
+// (Stage 7b, Round 2, Round 3). It runs on that upstream's single reader
+// goroutine, so it must not block or re-enter the connection: for
+// tools/list_changed it only (re)arms a debounce timer whose expiry does the
+// actual re-list on a fresh goroutine; for notifications/progress it forwards
+// the params VERBATIM to the notification subscribers via a non-blocking send
+// (the progressToken was minted by the client, the gateway never rewrites it);
+// for notifications/message it forwards the same way, except the emitting
+// upstream's name is stamped into the params' optional `logger` field first
+// (see withLogger — without it the client cannot tell N multiplexed upstream
+// log streams apart). Other notification methods are ignored (resources are
+// not aggregated yet).
 func (r *Registry) onUpstreamNotification(name, method string, params json.RawMessage) {
 	if method == mcp.NotifProgress {
 		r.forwardNotification(mcp.Message{Method: method, Params: params})
+		return
+	}
+	if method == mcp.NotifMessage {
+		r.forwardNotification(mcp.Message{Method: method, Params: withLogger(params, name)})
 		return
 	}
 	if method != mcp.NotifToolsListChanged {
@@ -1300,8 +1312,9 @@ func (r *Registry) notifyCatalogChanged() {
 const notifSubBuffer = 16
 
 // SubscribeNotifications registers interest in upstream notifications the
-// gateway forwards VERBATIM to its client — today only notifications/progress
-// (Round 2) — and returns a channel of whole mcp.Message values (method +
+// gateway forwards to its client — notifications/progress (Round 2, verbatim)
+// and notifications/message (Round 3, verbatim except the stamped `logger`
+// field, see withLogger) — and returns a channel of whole mcp.Message values (method +
 // params, no id) plus an unsubscribe function the caller MUST call when it
 // stops listening. Unlike Subscribe's coalescing one-bit signal, each message
 // matters individually, so the channel is buffered (notifSubBuffer); delivery
@@ -1337,6 +1350,34 @@ func (r *Registry) forwardNotification(msg mcp.Message) {
 			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
 		}
 	}
+}
+
+// withLogger stamps the emitting upstream's name into a notifications/message
+// params object before it is forwarded to the client (Round 3). The spec's
+// optional `logger` field is exactly this hook: the client sees ONE multiplexed
+// stream of log messages from N upstreams, and without the source name they
+// are indistinguishable — this is the single deliberate exception to the
+// "forward params verbatim" rule. A logger the upstream itself set is
+// preserved under the upstream's namespace ("<upstream>__<original>", the same
+// separator tool names use); every other field passes through untouched. An
+// unparseable or non-object params value is forwarded verbatim: enriching must
+// never break the message.
+func withLogger(params json.RawMessage, upstream string) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(params, &obj) != nil || obj == nil {
+		return params // absent, malformed, or JSON null: nothing to enrich
+	}
+	logger := upstream
+	var orig string
+	if raw, ok := obj["logger"]; ok && json.Unmarshal(raw, &orig) == nil && orig != "" {
+		logger = upstream + NameSeparator + orig
+	}
+	obj["logger"] = mustJSONString(logger)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return params // unreachable for a map of RawMessage; stay safe anyway
+	}
+	return out
 }
 
 // Reload applies a new configuration to the running gateway without a restart
@@ -1742,6 +1783,49 @@ func hasCapability(capabilities json.RawMessage, capability string) bool {
 	}
 	v, ok := caps[capability]
 	return ok && string(v) != "null"
+}
+
+// SetLogLevel fans a client's logging/setLevel out to every live upstream that
+// declared the logging capability in its initialize response (Round 3). The
+// level string is forwarded verbatim — the gateway does not validate it against
+// the RFC 5424 set (see mcp.LoggingSetLevelParams); an upstream rejecting an
+// unknown level does so with its own JSON-RPC error, which lands here as a
+// per-upstream Warn. Per the spec the response to logging/setLevel is an empty
+// result, so a partial upstream failure is NOT surfaced to the client: the
+// gateway's job is to try every capable upstream, and the ones that accepted
+// the level are now honoring it. The returned error is therefore always nil
+// today; the error signature stays so the dispatcher need not change if a
+// future policy (e.g. "every single upstream refused") wants to surface one.
+//
+// The fan-out is parallel (same spirit as Start's bring-up): each SetLogLevel
+// is bounded by that upstream's call timeout, and one slow upstream must not
+// serialize the rest behind it.
+func (r *Registry) SetLogLevel(ctx context.Context, level string) error {
+	// Snapshot the logging-capable connections under the read lock; the RPCs
+	// run outside it (no I/O under r.mu).
+	r.mu.RLock()
+	targets := make(map[string]Upstream, len(r.conns))
+	for name, conn := range r.conns {
+		if hasCapability(r.handshakes[name].capabilities, "logging") {
+			targets[name] = conn
+		}
+	}
+	r.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for name, conn := range targets {
+		wg.Add(1)
+		go func(name string, conn Upstream) {
+			defer wg.Done()
+			if err := r.withCallTimeoutFor(ctx, name, func(ctx context.Context) error {
+				return conn.SetLogLevel(ctx, level)
+			}); err != nil {
+				r.log.Warn("logging/setLevel failed", "upstream", name, "level", level, "err", err)
+			}
+		}(name, conn)
+	}
+	wg.Wait()
+	return nil
 }
 
 // CallTool routes a namespaced tool call to its owning upstream, rewriting the
