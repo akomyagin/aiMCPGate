@@ -128,14 +128,14 @@ func TestRegistryAppliesToolFilter(t *testing.T) {
 	}
 
 	// The renamed tool routes back to the upstream's ORIGINAL name.
-	if _, err := r.CallTool(context.Background(), "gh_search", nil); err != nil {
+	if _, err := r.CallTool(context.Background(), "gh_search", nil, nil); err != nil {
 		t.Fatalf("CallTool renamed tool: %v", err)
 	}
 	if gh.lastNamed != "search" {
 		t.Errorf("upstream received name %q, want original %q", gh.lastNamed, "search")
 	}
 	// The denied tool is not callable even by its would-be namespaced name.
-	if _, err := r.CallTool(context.Background(), "gh__delete_repo", nil); err == nil {
+	if _, err := r.CallTool(context.Background(), "gh__delete_repo", nil, nil); err == nil {
 		t.Error("denied tool must not be callable")
 	}
 }
@@ -248,7 +248,7 @@ func TestReloadFilterOnlyDoesNotRelaunch(t *testing.T) {
 		t.Fatal("upstream connection was replaced — filter-only reload must not relaunch the process")
 	}
 	// Still callable on the original, never-interrupted connection.
-	if _, err := r.CallTool(context.Background(), "svc__alpha", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "svc__alpha", []byte(`{}`), nil); err != nil {
 		t.Fatalf("upstream not callable after filter-only reload: %v", err)
 	}
 }

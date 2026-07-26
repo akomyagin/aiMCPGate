@@ -128,3 +128,53 @@ func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 		t.Fatal("resources/list internal error must stay a hard error")
 	}
 }
+
+// captureTransport records the raw params of the last call it received and
+// answers with an empty successful result — the wire-level probe for what
+// CallTool actually sends.
+type captureTransport struct {
+	params json.RawMessage
+}
+
+func (c *captureTransport) call(_ context.Context, _ string, params json.RawMessage) (*mcp.Message, error) {
+	c.params = params
+	return mcp.NewResult(mcp.IntID(1), json.RawMessage(`{}`)), nil
+}
+
+func (c *captureTransport) notify(context.Context, string, json.RawMessage) error { return nil }
+func (c *captureTransport) Name() string                                          { return "capture" }
+func (c *captureTransport) Close() error                                          { return nil }
+func (c *captureTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+
+// TestCallToolWireParamsCarryMetaExactly pins the wire contract of the `_meta`
+// passthrough: the params CallTool sends carry the client's `_meta` object
+// byte for byte (compact JSON in, identical bytes out), and when the caller
+// supplies none the params contain NO `_meta` key at all — the upstream must
+// see exactly what the client sent, nothing invented.
+func TestCallToolWireParamsCarryMetaExactly(t *testing.T) {
+	tr := &captureTransport{}
+	c := &Conn{transport: tr}
+
+	meta := json.RawMessage(`{"progressToken":42,"vendor":{"k":[1,2]}}`)
+	if _, err := c.CallTool(context.Background(), "fetch", json.RawMessage(`{"q":"x"}`), meta); err != nil {
+		t.Fatalf("CallTool with meta: %v", err)
+	}
+	var withMeta map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &withMeta); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if got := string(withMeta["_meta"]); got != string(meta) {
+		t.Errorf("sent _meta = %s, want the client's bytes %s", got, meta)
+	}
+
+	if _, err := c.CallTool(context.Background(), "fetch", json.RawMessage(`{"q":"x"}`), nil); err != nil {
+		t.Fatalf("CallTool without meta: %v", err)
+	}
+	var noMeta map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &noMeta); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if _, present := noMeta["_meta"]; present {
+		t.Errorf("params carry an invented _meta key: %s", tr.params)
+	}
+}

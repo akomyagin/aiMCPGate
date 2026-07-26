@@ -19,19 +19,42 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/upstream"
 )
 
+// fakeUpstreamBase is the embeddable default implementation of EVERY Upstream
+// method: zero values, nil errors, no behaviour. Concrete fakes embed it and
+// override only the methods their test actually exercises — so extending the
+// Upstream interface in a future round means adding ONE stub here instead of
+// fixing every fake in the package. Initialize returns a non-nil empty result
+// (not nil) because launch() dereferences it.
+type fakeUpstreamBase struct{}
+
+func (fakeUpstreamBase) Initialize(context.Context) (*mcp.InitializeResult, error) {
+	return &mcp.InitializeResult{}, nil
+}
+func (fakeUpstreamBase) ListTools(context.Context) ([]mcp.Tool, error)         { return nil, nil }
+func (fakeUpstreamBase) ListResources(context.Context) ([]mcp.Resource, error) { return nil, nil }
+func (fakeUpstreamBase) CallTool(context.Context, string, json.RawMessage, json.RawMessage) (*mcp.Message, error) {
+	return nil, nil
+}
+func (fakeUpstreamBase) Close() error                  { return nil }
+func (fakeUpstreamBase) Done() (<-chan struct{}, bool) { return nil, false }
+
 // fakeUpstream is an in-process Upstream used to test the multiplexer without
 // spawning processes. Each fake mints its own call-side ids from a private
 // counter, so the test asserts the registry keeps id spaces separated.
 type fakeUpstream struct {
-	name      string
-	tools     []string
-	initErr   error
-	listErr   error
-	callErr   error
-	callResp  *mcp.Message // if set, CallTool returns this response verbatim
-	nextID    atomic.Int64
-	lastArgs  json.RawMessage
-	lastNamed string
+	fakeUpstreamBase
+	name         string
+	tools        []string
+	instructions string          // reported in InitializeResult.Instructions
+	caps         json.RawMessage // reported in InitializeResult.Capabilities
+	initErr      error
+	listErr      error
+	callErr      error
+	callResp     *mcp.Message // if set, CallTool returns this response verbatim
+	nextID       atomic.Int64
+	lastArgs     json.RawMessage
+	lastMeta     json.RawMessage
+	lastNamed    string
 }
 
 func (f *fakeUpstream) Name() string { return f.name }
@@ -40,7 +63,12 @@ func (f *fakeUpstream) Initialize(context.Context) (*mcp.InitializeResult, error
 	if f.initErr != nil {
 		return nil, f.initErr
 	}
-	return &mcp.InitializeResult{ProtocolVersion: mcp.ProtocolVersion, ServerInfo: mcp.Implementation{Name: f.name}}, nil
+	return &mcp.InitializeResult{
+		ProtocolVersion: mcp.ProtocolVersion,
+		ServerInfo:      mcp.Implementation{Name: f.name},
+		Instructions:    f.instructions,
+		Capabilities:    f.caps,
+	}, nil
 }
 
 func (f *fakeUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
@@ -54,11 +82,10 @@ func (f *fakeUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
 	return out, nil
 }
 
-func (f *fakeUpstream) ListResources(context.Context) ([]mcp.Resource, error) { return nil, nil }
-
-func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	f.lastNamed = name
 	f.lastArgs = arguments
+	f.lastMeta = meta
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
@@ -71,10 +98,6 @@ func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments json.R
 	result := json.RawMessage(`{"content":[{"type":"text","text":"ok ` + name + `"}],"isError":false}`)
 	return mcp.NewResult(id, result), nil
 }
-
-func (f *fakeUpstream) Close() error { return nil }
-
-func (f *fakeUpstream) Done() (<-chan struct{}, bool) { return nil, false }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
@@ -164,7 +187,7 @@ func TestRegistryRoutesCallToOwner(t *testing.T) {
 	defer r.Close()
 
 	args := json.RawMessage(`{"q":"golang"}`)
-	resp, err := r.CallTool(context.Background(), "web__search", args)
+	resp, err := r.CallTool(context.Background(), "web__search", args, nil)
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
@@ -192,7 +215,7 @@ func TestRegistryUnknownToolErrors(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer r.Close()
-	if _, err := r.CallTool(context.Background(), "nope__nope", nil); err == nil {
+	if _, err := r.CallTool(context.Background(), "nope__nope", nil, nil); err == nil {
 		t.Fatal("expected error for unknown tool")
 	}
 }
@@ -217,7 +240,7 @@ func TestRegistryCallToolFailureSanitized(t *testing.T) {
 	}
 	defer r.Close()
 
-	_, err := r.CallTool(context.Background(), "secretname__search", nil)
+	_, err := r.CallTool(context.Background(), "secretname__search", nil, nil)
 	if err == nil {
 		t.Fatal("expected error from failing upstream")
 	}
@@ -240,7 +263,7 @@ func TestRegistryCallToolTimeoutSanitized(t *testing.T) {
 	}
 	defer r.Close()
 
-	_, err := r.CallTool(context.Background(), "secretname__search", nil)
+	_, err := r.CallTool(context.Background(), "secretname__search", nil, nil)
 	if err == nil {
 		t.Fatal("expected error from failing upstream")
 	}
@@ -339,7 +362,7 @@ func TestRegistryCallLogHasNoSecrets(t *testing.T) {
 
 	const secret = "SUPER_SECRET_TOKEN_abc123"
 	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
-	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", args, nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -377,7 +400,7 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 
 	const secret = "secret123"
 	args := json.RawMessage(`{"api_key":"` + secret + `","query":"hello"}`)
-	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", args, nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -435,7 +458,7 @@ func TestRegistryDefaultPayloadLogOff(t *testing.T) {
 
 	const secret = "SUPER_SECRET_TOKEN_xyz789"
 	args := json.RawMessage(`{"authorization":"Bearer ` + secret + `"}`)
-	if _, err := r.CallTool(context.Background(), "web__fetch", args); err != nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", args, nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -474,7 +497,7 @@ func TestRegistryPayloadLogMarksErrorResponseNotOK(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`), nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -518,7 +541,7 @@ func TestRegistryPayloadLogRecordsErrorData(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{}`), nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -627,7 +650,7 @@ type swapConnOnCallUpstream struct {
 	calls atomic.Int64
 }
 
-func (s *swapConnOnCallUpstream) CallTool(context.Context, string, json.RawMessage) (*mcp.Message, error) {
+func (s *swapConnOnCallUpstream) CallTool(context.Context, string, json.RawMessage, json.RawMessage) (*mcp.Message, error) {
 	s.calls.Add(1)
 	s.once.Do(func() {
 		if s.repl == nil {
@@ -665,7 +688,7 @@ func TestCallToolRetriesOnceOnConnClosedBeforeSend(t *testing.T) {
 	}
 	defer r.Close()
 
-	resp, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{"q":1}`))
+	resp, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{"q":1}`), nil)
 	if err != nil {
 		t.Fatalf("CallTool should have retried on the fresh connection, got error: %v", err)
 	}
@@ -714,7 +737,7 @@ func TestCallToolNoRetryOnLateConnClosed(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "web__fetch", nil); err == nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", nil, nil); err == nil {
 		t.Fatal("expected error for a late ErrConnClosed, got success — a post-send failure must never be retried")
 	}
 	if live.lastNamed != "" {
@@ -741,7 +764,7 @@ func TestCallToolNoRetryOnSameConn(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "web__fetch", nil); err == nil {
+	if _, err := r.CallTool(context.Background(), "web__fetch", nil, nil); err == nil {
 		t.Fatal("expected error when the re-resolved connection is the same dead one")
 	}
 	if got := dead.calls.Load(); got != 1 {
@@ -877,11 +900,11 @@ func TestRegistrySeparatesIDSpaces(t *testing.T) {
 	}
 	defer r.Close()
 
-	ra, err := r.CallTool(context.Background(), "a__t", nil)
+	ra, err := r.CallTool(context.Background(), "a__t", nil, nil)
 	if err != nil {
 		t.Fatalf("call a: %v", err)
 	}
-	rb, err := r.CallTool(context.Background(), "b__t", nil)
+	rb, err := r.CallTool(context.Background(), "b__t", nil, nil)
 	if err != nil {
 		t.Fatalf("call b: %v", err)
 	}
@@ -892,5 +915,163 @@ func TestRegistrySeparatesIDSpaces(t *testing.T) {
 	}
 	if !strings.Contains(string(ra.Result), "ok t") || !strings.Contains(string(rb.Result), "ok t") {
 		t.Fatalf("unexpected results a=%s b=%s", ra.Result, rb.Result)
+	}
+}
+
+// TestCallToolForwardsMetaVerbatim: the client's `_meta` object (progressToken
+// etc.) must travel the whole CallTool chain to the upstream byte for byte —
+// and, symmetrically, a call WITHOUT `_meta` must deliver none (nil), so the
+// gateway never invents one (transparent-proxy contract, MCP_NOTES §1).
+func TestCallToolForwardsMetaVerbatim(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	web := &fakeUpstream{name: "web", tools: []string{"fetch"}}
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{"web": web})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	meta := json.RawMessage(`{"progressToken":"tok-1","vendor":{"x":[1,2]}}`)
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{"q":1}`), meta); err != nil {
+		t.Fatalf("CallTool with meta: %v", err)
+	}
+	if string(web.lastMeta) != string(meta) {
+		t.Errorf("_meta not forwarded verbatim: got %s want %s", web.lastMeta, meta)
+	}
+
+	if _, err := r.CallTool(context.Background(), "web__fetch", json.RawMessage(`{"q":2}`), nil); err != nil {
+		t.Fatalf("CallTool without meta: %v", err)
+	}
+	if web.lastMeta != nil {
+		t.Errorf("call without _meta delivered %s to the upstream, want none", web.lastMeta)
+	}
+}
+
+// TestInstructionsAggregatesSortedNonEmpty: Instructions() concatenates the
+// non-empty per-upstream instructions as "## <name>" sections, sorted by
+// upstream name for determinism; upstreams without instructions are skipped
+// entirely. A filter-only re-projection (installLocked with nil meta) must not
+// lose the recorded instructions.
+func TestInstructionsAggregatesSortedNonEmpty(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "zeta", Enabled: true},
+		{Name: "alpha", Enabled: true},
+		{Name: "mid", Enabled: true},
+	}}
+	fakes := map[string]*fakeUpstream{
+		"zeta":  {name: "zeta", tools: []string{"z"}, instructions: "Use zeta wisely."},
+		"alpha": {name: "alpha", tools: []string{"a"}, instructions: "Alpha rules."},
+		"mid":   {name: "mid", tools: []string{"m"}}, // no instructions — skipped
+	}
+	r := newTestRegistry(t, cfg, nil, fakes)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	want := "## alpha\nAlpha rules.\n\n## zeta\nUse zeta wisely."
+	if got := r.Instructions(); got != want {
+		t.Errorf("Instructions() = %q, want %q", got, want)
+	}
+
+	// A re-projection without a new handshake must preserve the metadata.
+	r.remergeUpstream("alpha")
+	if got := r.Instructions(); got != want {
+		t.Errorf("Instructions() after remerge = %q, want %q (handshake meta lost)", got, want)
+	}
+
+	// Dropping an upstream removes its section.
+	r.dropUpstream("alpha")
+	if got, want := r.Instructions(), "## zeta\nUse zeta wisely."; got != want {
+		t.Errorf("Instructions() after drop = %q, want %q", got, want)
+	}
+}
+
+// TestInstructionsEmptyWhenNoUpstreamProvidesAny: no instructions anywhere
+// yields the empty string (so InitializeResult.Instructions is omitted).
+func TestInstructionsEmptyWhenNoUpstreamProvidesAny(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	if got := r.Instructions(); got != "" {
+		t.Errorf("Instructions() = %q, want empty", got)
+	}
+}
+
+// TestHasUpstreamCapability: the shallow capability probe — a key present in
+// at least one live upstream's capabilities object (and not JSON null) counts;
+// absent keys, null values and malformed/missing capabilities do not.
+func TestHasUpstreamCapability(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "rich", Enabled: true},
+		{Name: "bare", Enabled: true},
+	}}
+	fakes := map[string]*fakeUpstream{
+		"rich": {name: "rich", tools: []string{"r"},
+			caps: json.RawMessage(`{"tools":{},"prompts":{"listChanged":true},"odd":null}`)},
+		"bare": {name: "bare", tools: []string{"b"}}, // nil capabilities
+	}
+	r := newTestRegistry(t, cfg, nil, fakes)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	for cap, want := range map[string]bool{
+		"tools":     true,
+		"prompts":   true,
+		"resources": false, // nobody declares it
+		"odd":       false, // declared but null
+	} {
+		if got := r.HasUpstreamCapability(cap); got != want {
+			t.Errorf("HasUpstreamCapability(%q) = %v, want %v", cap, got, want)
+		}
+	}
+
+	r.dropUpstream("rich")
+	if r.HasUpstreamCapability("prompts") {
+		t.Error("HasUpstreamCapability(prompts) still true after the declaring upstream was dropped")
+	}
+}
+
+// TestAuditRecordsClientFromContext: a CallTool made under a context carrying
+// the client identity (registry.WithClient — what the transports attach after
+// initialize) is audited with CallRecord.Client; a context without one yields
+// a record with the client field omitted entirely.
+func TestAuditRecordsClientFromContext(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	var buf bytes.Buffer
+	r := newTestRegistry(t, cfg, logging.NewCallLogWriter(&buf), map[string]*fakeUpstream{
+		"web": {name: "web", tools: []string{"fetch"}},
+	})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	ctx := WithClient(context.Background(), "test-client/9.9.9")
+	if _, err := r.CallTool(ctx, "web__fetch", nil, nil); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"client":"test-client/9.9.9"`) {
+		t.Errorf("audit record missing client identity:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	if _, err := r.CallTool(context.Background(), "web__fetch", nil, nil); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if strings.Contains(buf.String(), `"client"`) {
+		t.Errorf("audit record carries a client field without WithClient:\n%s", buf.String())
+	}
+
+	// WithClient("") is a documented no-op — the context comes back unchanged.
+	if got := ClientFromContext(WithClient(context.Background(), "")); got != "" {
+		t.Errorf("ClientFromContext after WithClient(\"\") = %q, want empty", got)
 	}
 }

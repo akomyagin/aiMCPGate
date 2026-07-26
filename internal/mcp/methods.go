@@ -13,6 +13,12 @@ const (
 	MethodResourceList = "resources/list"
 	MethodResourceRead = "resources/read"
 
+	// MethodPing is the liveness check either side may send at any time —
+	// including BEFORE the initialize handshake completes (the only request the
+	// spec allows there, docs/MCP_NOTES.md §4). The receiver MUST answer
+	// promptly with an empty result.
+	MethodPing = "ping"
+
 	// NotifInitialized is sent by a client after a successful initialize.
 	NotifInitialized = "notifications/initialized"
 
@@ -77,9 +83,15 @@ type ToolsListResult struct {
 
 // ToolsCallParams is the params object of a tools/call request. Arguments is
 // proxied verbatim.
+//
+// Meta carries the client's optional `_meta` object (e.g. progressToken)
+// through to the upstream verbatim — dropping it silently would break the
+// gateway's transparent-proxy contract (docs/MCP_NOTES.md §1). RawMessage with
+// omitempty: absent stays absent, present is forwarded byte for byte.
 type ToolsCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Meta      json.RawMessage `json:"_meta,omitempty"`
 }
 
 // Resource is one entry in a resources/list result.

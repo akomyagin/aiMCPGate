@@ -71,7 +71,7 @@ func TestRegistryAggregatesHTTPUpstream(t *testing.T) {
 		t.Fatalf("unexpected catalog from HTTP upstream: %+v", tools)
 	}
 
-	msg, err := r.CallTool(ctx, "remote__search", json.RawMessage(`{"q":"http-routing"}`))
+	msg, err := r.CallTool(ctx, "remote__search", json.RawMessage(`{"q":"http-routing"}`), nil)
 	if err != nil {
 		t.Fatalf("CallTool to HTTP upstream: %v", err)
 	}

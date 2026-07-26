@@ -195,7 +195,9 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 }
 
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
-// (un-namespaced) tool name expected by the upstream.
+// (un-namespaced) tool name expected by the upstream. meta is the client's
+// optional `_meta` object (progressToken etc.), forwarded verbatim — nil when
+// the client sent none, so the upstream sees exactly what the client sent.
 //
 // If the transport reports an expired HTTP session (the server answered 404 to
 // a request carrying Mcp-Session-Id — per the spec it may drop a session at
@@ -204,8 +206,8 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 // means the upstream refused the request outright, so the tool was never
 // executed and cannot run twice. Exactly one retry — a second expiry in a row
 // is a genuinely broken upstream, not an expired session.
-func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
+func (c *Conn) CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments, Meta: meta})
 	resp, err := c.transport.call(ctx, mcp.MethodToolsCall, params)
 	if err != nil && errors.Is(err, errSessionExpired) {
 		// The transport already cleared the stale session id; a fresh
