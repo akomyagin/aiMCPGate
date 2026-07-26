@@ -31,12 +31,10 @@ import (
 // listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
 // catalog is dynamic (auto-restart, upstream list_changed, reload), so the
 // gateway CAN emit notifications/tools/list_changed — but only over a transport
-// with a server→client channel. stdio has one (the same pipe), so it advertises
-// listChanged:true and pushes the notification. The HTTP transport is POST-only
-// here (no GET SSE stream, MCP_NOTES §8 п.3), so it CANNOT push server→client
-// notifications; it truthfully advertises listChanged:false and clients simply
-// see the updated catalog on their next tools/list. Building the GET SSE channel
-// is deferred future work.
+// with a server→client channel. stdio has one (the same pipe) and advertises
+// listChanged:true. Since Round 12 the HTTP transport has one too — the GET
+// /mcp SSE stream (handleSSE) — so it also advertises listChanged:true; the
+// parameter stays so a future channel-less transport can still tell the truth.
 func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage {
 	caps := map[string]any{
 		"tools": map[string]any{"listChanged": listChanged},
@@ -99,9 +97,9 @@ type dispatcher struct {
 	log     *slog.Logger
 	version string
 	// listChanged is whether this transport can push a server→client
-	// notifications/tools/list_changed (Stage 7c): true for stdio, false for
-	// the POST-only HTTP transport. handleInitialize feeds it to
-	// buildCapabilities on every handshake.
+	// notifications/tools/list_changed (Stage 7c): true for stdio (the pipe)
+	// and, since Round 12, for HTTP too (the GET SSE stream). handleInitialize
+	// feeds it to buildCapabilities on every handshake.
 	listChanged bool
 
 	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
@@ -115,8 +113,8 @@ type dispatcher struct {
 
 // newDispatcher builds the shared method-handling core. listChanged tells it
 // which tools capability to advertise: true only for a transport that can push
-// a server→client notifications/tools/list_changed (stdio), false otherwise
-// (HTTP POST-only). See buildCapabilities for the reasoning.
+// a server→client notifications/tools/list_changed — today both stdio (the
+// pipe) and HTTP (the GET SSE stream, Round 12). See buildCapabilities.
 func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
 	return &dispatcher{
 		reg:         reg,
