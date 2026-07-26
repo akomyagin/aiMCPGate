@@ -49,6 +49,18 @@ const (
 	UpstreamHTTP UpstreamKind = "http"
 )
 
+// Catalog-mode values (Round 8). An empty CatalogMode means CatalogModeNormal.
+const (
+	// CatalogModeNormal exposes every aggregated, namespaced upstream tool in
+	// tools/list — the default behaviour since the MVP.
+	CatalogModeNormal = "normal"
+	// CatalogModeLazy exposes exactly three gateway meta-tools
+	// (gate_search_tools / gate_describe / gate_call) instead of the full
+	// catalog — progressive tool disclosure for very large catalogs. See
+	// internal/transport/lazy.go.
+	CatalogModeLazy = "lazy"
+)
+
 // upstreamNameRe restricts upstream names to characters that survive namespacing
 // into "<upstream>__<tool>" without breaking clients that expect tool names to
 // match ^[a-zA-Z0-9_-]+$ (Claude Code and friends). See docs/MCP_NOTES.md §6.
@@ -305,6 +317,26 @@ type Config struct {
 	// override it via their own max_result_bytes (EffectiveMaxResultBytesFor).
 	MaxResultBytes int `yaml:"max_result_bytes"`
 
+	// CatalogMode selects how tools/list presents the aggregated catalog
+	// (Round 8). "" or "normal": every namespaced upstream tool, as always.
+	// "lazy": a fixed set of three gateway meta-tools (gate_search_tools,
+	// gate_describe, gate_call) through which the client discovers and calls
+	// the real catalog on demand — progressive tool disclosure that keeps the
+	// client's tool list tiny no matter how many upstreams are aggregated.
+	//
+	// PRECEDENCE (documented contract): when CatalogMode is "lazy", PageSize
+	// is IGNORED — the three meta-tools are a fixed, tiny list that never
+	// paginates. Like the Round 6 limits, this field is read from the live
+	// config on every request, so a SIGHUP reload switches modes without
+	// relaunching anything.
+	CatalogMode string `yaml:"catalog_mode"`
+	// PageSize, when > 0, paginates tools/list responses into pages of at
+	// most this many tools, linked by an opaque nextCursor (MCP pagination).
+	// 0 (the default) keeps the old behaviour: the whole catalog in a single
+	// response, any cursor ignored. Ignored entirely in lazy catalog mode
+	// (see CatalogMode).
+	PageSize int `yaml:"page_size"`
+
 	// Restart is the GLOBAL policy for automatically restarting a stdio upstream
 	// whose child process dies while the gateway is running (Stage 7a). It is a
 	// single policy, not per-upstream: the granularity was deliberately kept
@@ -439,6 +471,11 @@ func (c *Config) EffectiveCallTimeoutFor(name string) time.Duration {
 	}
 	return c.EffectiveCallTimeout()
 }
+
+// LazyCatalog reports whether the lazy catalog mode (Round 8) is active —
+// the one place the string comparison lives, so the dispatcher never spells
+// "lazy" itself.
+func (c *Config) LazyCatalog() bool { return c.CatalogMode == CatalogModeLazy }
 
 // EffectiveListenAddr returns ListenAddr or DefaultListenAddr if unset.
 func (c *Config) EffectiveListenAddr() string {
@@ -629,6 +666,15 @@ func (c *Config) Validate() error {
 	}
 	if c.CallTimeout < 0 {
 		return fmt.Errorf("call_timeout must not be negative (0 selects the default)")
+	}
+
+	switch c.CatalogMode {
+	case "", CatalogModeNormal, CatalogModeLazy:
+	default:
+		return fmt.Errorf("unknown catalog_mode %q (want %q or %q)", c.CatalogMode, CatalogModeNormal, CatalogModeLazy)
+	}
+	if c.PageSize < 0 {
+		return fmt.Errorf("page_size must not be negative (0 disables tools/list pagination)")
 	}
 
 	// The opt-in payload debug log must never share a file with the audit log:

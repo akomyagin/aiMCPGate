@@ -666,3 +666,51 @@ func TestSameLaunchHTTP(t *testing.T) {
 		t.Error("http upstreams with identical url/headers must be SameLaunch")
 	}
 }
+
+// TestValidateCatalogModeAndPageSize covers the Round 8 knobs: the three legal
+// catalog_mode spellings (unset/normal/lazy), rejection of anything else, the
+// non-negative page_size constraint, and that lazy + page_size together is a
+// VALID config (the documented precedence — lazy ignores page_size — is a
+// runtime rule in the dispatcher, not a validation error).
+func TestValidateCatalogModeAndPageSize(t *testing.T) {
+	mk := func(mode string, pageSize int) *Config {
+		return &Config{
+			Transport:   TransportStdio,
+			CatalogMode: mode,
+			PageSize:    pageSize,
+			Upstreams:   []Upstream{{Name: "a", Command: "x"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		mode    string
+		ps      int
+		wantErr bool
+	}{
+		{"unset defaults", "", 0, false},
+		{"explicit normal", CatalogModeNormal, 0, false},
+		{"lazy", CatalogModeLazy, 0, false},
+		{"page_size positive", "", 5, false},
+		{"lazy with page_size is valid (precedence is runtime, not validation)", CatalogModeLazy, 10, false},
+		{"unknown mode", "eager", 0, true},
+		{"negative page_size", "", -1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mk(tt.mode, tt.ps).Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate(catalog_mode=%q, page_size=%d) err = %v, wantErr %v", tt.mode, tt.ps, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLazyCatalogHelper pins the one place the "lazy" comparison lives.
+func TestLazyCatalogHelper(t *testing.T) {
+	if (&Config{}).LazyCatalog() || (&Config{CatalogMode: CatalogModeNormal}).LazyCatalog() {
+		t.Error("normal/unset config must not report LazyCatalog")
+	}
+	if !(&Config{CatalogMode: CatalogModeLazy}).LazyCatalog() {
+		t.Error("catalog_mode lazy must report LazyCatalog")
+	}
+}

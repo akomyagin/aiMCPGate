@@ -52,6 +52,23 @@ call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 # default).
 # max_result_bytes: 65536
 
+# Catalog presentation (Round 8) — both optional, hot-reloadable via SIGHUP.
+#
+# catalog_mode: "normal" (or omitted) exposes every namespaced upstream tool in
+# tools/list, as always. "lazy" enables progressive tool disclosure: the client
+# sees exactly THREE gateway meta-tools — gate_search_tools(query),
+# gate_describe(name), gate_call(name, arguments) — and discovers/invokes the
+# real catalog through them on demand, keeping the client's tool list (and its
+# token cost) tiny however many upstreams are aggregated. Direct calls to
+# namespaced tool names keep working in lazy mode.
+# catalog_mode: lazy
+#
+# page_size: opt-in pagination of tools/list — pages of at most this many tools
+# linked by an opaque nextCursor (MCP pagination). 0 / omitted = the whole
+# catalog in one response. PRECEDENCE: ignored when catalog_mode is "lazy" (a
+# fixed list of three meta-tools never paginates).
+# page_size: 50
+
 # Auto-restart policy for stdio upstreams whose child process dies while the
 # gateway runs (a single GLOBAL policy — every upstream restart replays the exact
 # config it was first launched with). HTTP upstreams have no process to restart.
