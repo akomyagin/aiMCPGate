@@ -9,10 +9,14 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// Gateway capability objects advertised to the client on initialize. Resources
-// are not aggregated in the MVP (see handleResourcesList), so only the tools
-// capability is declared. They are raw JSON literals because the gateway does
-// not otherwise interpret its own capability object.
+// buildCapabilities assembles the gateway's own capability object, advertised
+// to the client on initialize. Resources are not aggregated in the MVP (see
+// handleResourcesList), so only the tools capability is declared today — but
+// the object is built structurally (map → json.Marshal) rather than as a
+// string literal, so upcoming rounds can add CONDITIONAL capabilities
+// (prompts/resources/logging — advertised only when
+// reg.HasUpstreamCapability(...) says at least one upstream backs them)
+// without rebuilding this function.
 //
 // listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
 // catalog is dynamic (auto-restart, upstream list_changed, reload), so the
@@ -23,10 +27,18 @@ import (
 // notifications; it truthfully advertises listChanged:false and clients simply
 // see the updated catalog on their next tools/list. Building the GET SSE channel
 // is deferred future work.
-var (
-	gatewayCapabilitiesListChanged   = json.RawMessage(`{"tools":{"listChanged":true}}`)
-	gatewayCapabilitiesNoListChanged = json.RawMessage(`{"tools":{"listChanged":false}}`)
-)
+func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage {
+	_ = reg // consulted from the next rounds on (HasUpstreamCapability for prompts/resources/logging)
+	caps := map[string]any{
+		"tools": map[string]any{"listChanged": listChanged},
+	}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		// Unreachable for a map of plain bools; keep initialize alive anyway.
+		return json.RawMessage(`{}`)
+	}
+	return b
+}
 
 // dispatcher is the transport-agnostic core of the client-facing gateway: given
 // one decoded client message it produces the reply (or nil, for a notification
@@ -42,22 +54,19 @@ type dispatcher struct {
 	reg     *registry.Registry
 	log     *slog.Logger
 	version string
-	// capabilities is what handleInitialize advertises. It is chosen per
-	// transport (Stage 7c): stdio can push server→client notifications so it
-	// declares listChanged:true, HTTP (POST-only) cannot so it declares false.
-	capabilities json.RawMessage
+	// listChanged is whether this transport can push a server→client
+	// notifications/tools/list_changed (Stage 7c): true for stdio, false for
+	// the POST-only HTTP transport. handleInitialize feeds it to
+	// buildCapabilities on every handshake.
+	listChanged bool
 }
 
 // newDispatcher builds the shared method-handling core. listChanged tells it
 // which tools capability to advertise: true only for a transport that can push
 // a server→client notifications/tools/list_changed (stdio), false otherwise
-// (HTTP POST-only). See gatewayCapabilities* for the reasoning.
+// (HTTP POST-only). See buildCapabilities for the reasoning.
 func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
-	caps := gatewayCapabilitiesNoListChanged
-	if listChanged {
-		caps = gatewayCapabilitiesListChanged
-	}
-	return &dispatcher{reg: reg, log: log, version: version, capabilities: caps}
+	return &dispatcher{reg: reg, log: log, version: version, listChanged: listChanged}
 }
 
 // dispatch handles one client message and returns the reply to send back, or
@@ -100,6 +109,11 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 	}
 
 	switch msg.Method {
+	case mcp.MethodPing:
+		// Liveness check, answered with an empty result — the one request the
+		// spec allows at ANY time, including before the initialize handshake
+		// (MCP_NOTES §4), so it deliberately consults nothing and cannot fail.
+		return mcp.NewResult(msg.ID, json.RawMessage("{}"))
 	case mcp.MethodInitialize:
 		return d.handleInitialize(msg)
 	case mcp.MethodToolsList:
@@ -116,17 +130,44 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 }
 
 // handleInitialize answers the client handshake with the gateway's own
-// serverInfo and aggregated capabilities, echoing the client's id.
+// serverInfo, its aggregated capabilities and the concatenated upstream
+// instructions, echoing the client's id.
+//
+// The client's own params (clientInfo etc.) are parsed TOLERANTLY, for the
+// debug log only: malformed initialize params must not fail the handshake —
+// the gateway needs nothing from them to answer, so the worst case is an
+// unidentified client. (The transports run the same tolerant parse via
+// clientString to attach the identity to later calls' contexts.)
 func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
+	if client := clientString(req.Params); client != "" {
+		d.log.Debug("client initialize", "client", client)
+	}
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    d.capabilities,
+		Capabilities:    buildCapabilities(d.reg, d.listChanged),
 		ServerInfo: mcp.Implementation{
 			Name:    "aiMCPGate",
 			Version: d.version,
 		},
+		Instructions: d.reg.Instructions(),
 	}
 	return mcp.NewResult(req.ID, mcp.MustParams(result))
+}
+
+// clientString extracts the calling client's identity from initialize params
+// as "name/version" — the string CallRecord.Client carries. The parse is
+// tolerant by design: malformed or absent params yield "" (an unidentified
+// client), never an error — initialize must succeed regardless. Empty when
+// both clientInfo fields are empty.
+func clientString(params json.RawMessage) string {
+	var p mcp.InitializeParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil {
+		return ""
+	}
+	if p.ClientInfo.Name == "" && p.ClientInfo.Version == "" {
+		return ""
+	}
+	return p.ClientInfo.Name + "/" + p.ClientInfo.Version
 }
 
 // handleToolsList returns the aggregated, namespaced catalog. Each tool's
@@ -160,7 +201,9 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "tools/call missing tool name", nil)
 	}
 
-	resp, err := d.reg.CallTool(ctx, params.Name, params.Arguments)
+	// params.Meta (the client's `_meta`, e.g. progressToken) rides along
+	// verbatim — the registry hands it to the upstream untouched.
+	resp, err := d.reg.CallTool(ctx, params.Name, params.Arguments, params.Meta)
 	if err != nil {
 		// Routing/transport failure (unknown tool, dead upstream, timeout):
 		// surface it as a JSON-RPC error under the client's id. err.Error() is

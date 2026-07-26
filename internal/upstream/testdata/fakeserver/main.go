@@ -7,7 +7,12 @@
 //
 //	FAKE_NAME        server name reported in serverInfo/initialize (default "fake")
 //	FAKE_TOOLS       comma-separated tool names to advertise in tools/list
-//	FAKE_ECHO        if "1", tools/call echoes back the received arguments as text
+//	FAKE_ECHO        if "1", tools/call echoes back the received arguments as
+//	                 text; a received `_meta` object is appended as
+//	                 "|_meta=<raw>" so tests can assert the gateway proxied it
+//	FAKE_INSTRUCTIONS  if non-empty, reported as `instructions` in the
+//	                 initialize result — used to test the gateway's
+//	                 instructions aggregation
 //	FAKE_CALL_DELAY  Go duration (e.g. "2s") to sleep before answering tools/call;
 //	                 used to exercise the gateway's call-timeout path. Handshake
 //	                 and tools/list are never delayed by it (see FAKE_INIT_DELAY).
@@ -167,8 +172,13 @@ func main() {
 				time.Sleep(initDelay)
 			}
 			result := fmt.Sprintf(
-				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"1.0.0"}}`,
+				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"1.0.0"}`,
 				name)
+			if instr := os.Getenv("FAKE_INSTRUCTIONS"); instr != "" {
+				b, _ := json.Marshal(instr)
+				result += `,"instructions":` + string(b)
+			}
+			result += "}"
 			write(message{ID: req.ID, Result: json.RawMessage(result)})
 		case "notifications/initialized":
 			// no response
@@ -251,11 +261,17 @@ func callResult(params json.RawMessage, echo bool) string {
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+		Meta      json.RawMessage `json:"_meta"`
 	}
 	_ = json.Unmarshal(params, &p)
 	text := "called " + p.Name
 	if echo && len(p.Arguments) > 0 {
 		text = string(p.Arguments)
+	}
+	if echo && len(p.Meta) > 0 {
+		// Surface the received _meta so gateway tests can assert it was
+		// proxied through (and, by its absence, that none was invented).
+		text += "|_meta=" + string(p.Meta)
 	}
 	b, _ := json.Marshal(text)
 	return fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":false}`, b)

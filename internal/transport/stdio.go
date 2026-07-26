@@ -84,6 +84,14 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	initialized := false
 	pendingListChanged := false
 
+	// dispatchCtx is what every d.dispatch call receives. stdio serves exactly
+	// ONE client per process, so after a successful initialize it is wrapped
+	// ONCE with that client's identity (registry.WithClient) and every later
+	// call — tools/call above all — is audited with it (CallRecord.Client).
+	// Before initialize it is just ctx; cancellation semantics are identical
+	// either way (WithClient adds only a value).
+	dispatchCtx := ctx
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,7 +127,7 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				continue
 			}
 			isInitialize := fr.msg.IsRequest() && fr.msg.Method == mcp.MethodInitialize
-			reply := s.d.dispatch(ctx, fr.msg)
+			reply := s.d.dispatch(dispatchCtx, fr.msg)
 			if reply == nil {
 				continue // notification or ignored message: nothing to write
 			}
@@ -134,6 +142,13 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				// here on. Flush a catalog change that arrived during the gate —
 				// it always lands AFTER the initialize response.
 				initialized = true
+				// Attach the client identity from the initialize params to every
+				// subsequent dispatch (see dispatchCtx above). Wrapping the BASE
+				// ctx, not the previous dispatchCtx, keeps a re-initialize from
+				// stacking values — the latest client simply wins.
+				if client := clientString(fr.msg.Params); client != "" {
+					dispatchCtx = registry.WithClient(ctx, client)
+				}
 				if pendingListChanged {
 					pendingListChanged = false
 					if err := s.pushListChanged(ctx); err != nil {

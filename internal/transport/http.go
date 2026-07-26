@@ -189,6 +189,15 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 // handlePost decodes the single JSON-RPC message in the request body, dispatches
 // it, and replies: 202 Accepted with no body for a notification (nothing to
 // answer), or a single application/json JSON-RPC response for a request.
+//
+// Client identification (CallRecord.Client) is a KNOWN LIMITATION here: the
+// gateway issues no server-side session id (Mcp-Session-Id), so an HTTP
+// request after initialize carries nothing tying it back to the client that
+// initialized — requests are stateless to us. The client identity is therefore
+// attached (registry.WithClient) only to the initialize request ITSELF, whose
+// params carry clientInfo; every other request — tools/call included — is
+// audited with an empty Client over HTTP. Fixing this honestly requires
+// real session management, deliberately out of scope for this round.
 func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
@@ -201,7 +210,12 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply := s.d.dispatch(r.Context(), &msg)
+	ctx := r.Context()
+	if msg.IsRequest() && msg.Method == mcp.MethodInitialize {
+		// Per-request only — see the limitation in the doc comment above.
+		ctx = registry.WithClient(ctx, clientString(msg.Params))
+	}
+	reply := s.d.dispatch(ctx, &msg)
 	if reply == nil {
 		// A notification (or response) the gateway accepts but need not answer.
 		w.WriteHeader(http.StatusAccepted)

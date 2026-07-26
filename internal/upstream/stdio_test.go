@@ -90,7 +90,7 @@ func TestStdioConnCallToolEcho(t *testing.T) {
 	}
 
 	args := json.RawMessage(`{"url":"https://example.com"}`)
-	resp, err := conn.CallTool(ctx, "fetch", args)
+	resp, err := conn.CallTool(ctx, "fetch", args, nil)
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			args := json.RawMessage(`{"seq":` + itoa(i) + `}`)
-			out, err := conn.CallTool(ctx, "t", args)
+			out, err := conn.CallTool(ctx, "t", args, nil)
 			results <- res{i, out, err}
 		}(i)
 	}
@@ -181,7 +181,7 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 	// A subsequent call must fail promptly.
 	done := make(chan error, 1)
 	go func() {
-		_, err := conn.CallTool(ctx, "t", nil)
+		_, err := conn.CallTool(ctx, "t", nil, nil)
 		done <- err
 	}()
 	select {
@@ -359,7 +359,7 @@ func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
 	defer callCancel()
 
 	start := time.Now()
-	_, err = conn.CallTool(callCtx, "t", big)
+	_, err = conn.CallTool(callCtx, "t", big, nil)
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CallTool err=%v, want context.DeadlineExceeded", err)
@@ -394,7 +394,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 
 	callCtx, callCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer callCancel()
-	resp, err := conn.CallTool(callCtx, "t", nil)
+	resp, err := conn.CallTool(callCtx, "t", nil, nil)
 	if err == nil {
 		t.Fatalf("CallTool delivered the malformed hybrid as a valid response: %+v", resp)
 	}
@@ -419,7 +419,7 @@ func TestCallOnClosedConnReturnsBeforeSendSentinel(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	_, err = conn.CallTool(ctx, "t", nil)
+	_, err = conn.CallTool(ctx, "t", nil, nil)
 	if !errors.Is(err, upstream.ErrConnClosedBeforeSend) {
 		t.Errorf("err=%v, want errors.Is(err, ErrConnClosedBeforeSend)", err)
 	}

@@ -225,7 +225,7 @@ func TestHTTPCallToolJSON(t *testing.T) {
 	if _, err := conn.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	resp, err := conn.CallTool(ctx, "fetch", json.RawMessage(`{"q":"golang"}`))
+	resp, err := conn.CallTool(ctx, "fetch", json.RawMessage(`{"q":"golang"}`), nil)
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestHTTPCallToolSSE(t *testing.T) {
 	if _, err := conn.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize over SSE: %v", err)
 	}
-	resp, err := conn.CallTool(ctx, "fetch", json.RawMessage(`{"q":"sse-works"}`))
+	resp, err := conn.CallTool(ctx, "fetch", json.RawMessage(`{"q":"sse-works"}`), nil)
 	if err != nil {
 		t.Fatalf("CallTool over SSE: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestHTTPSessionIDEchoed(t *testing.T) {
 	if _, err := conn.ListTools(ctx); err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if _, err := conn.CallTool(ctx, "fetch", nil); err != nil {
+	if _, err := conn.CallTool(ctx, "fetch", nil, nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 
@@ -365,7 +365,7 @@ func TestCallRejectsNonResponseBody(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client(), "0.0.0-test")
 	defer func() { _ = conn.Close() }()
 
-	if _, err := conn.CallTool(context.Background(), "fetch", nil); err == nil {
+	if _, err := conn.CallTool(context.Background(), "fetch", nil, nil); err == nil {
 		t.Fatal("body without result/error: want an error, got success")
 	}
 }
@@ -383,7 +383,7 @@ func TestCallRejectsMismatchedID(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client(), "0.0.0-test")
 	defer func() { _ = conn.Close() }()
 
-	_, err := conn.CallTool(context.Background(), "fetch", nil)
+	_, err := conn.CallTool(context.Background(), "fetch", nil, nil)
 	if err == nil {
 		t.Fatal("response with a mismatched id: want an error, got success")
 	}
@@ -410,7 +410,7 @@ func TestCallAcceptsNullResult(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client(), "0.0.0-test")
 	defer func() { _ = conn.Close() }()
 
-	resp, err := conn.CallTool(context.Background(), "fetch", nil)
+	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
 	if err != nil {
 		t.Fatalf(`"result": null is a valid response, got error: %v`, err)
 	}
@@ -508,7 +508,7 @@ func TestHTTPSessionExpiry404ReinitializesAndRetries(t *testing.T) {
 
 	f.expire() // the server forgets sess-1 behind our back
 
-	resp, err := conn.CallTool(ctx, "fetch", nil)
+	resp, err := conn.CallTool(ctx, "fetch", nil, nil)
 	if err != nil {
 		t.Fatalf("CallTool after session expiry: want transparent recovery, got %v", err)
 	}
@@ -543,7 +543,7 @@ func TestHTTPSessionExpiryRetriesOnlyOnce(t *testing.T) {
 		t.Fatalf("Initialize: %v", err)
 	}
 
-	_, err := conn.CallTool(ctx, "fetch", nil)
+	_, err := conn.CallTool(ctx, "fetch", nil, nil)
 	if err == nil {
 		t.Fatal("upstream 404s every session-carrying request: want an error, got success")
 	}
@@ -583,7 +583,7 @@ func TestHTTPSSEMultiLineDataConcatenated(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "multiline", srv.URL, nil, srv.Client(), "0.0.0-test")
 	defer func() { _ = conn.Close() }()
 
-	resp, err := conn.CallTool(context.Background(), "fetch", nil)
+	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
 	if err != nil {
 		t.Fatalf("CallTool over multi-line SSE: %v", err)
 	}
@@ -625,7 +625,7 @@ func TestHTTPJSONBodyDrainedForKeepAlive(t *testing.T) {
 
 	const calls = 4
 	for i := 0; i < calls; i++ {
-		if _, err := conn.CallTool(context.Background(), "fetch", nil); err != nil {
+		if _, err := conn.CallTool(context.Background(), "fetch", nil, nil); err != nil {
 			t.Fatalf("CallTool %d: %v", i, err)
 		}
 	}
@@ -684,7 +684,7 @@ func TestHTTPNegotiatedProtocolVersionEchoed(t *testing.T) {
 	if _, err := conn.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	if _, err := conn.CallTool(ctx, "fetch", nil); err != nil {
+	if _, err := conn.CallTool(ctx, "fetch", nil, nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 

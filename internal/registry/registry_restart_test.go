@@ -83,7 +83,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 	defer r.Close()
 
 	// First call succeeds, then the child exits (FAKE_EXIT_AFTER=1).
-	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{"x":1}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{"x":1}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 
@@ -172,7 +172,7 @@ func TestSupervisorReapsCrashedProcess(t *testing.T) {
 
 	// Trigger the crash (fakeserver exits after answering, FAKE_EXIT_AFTER=1)
 	// and wait for the supervisor to relaunch it.
-	if _, err := r.CallTool(context.Background(), "crasher__ping", nil); err != nil {
+	if _, err := r.CallTool(context.Background(), "crasher__ping", nil, nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 	waitForTool(t, r, "crasher__ping", 5*time.Second)
@@ -192,7 +192,7 @@ func callSucceedsWithin(r *Registry, ns string, within time.Duration) bool {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, err := r.CallTool(ctx, ns, []byte(`{}`))
+		_, err := r.CallTool(ctx, ns, []byte(`{}`), nil)
 		cancel()
 		if err == nil {
 			return true
@@ -246,7 +246,7 @@ func TestSupervisorGivesUpAndDrops(t *testing.T) {
 	if err := os.Remove(bin); err != nil {
 		t.Fatalf("remove binary: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "doomed__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "doomed__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 
@@ -276,7 +276,7 @@ func TestSupervisorDisabled(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "solo__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "solo__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 	// The child has now exited. With restart disabled it never comes back, so a
@@ -312,7 +312,7 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "flapper__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "flapper__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 	// Let a couple of restart cycles happen so the supervisor is genuinely busy.
@@ -398,7 +398,7 @@ func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
 		t.Fatalf("connB.ListTools: %v", err)
 	}
 	r.mu.Lock()
-	r.installLocked("up", connB, toolsB, "test: fresh conn installed")
+	r.installLocked("up", connB, toolsB, nil, "test: fresh conn installed")
 	r.mu.Unlock()
 	if !hasTool(r, "up__b") {
 		t.Fatal("precondition: up__b not in catalog after installing the fresh conn")

@@ -115,7 +115,7 @@ func TestNoSuperviseSkipsRestart(t *testing.T) {
 	// Crash the child (FAKE_EXIT_AFTER=1). With supervise=false no supervisor
 	// exists to revive it, so calls must keep failing — if auto-restart had
 	// (wrongly) run, callSucceedsWithin would observe a success.
-	if _, err := r.CallTool(context.Background(), "once__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "once__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 	if callSucceedsWithin(r, "once__ping", 2*time.Second) {
