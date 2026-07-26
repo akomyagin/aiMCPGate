@@ -10,6 +10,14 @@
 //	FAKE_ECHO        if "1", tools/call echoes back the received arguments as
 //	                 text; a received `_meta` object is appended as
 //	                 "|_meta=<raw>" so tests can assert the gateway proxied it
+//	FAKE_PROMPTS     comma-separated prompt names to advertise in prompts/list.
+//	                 When non-empty the initialize result also declares the
+//	                 "prompts" capability, and prompts/get answers with a
+//	                 deterministic message that echoes the requested name and
+//	                 raw arguments — so gateway tests can assert both the
+//	                 namespace→original rewrite and verbatim argument passing
+//	                 (Round 4). When empty, no capability is declared and the
+//	                 prompts/* methods fall through to method-not-found.
 //	FAKE_INSTRUCTIONS  if non-empty, reported as `instructions` in the
 //	                 initialize result — used to test the gateway's
 //	                 instructions aggregation
@@ -114,6 +122,10 @@ func main() {
 		tools = strings.Split(raw, ",")
 	}
 	echo := os.Getenv("FAKE_ECHO") == "1"
+	var prompts []string
+	if raw := os.Getenv("FAKE_PROMPTS"); raw != "" {
+		prompts = strings.Split(raw, ",")
+	}
 	var callDelay time.Duration
 	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
 		callDelay, _ = time.ParseDuration(raw)
@@ -213,9 +225,13 @@ func main() {
 			if initDelay > 0 {
 				time.Sleep(initDelay)
 			}
+			caps := `{"tools":{}}`
+			if len(prompts) > 0 {
+				caps = `{"tools":{},"prompts":{}}`
+			}
 			result := fmt.Sprintf(
-				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"1.0.0"}`,
-				name)
+				`{"protocolVersion":"2025-06-18","capabilities":%s,"serverInfo":{"name":%q,"version":"1.0.0"}`,
+				caps, name)
 			if instr := os.Getenv("FAKE_INSTRUCTIONS"); instr != "" {
 				b, _ := json.Marshal(instr)
 				result += `,"instructions":` + string(b)
@@ -242,6 +258,20 @@ func main() {
 					f.Close()
 				}
 			}
+		case "prompts/list":
+			if len(prompts) == 0 {
+				// No FAKE_PROMPTS: behave like a server without the prompts
+				// capability — the method is simply unknown.
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: prompts/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(promptsListResult(prompts))})
+		case "prompts/get":
+			if len(prompts) == 0 {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: prompts/get"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(promptGetResult(req.Params))})
 		case "tools/call":
 			if progress {
 				// Echo the client's progressToken back in a progress
@@ -337,6 +367,36 @@ func toolsListResult(tools []string) string {
 	}
 	b.WriteString(`]}`)
 	return b.String()
+}
+
+func promptsListResult(prompts []string) string {
+	var b strings.Builder
+	b.WriteString(`{"prompts":[`)
+	for i, name := range prompts {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":%q,"description":"fake prompt %s","arguments":[{"name":"text","required":false}]}`, name, name)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// promptGetResult echoes the requested prompt name and raw arguments back in
+// the message text, so gateway tests can assert the namespace→original name
+// rewrite and verbatim argument forwarding.
+func promptGetResult(params json.RawMessage) string {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	_ = json.Unmarshal(params, &p)
+	text := "prompt " + p.Name
+	if len(p.Arguments) > 0 {
+		text += "|args=" + string(p.Arguments)
+	}
+	b, _ := json.Marshal(text)
+	return fmt.Sprintf(`{"description":"fake prompt %s","messages":[{"role":"user","content":{"type":"text","text":%s}}]}`, p.Name, b)
 }
 
 func callResult(params json.RawMessage, echo bool) string {

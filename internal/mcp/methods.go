@@ -12,6 +12,8 @@ const (
 	MethodToolsCall    = "tools/call"
 	MethodResourceList = "resources/list"
 	MethodResourceRead = "resources/read"
+	MethodPromptsList  = "prompts/list"
+	MethodPromptsGet   = "prompts/get"
 
 	// MethodPing is the liveness check either side may send at any time —
 	// including BEFORE the initialize handshake completes (the only request the
@@ -116,6 +118,42 @@ type ToolsCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 	Meta      json.RawMessage `json:"_meta,omitempty"`
+}
+
+// Prompt is one entry in a prompts/list result.
+//
+// Description is RawMessage for the same reason as Tool.Description — the
+// exact JSON is proxied to the client verbatim. Arguments is the upstream's
+// PromptArgument array, also verbatim: the gateway never parses individual
+// prompt arguments, it only namespaces the prompt name.
+type Prompt struct {
+	Name        string          `json:"name"`
+	Title       string          `json:"title,omitempty"`
+	Description json.RawMessage `json:"description,omitempty"`
+	Arguments   json.RawMessage `json:"arguments,omitempty"`
+}
+
+// PromptsListParams carries the optional pagination cursor.
+type PromptsListParams struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// PromptsListResult is the result of a prompts/list response.
+type PromptsListResult struct {
+	Prompts    []Prompt `json:"prompts"`
+	NextCursor string   `json:"nextCursor,omitempty"`
+}
+
+// PromptsGetParams is the params object of a prompts/get request. Arguments is
+// proxied verbatim.
+//
+// There is deliberately NO PromptsGetResult type: the gateway forwards the
+// upstream's result (description/messages) verbatim as the response payload,
+// exactly like tools/call — only prompts/list, where the gateway actually
+// aggregates entries across upstreams, needs typing.
+type PromptsGetParams struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
 // Resource is one entry in a resources/list result.

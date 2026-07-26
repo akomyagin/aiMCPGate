@@ -74,7 +74,20 @@ type ToolDescriptor struct {
 	Tool     mcp.Tool
 }
 
-// route maps a namespaced tool name back to its upstream and original name.
+// PromptDescriptor is one aggregated prompt entry in the merged catalog
+// (Round 4) — ToolDescriptor's prompts twin. Name is the client-facing
+// namespaced name; unlike tools, prompts do NOT pass through config.ToolFilter
+// (no allow/deny/rename mechanism exists for them in this round), so Name is
+// always "<upstream>__<original>", without exception. The prompt itself
+// (Description/Arguments) is carried verbatim from the upstream.
+type PromptDescriptor struct {
+	Name     string
+	Upstream string
+	Prompt   mcp.Prompt
+}
+
+// route maps a namespaced tool or prompt name back to its upstream and
+// original name.
 type route struct {
 	upstream string
 	original string
@@ -103,9 +116,16 @@ type Upstream interface {
 	Initialize(ctx context.Context) (*mcp.InitializeResult, error)
 	ListTools(ctx context.Context) ([]mcp.Tool, error)
 	ListResources(ctx context.Context) ([]mcp.Resource, error)
+	// ListPrompts fetches the upstream's prompt catalog (Round 4). The registry
+	// calls it only for upstreams that declared the prompts capability in
+	// initialize — never as a blind probe.
+	ListPrompts(ctx context.Context) ([]mcp.Prompt, error)
 	// CallTool forwards one tools/call. meta is the client's optional `_meta`
 	// object, proxied verbatim (nil when the client sent none).
 	CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error)
+	// GetPrompt forwards one prompts/get with the upstream's ORIGINAL prompt
+	// name (the registry resolves the namespace before calling).
+	GetPrompt(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error)
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
 	// long-lived process (stdio); ok is false when there is no such process
@@ -183,6 +203,17 @@ type Registry struct {
 	// re-list. Guarded by the same r.mu as conns/tools/toolRoute because the
 	// four are always mutated together (mergeLocked/dropLocked).
 	rawTools map[string][]mcp.Tool
+	// prompts/promptRoute are the aggregated prompt catalog and its routing
+	// table (Round 4) — the prompts twins of tools/toolRoute, mutated only by
+	// mergeLocked/dropLocked under the same r.mu. rawPrompts keeps the
+	// per-upstream prompt list so catalog rewrites that fetched no fresh
+	// prompts (a tools-only re-list, a filter-only re-projection) can carry the
+	// existing prompts over instead of losing them — the same role rawTools
+	// plays for filter reloads. Prompts do not pass through config.ToolFilter:
+	// the client-facing name is always "<upstream>__<original>".
+	prompts     map[string]PromptDescriptor
+	promptRoute map[string]route
+	rawPrompts  map[string][]mcp.Prompt
 	// handshakes holds the per-upstream slice of the initialize handshake the
 	// gateway keeps after launch: the upstream's instructions (aggregated into
 	// the gateway's own InitializeResult.Instructions) and its raw capabilities
@@ -321,6 +352,9 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		tools:        map[string]ToolDescriptor{},
 		toolRoute:    map[string]route{},
 		rawTools:     map[string][]mcp.Tool{},
+		prompts:      map[string]PromptDescriptor{},
+		promptRoute:  map[string]route{},
+		rawPrompts:   map[string][]mcp.Prompt{},
 		handshakes:   map[string]handshakeMeta{},
 		subscribers:  map[int]chan struct{}{},
 		notifSubs:    map[int]chan mcp.Message{},
@@ -415,18 +449,19 @@ func (r *Registry) Start(ctx context.Context) error {
 	// goroutine completion order, nondeterministic across runs of an identical
 	// config (the same fix Reload's changed/added pass received earlier).
 	type launchOutcome struct {
-		conn  Upstream
-		tools []mcp.Tool
-		meta  handshakeMeta
-		err   error
+		conn    Upstream
+		tools   []mcp.Tool
+		prompts []mcp.Prompt
+		meta    handshakeMeta
+		err     error
 	}
 	results := make([]launchOutcome, len(enabled))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, u := range enabled {
 		i, u := i, u
 		g.Go(func() error {
-			conn, tools, meta, err := r.launch(gctx, u)
-			results[i] = launchOutcome{conn: conn, tools: tools, meta: meta, err: err}
+			conn, tools, prompts, meta, err := r.launch(gctx, u)
+			results[i] = launchOutcome{conn: conn, tools: tools, prompts: prompts, meta: meta, err: err}
 			return nil // errors are isolated per-upstream, never propagated
 		})
 	}
@@ -450,7 +485,7 @@ func (r *Registry) Start(ctx context.Context) error {
 			r.recordFailure(u.Name, res.err.Error())
 			continue
 		}
-		n := r.merge(u.Name, res.conn, res.tools, res.meta)
+		n := r.merge(u.Name, res.conn, res.tools, res.prompts, res.meta)
 		r.recordSuccess(u.Name, n)
 		r.superviseUpstream(u, res.conn)
 	}
@@ -473,22 +508,23 @@ func (r *Registry) Start(ctx context.Context) error {
 }
 
 // launch starts one upstream and runs the full handshake sequence
-// (start → Initialize → ListTools), returning the live connection, its tool
-// catalog and the retained handshake metadata (instructions/capabilities from
-// the InitializeResult). It is the single reusable "bring an
-// upstream to a usable state" primitive shared by the first start (Start),
-// the auto-restart supervisor (Stage 7a) and hot-reload (Stage 7d). On any
-// failure it tears the connection back down and returns a single error whose
-// message names the failing phase — the caller decides whether to record it as
-// a start-time failure, retry it, or log it.
+// (start → Initialize → ListTools → best-effort ListPrompts), returning the
+// live connection, its tool catalog, its prompt catalog and the retained
+// handshake metadata (instructions/capabilities from the InitializeResult).
+// It is the single reusable "bring an upstream to a usable state" primitive
+// shared by the first start (Start), the auto-restart supervisor (Stage 7a)
+// and hot-reload (Stage 7d). On any failure it tears the connection back down
+// and returns a single error whose message names the failing phase — the
+// caller decides whether to record it as a start-time failure, retry it, or
+// log it.
 //
 // The child process is launched under r.procCtx (long-lived, see procCtx);
 // ctx bounds only the handshake RPCs so a slow upstream cannot block Start (or
 // a restart) indefinitely.
-func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []mcp.Tool, handshakeMeta, error) {
+func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []mcp.Tool, []mcp.Prompt, handshakeMeta, error) {
 	conn, err := r.start(r.procCtx, u)
 	if err != nil {
-		return nil, nil, handshakeMeta{}, fmt.Errorf("failed to start: %w", err)
+		return nil, nil, nil, handshakeMeta{}, fmt.Errorf("failed to start: %w", err)
 	}
 
 	// Upstream→registry notifications (Stage 7b) are wired inside startStdio —
@@ -502,7 +538,7 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 		return err
 	}); err != nil {
 		_ = conn.Close()
-		return nil, nil, handshakeMeta{}, fmt.Errorf("handshake failed: %w", err)
+		return nil, nil, nil, handshakeMeta{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	r.log.Info("upstream initialized", "upstream", u.Name, "server", info.ServerInfo.Name)
 	meta := handshakeMeta{instructions: info.Instructions, capabilities: info.Capabilities}
@@ -514,10 +550,29 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 		return err
 	}); err != nil {
 		_ = conn.Close()
-		return nil, nil, handshakeMeta{}, fmt.Errorf("tools/list failed: %w", err)
+		return nil, nil, nil, handshakeMeta{}, fmt.Errorf("tools/list failed: %w", err)
 	}
 
-	return conn, tools, meta, nil
+	// Prompts (Round 4): fetched only when the upstream DECLARED the prompts
+	// capability in its initialize response — an upstream without it need not
+	// even recognize prompts/list, so probing blindly would provoke pointless
+	// method-not-found errors. Best-effort, unlike tools/list above: a failing
+	// prompts/list degrades this upstream to "no prompts" (Warn) instead of
+	// failing the whole launch — prompts are auxiliary next to the tool catalog
+	// the gateway exists for.
+	var prompts []mcp.Prompt
+	if hasCapability(info.Capabilities, "prompts") {
+		if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+			var err error
+			prompts, err = conn.ListPrompts(ctx)
+			return err
+		}); err != nil {
+			r.log.Warn("prompts/list failed, continuing without prompts", "upstream", u.Name, "err", err)
+			prompts = nil
+		}
+	}
+
+	return conn, tools, prompts, meta, nil
 }
 
 // withCallTimeout runs fn under a child context bounded by the CURRENT
@@ -712,7 +767,7 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 		case <-timer.C:
 		}
 
-		conn, tools, meta, err := r.launch(r.procCtx, u)
+		conn, tools, prompts, meta, err := r.launch(r.procCtx, u)
 		if err != nil {
 			r.log.Warn("stdio upstream restart attempt failed",
 				"upstream", u.Name, "attempt", attempt, "err", err)
@@ -728,7 +783,7 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
 			return nil, nil, false
 		}
-		if !r.replaceUpstreamIfLive(u.Name, conn, tools, meta, supCtx) {
+		if !r.replaceUpstreamIfLive(u.Name, conn, tools, prompts, meta, supCtx) {
 			// A reload retired this upstream while we were launching: the fresh
 			// connection must not enter the catalog (that would resurrect an
 			// upstream the reload just removed/replaced). Close it and stop.
@@ -869,15 +924,15 @@ func (r *Registry) relistUpstream(name string) {
 	r.notifyCatalogChanged()
 }
 
-// merge namespaces an upstream's tools and adds them to the aggregated catalog
-// and routing table under the registry lock, recording the handshake metadata
-// launch retained alongside. It returns the number of tools actually projected
-// into the catalog (post-filter, post-dedup).
-func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool, meta handshakeMeta) int {
+// merge namespaces an upstream's tools and prompts and adds them to the
+// aggregated catalog and routing tables under the registry lock, recording the
+// handshake metadata launch retained alongside. It returns the number of tools
+// actually projected into the catalog (post-filter, post-dedup).
+func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool, prompts []mcp.Prompt, meta handshakeMeta) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := r.mergeLocked(name, conn, tools, meta)
-	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n)
+	n := r.mergeLocked(name, conn, tools, prompts, meta)
+	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n, "prompts", len(prompts))
 	return n
 }
 
@@ -990,10 +1045,11 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 // It returns the number of entries actually added to the catalog by this call
 // (post-filter, post-dedup) — the count the client really sees, which callers
 // report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
-func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, meta handshakeMeta) int {
+func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, prompts []mcp.Prompt, meta handshakeMeta) int {
 	r.cachedToolsValid = false
 	r.conns[name] = conn
 	r.rawTools[name] = tools
+	r.rawPrompts[name] = prompts
 	r.handshakes[name] = meta
 	n := 0
 	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
@@ -1004,6 +1060,21 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, met
 		r.tools[e.name] = ToolDescriptor{Name: e.name, Upstream: name, Tool: e.tool}
 		r.toolRoute[e.name] = route{upstream: name, original: e.tool.Name}
 		n++
+	}
+	// Prompts (Round 4): no filter/rename mechanism exists for prompts, so the
+	// client-facing name is always the plain "<upstream>__<original>". The
+	// namespacing makes cross-upstream collisions impossible for well-formed
+	// names; keep-first only guards runtime surprises (an upstream whose own
+	// name or prompt names smuggle the separator, or duplicate prompt names
+	// within one upstream) — same policy as tools above.
+	for _, p := range prompts {
+		ns := name + NameSeparator + p.Name
+		if _, dup := r.prompts[ns]; dup {
+			r.log.Warn("duplicate client-facing prompt name skipped", "name", ns, "upstream", name)
+			continue
+		}
+		r.prompts[ns] = PromptDescriptor{Name: ns, Upstream: name, Prompt: p}
+		r.promptRoute[ns] = route{upstream: name, original: p.Name}
 	}
 	return n
 }
@@ -1064,11 +1135,18 @@ func (r *Registry) dropLocked(name string) {
 	r.cachedToolsValid = false
 	delete(r.conns, name)
 	delete(r.rawTools, name)
+	delete(r.rawPrompts, name)
 	delete(r.handshakes, name)
 	for ns, d := range r.tools {
 		if d.Upstream == name {
 			delete(r.tools, ns)
 			delete(r.toolRoute, ns)
+		}
+	}
+	for ns, d := range r.prompts {
+		if d.Upstream == name {
+			delete(r.prompts, ns)
+			delete(r.promptRoute, ns)
 		}
 	}
 }
@@ -1081,14 +1159,21 @@ func (r *Registry) dropLocked(name string) {
 // meta is the handshake metadata to record for the fresh entry; nil means
 // "this path ran no new handshake" (re-list, filter-only re-projection — the
 // connection is unchanged), so the currently recorded metadata is carried
-// over instead of being wiped by dropLocked.
-func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, meta *handshakeMeta, logMsg string) {
+// over instead of being wiped by dropLocked. prompts follows the same nil
+// convention: nil means "this path fetched no fresh prompts" (a tools/
+// list_changed re-list refreshes only tools; a filter re-projection touches
+// nothing upstream), so the currently recorded prompt list is carried over.
+func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, prompts *[]mcp.Prompt, meta *handshakeMeta, logMsg string) {
 	if meta == nil {
 		m := r.handshakes[name] // zero value when absent — nothing to preserve
 		meta = &m
 	}
+	if prompts == nil {
+		p := r.rawPrompts[name] // nil when absent — nothing to preserve
+		prompts = &p
+	}
 	r.dropLocked(name)
-	n := r.mergeLocked(name, conn, tools, *meta)
+	n := r.mergeLocked(name, conn, tools, *prompts, *meta)
 	r.log.Debug(logMsg, "upstream", name, "tools", n)
 }
 
@@ -1103,13 +1188,13 @@ func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, m
 // removed (the supervisor-vs-reload race found by independent review). Returns
 // false — leaving the catalog untouched — when supCtx was already cancelled;
 // the caller then owns closing the never-installed connection.
-func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, meta handshakeMeta, supCtx context.Context) bool {
+func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, prompts []mcp.Prompt, meta handshakeMeta, supCtx context.Context) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if supCtx.Err() != nil {
 		return false
 	}
-	r.installLocked(name, conn, tools, &meta, "upstream catalog replaced")
+	r.installLocked(name, conn, tools, &prompts, &meta, "upstream catalog replaced")
 	return true
 }
 
@@ -1130,8 +1215,9 @@ func (r *Registry) replaceUpstreamIfCurrent(name string, oldConn Upstream, tools
 	if r.conns[name] != oldConn {
 		return false
 	}
-	// nil meta: a re-list runs no new handshake — keep the recorded one.
-	r.installLocked(name, oldConn, tools, nil, "upstream catalog refreshed after list_changed")
+	// nil meta/prompts: a re-list runs no new handshake and refreshes only the
+	// tools — keep the recorded handshake metadata and prompt list.
+	r.installLocked(name, oldConn, tools, nil, nil, "upstream catalog refreshed after list_changed")
 	return true
 }
 
@@ -1369,6 +1455,7 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		u       config.Upstream
 		conn    Upstream
 		tools   []mcp.Tool
+		prompts []mcp.Prompt
 		meta    handshakeMeta
 		err     error
 		changed bool // true: a relaunched (changed) upstream, its old entry already dropped; false: a newly added one
@@ -1383,16 +1470,16 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 			// comment above). The relaunched catalog merges after g.Wait().
 			r.retireAndClose(u.Name)
 			r.dropUpstream(u.Name)
-			conn, tools, meta, err := r.launch(ctx, u)
-			results[i] = launchResult{u: u, conn: conn, tools: tools, meta: meta, err: err, changed: true}
+			conn, tools, prompts, meta, err := r.launch(ctx, u)
+			results[i] = launchResult{u: u, conn: conn, tools: tools, prompts: prompts, meta: meta, err: err, changed: true}
 			return nil
 		})
 	}
 	for j, u := range added {
 		idx, u := len(changed)+j, u
 		g.Go(func() error {
-			conn, tools, meta, err := r.launch(ctx, u)
-			results[idx] = launchResult{u: u, conn: conn, tools: tools, meta: meta, err: err}
+			conn, tools, prompts, meta, err := r.launch(ctx, u)
+			results[idx] = launchResult{u: u, conn: conn, tools: tools, prompts: prompts, meta: meta, err: err}
 			return nil
 		})
 	}
@@ -1414,11 +1501,11 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		case res.changed:
 			// The old entry is long gone (dropped in the goroutine), so this is
 			// a plain merge into an empty name — same call as the added case.
-			r.merge(res.u.Name, res.conn, res.tools, res.meta)
+			r.merge(res.u.Name, res.conn, res.tools, res.prompts, res.meta)
 			r.superviseUpstream(res.u, res.conn)
 			r.log.Info("upstream reconfigured by reload", "upstream", res.u.Name, "tools", len(res.tools))
 		default:
-			r.merge(res.u.Name, res.conn, res.tools, res.meta)
+			r.merge(res.u.Name, res.conn, res.tools, res.prompts, res.meta)
 			r.superviseUpstream(res.u, res.conn)
 			r.log.Info("upstream added by reload", "upstream", res.u.Name, "tools", len(res.tools))
 		}
@@ -1449,8 +1536,9 @@ func (r *Registry) remergeUpstream(name string) {
 		return
 	}
 	tools := r.rawTools[name] // read BEFORE installLocked's drop, which deletes the entry
-	// nil meta: a filter-only re-projection runs no new handshake — keep it.
-	r.installLocked(name, conn, tools, nil, "upstream catalog re-projected")
+	// nil meta/prompts: a filter-only re-projection runs no new handshake and
+	// touches nothing upstream — keep the recorded metadata and prompt list.
+	r.installLocked(name, conn, tools, nil, nil, "upstream catalog re-projected")
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
@@ -1506,6 +1594,62 @@ func (r *Registry) ToolCount() int {
 	return len(r.tools)
 }
 
+// Prompts returns the aggregated, namespaced prompt catalog, sorted by name
+// for deterministic output — Tools()'s prompts twin. Unlike Tools it builds a
+// fresh slice on every call, deliberately without a cachedTools-style cache:
+// prompt catalogs are typically tiny (units, not hundreds) and prompts/list is
+// far rarer than tools/list, so the cache's invalidation bookkeeping would
+// cost more in complexity than the copy costs in CPU. Revisit if either
+// assumption breaks.
+func (r *Registry) Prompts() []PromptDescriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PromptDescriptor, 0, len(r.prompts))
+	for _, d := range r.prompts {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// GetPrompt routes a namespaced prompts/get to its owning upstream, rewriting
+// the name back to the upstream's original before forwarding — CallTool's
+// prompts twin, including the sanitized error contract: a routing/transport
+// failure is logged here with full detail and returned as a short message
+// naming only the prompt the client itself asked for (dispatch.go forwards
+// the text verbatim to the client). The returned *mcp.Message is the raw
+// upstream response (which may itself carry a JSON-RPC error).
+//
+// TODO: retry once on upstream.ErrConnClosedBeforeSend against a re-resolved
+// fresh connection, the way CallTool does — skipped in this round for
+// minimality (prompts/get is read-only and far rarer than tools/call, so the
+// race window matters much less; see CallTool for the pattern to copy).
+func (r *Registry) GetPrompt(ctx context.Context, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
+	r.mu.RLock()
+	rt, ok := r.promptRoute[namespaced]
+	conn := r.conns[rt.upstream]
+	r.mu.RUnlock()
+
+	if !ok || conn == nil {
+		return nil, fmt.Errorf("unknown prompt %q", namespaced)
+	}
+
+	var resp *mcp.Message
+	err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+		var err error
+		resp, err = conn.GetPrompt(ctx, rt.original, arguments)
+		return err
+	})
+	if err != nil {
+		r.log.Warn("prompt get failed", "prompt", namespaced, "upstream", rt.upstream, "err", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("get prompt %q timed out", namespaced)
+		}
+		return nil, fmt.Errorf("get prompt %q failed", namespaced)
+	}
+	return resp, nil
+}
+
 // Instructions aggregates the live upstreams' initialize instructions into one
 // string for the gateway's own InitializeResult.Instructions: each non-empty
 // entry becomes a "## <upstream>" section, sections are sorted by upstream
@@ -1540,15 +1684,24 @@ func (r *Registry) HasUpstreamCapability(capability string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, m := range r.handshakes {
-		var caps map[string]json.RawMessage
-		if json.Unmarshal(m.capabilities, &caps) != nil {
-			continue // absent or malformed capabilities object: contributes nothing
-		}
-		if v, ok := caps[capability]; ok && string(v) != "null" {
+		if hasCapability(m.capabilities, capability) {
 			return true
 		}
 	}
 	return false
+}
+
+// hasCapability reports whether ONE raw capabilities object declares the named
+// capability: the key exists and is not JSON null. Same deliberately shallow
+// check as HasUpstreamCapability (which loops over it); also used by launch to
+// decide whether an upstream may be asked for prompts/list at all.
+func hasCapability(capabilities json.RawMessage, capability string) bool {
+	var caps map[string]json.RawMessage
+	if json.Unmarshal(capabilities, &caps) != nil {
+		return false // absent or malformed capabilities object: declares nothing
+	}
+	v, ok := caps[capability]
+	return ok && string(v) != "null"
 }
 
 // CallTool routes a namespaced tool call to its owning upstream, rewriting the
