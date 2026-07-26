@@ -1,7 +1,9 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -90,6 +92,183 @@ func TestFilterAndRenameTools(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestFilterProjectionRules drives the token-optimization rules of the
+// projection (strip_annotations / strip_output_schema / max_description /
+// describe): each rule alone, their combination, and the invariants — describe
+// is keyed by the ORIGINAL name (like rename) and is never re-truncated by
+// max_description; truncation counts runes, not bytes.
+func TestFilterProjectionRules(t *testing.T) {
+	full := func(name, desc string) mcp.Tool {
+		return mcp.Tool{
+			Name:         name,
+			Description:  mustJSONString(desc),
+			InputSchema:  json.RawMessage(`{"type":"object"}`),
+			OutputSchema: json.RawMessage(`{"type":"string"}`),
+			Annotations:  json.RawMessage(`{"readOnlyHint":true}`),
+		}
+	}
+	tests := []struct {
+		name   string
+		tool   mcp.Tool
+		filter config.ToolFilter
+		check  func(t *testing.T, got mcp.Tool)
+	}{
+		{
+			name:   "strip_annotations drops annotations only",
+			tool:   full("a", "desc"),
+			filter: config.ToolFilter{StripAnnotations: true},
+			check: func(t *testing.T, got mcp.Tool) {
+				if got.Annotations != nil {
+					t.Errorf("Annotations = %s, want nil", got.Annotations)
+				}
+				if got.OutputSchema == nil || got.InputSchema == nil || got.Description == nil {
+					t.Errorf("strip_annotations must not touch other fields: %+v", got)
+				}
+			},
+		},
+		{
+			name:   "strip_output_schema drops outputSchema only",
+			tool:   full("a", "desc"),
+			filter: config.ToolFilter{StripOutputSchema: true},
+			check: func(t *testing.T, got mcp.Tool) {
+				if got.OutputSchema != nil {
+					t.Errorf("OutputSchema = %s, want nil", got.OutputSchema)
+				}
+				if got.Annotations == nil || got.InputSchema == nil || got.Description == nil {
+					t.Errorf("strip_output_schema must not touch other fields: %+v", got)
+				}
+			},
+		},
+		{
+			name:   "max_description truncates by runes with ellipsis",
+			tool:   full("a", "привет мир"), // 10 runes, multi-byte UTF-8
+			filter: config.ToolFilter{MaxDescription: 6},
+			check: func(t *testing.T, got mcp.Tool) {
+				var s string
+				if err := json.Unmarshal(got.Description, &s); err != nil {
+					t.Fatalf("description is not a JSON string: %s", got.Description)
+				}
+				if s != "привет…" {
+					t.Errorf("description = %q, want %q", s, "привет…")
+				}
+			},
+		},
+		{
+			name:   "max_description leaves short description alone",
+			tool:   full("a", "short"),
+			filter: config.ToolFilter{MaxDescription: 5},
+			check: func(t *testing.T, got mcp.Tool) {
+				if string(got.Description) != `"short"` {
+					t.Errorf("description = %s, want %q unchanged", got.Description, `"short"`)
+				}
+			},
+		},
+		{
+			name:   "max_description ignores absent description",
+			tool:   mcp.Tool{Name: "a"},
+			filter: config.ToolFilter{MaxDescription: 3},
+			check: func(t *testing.T, got mcp.Tool) {
+				if got.Description != nil {
+					t.Errorf("description = %s, want nil", got.Description)
+				}
+			},
+		},
+		{
+			name:   "describe replaces description wholesale",
+			tool:   full("a", "long upstream text"),
+			filter: config.ToolFilter{Describe: map[string]string{"a": "short override"}},
+			check: func(t *testing.T, got mcp.Tool) {
+				if string(got.Description) != `"short override"` {
+					t.Errorf("description = %s, want %q", got.Description, `"short override"`)
+				}
+			},
+		},
+		{
+			name: "describe wins over max_description and is never re-truncated",
+			tool: full("a", "upstream"),
+			filter: config.ToolFilter{
+				MaxDescription: 4,
+				Describe:       map[string]string{"a": "override longer than four"},
+			},
+			check: func(t *testing.T, got mcp.Tool) {
+				if string(got.Description) != `"override longer than four"` {
+					t.Errorf("description = %s, want the full override", got.Description)
+				}
+			},
+		},
+		{
+			name: "describe keys the ORIGINAL name even for a renamed tool",
+			tool: full("a", "upstream"),
+			filter: config.ToolFilter{
+				Rename:   map[string]string{"a": "renamed_a"},
+				Describe: map[string]string{"a": "override"},
+			},
+			check: func(t *testing.T, got mcp.Tool) {
+				if string(got.Description) != `"override"` {
+					t.Errorf("description = %s, want %q (describe keyed by original name)", got.Description, `"override"`)
+				}
+			},
+		},
+		{
+			name: "all rules combined",
+			tool: full("a", "две тысячи слов"),
+			filter: config.ToolFilter{
+				StripAnnotations:  true,
+				StripOutputSchema: true,
+				MaxDescription:    3,
+			},
+			check: func(t *testing.T, got mcp.Tool) {
+				if got.Annotations != nil || got.OutputSchema != nil {
+					t.Errorf("annotations/outputSchema must be stripped: %+v", got)
+				}
+				var s string
+				if err := json.Unmarshal(got.Description, &s); err != nil || s != "две…" {
+					t.Errorf("description = %s, want %q", got.Description, "две…")
+				}
+				if got.InputSchema == nil {
+					t.Error("inputSchema must survive the projection")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Keep a deep copy of the raw list: the projection must be pure —
+			// a filter-only reload re-runs it against the SAME stored slice.
+			rawBefore, err := json.Marshal(tt.tool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := []mcp.Tool{tt.tool}
+			out := filterAndRenameTools("up", in, tt.filter)
+			if len(out) != 1 {
+				t.Fatalf("projection kept %d tools, want 1", len(out))
+			}
+			tt.check(t, out[0].tool)
+			rawAfter, err := json.Marshal(in[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(rawBefore, rawAfter) {
+				t.Errorf("projection mutated the raw tool list: before %s, after %s", rawBefore, rawAfter)
+			}
+		})
+	}
+}
+
+// TestTruncateJSONStringNonString pins the pass-through contract: a raw
+// description that is not a JSON string (the gateway proxies whatever the
+// upstream sends) is returned unchanged rather than mangled or dropped.
+func TestTruncateJSONStringNonString(t *testing.T) {
+	raw := json.RawMessage(`{"weird":"object"}`)
+	if got := truncateJSONString(raw, 3); !bytes.Equal(got, raw) {
+		t.Errorf("truncateJSONString(%s) = %s, want unchanged", raw, got)
+	}
+	if got := truncateJSONString(nil, 3); got != nil {
+		t.Errorf("truncateJSONString(nil) = %s, want nil", got)
 	}
 }
 

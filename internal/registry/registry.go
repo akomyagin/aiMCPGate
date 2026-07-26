@@ -848,9 +848,14 @@ type toolEntry struct {
 // filterAndRenameTools projects one upstream's raw tool list through its
 // configured filter (Stage 9): allow (when non-empty — intersection), then
 // deny (subtraction), then rename (client-facing name for survivors; tools
-// without a rename get the default namespaced "<upstream>__<original>").
-// It is pure — no registry state, no side effects — so the projection can be
-// re-run at any time against the stored raw list (filter-only reload).
+// without a rename get the default namespaced "<upstream>__<original>"), then
+// the token-optimization rules — strip annotations/outputSchema, override the
+// description (Describe, keyed by ORIGINAL name like Rename), truncate the
+// description to MaxDescription runes (never applied on top of a Describe
+// override: the override is the config author's final word).
+// It is pure — no registry state, no side effects (mcp.Tool is modified as a
+// copy, never the stored raw list) — so the projection can be re-run at any
+// time against the stored raw list (filter-only reload).
 func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter) []toolEntry {
 	allow := f.AllowSet()
 	deny := f.DenySet()
@@ -867,9 +872,50 @@ func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter
 		if !renamed {
 			name = upstream + NameSeparator + t.Name
 		}
+		if f.StripAnnotations {
+			t.Annotations = nil
+		}
+		if f.StripOutputSchema {
+			t.OutputSchema = nil
+		}
+		if desc := f.Describe[t.Name]; desc != "" {
+			t.Description = mustJSONString(desc)
+		} else if f.MaxDescription > 0 {
+			t.Description = truncateJSONString(t.Description, f.MaxDescription)
+		}
 		out = append(out, toolEntry{name: name, tool: t})
 	}
 	return out
+}
+
+// mustJSONString encodes a plain string as a JSON string literal.
+// json.Marshal of a string cannot fail, hence "must".
+func mustJSONString(s string) json.RawMessage {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err) // unreachable: a Go string always marshals
+	}
+	return b
+}
+
+// truncateJSONString truncates the string carried in a JSON string literal to
+// at most max runes (never bytes — a multi-byte UTF-8 sequence is not cut in
+// the middle), appending "…" when truncation happened. A raw value that is
+// absent, short enough, or not a JSON string (an upstream is free to send
+// anything — the gateway proxies verbatim) is returned unchanged.
+func truncateJSONString(raw json.RawMessage, max int) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return raw
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return raw
+	}
+	return mustJSONString(string(runes[:max]) + "…")
 }
 
 // filterFor looks up the CURRENT tool filter for an upstream by name from the
