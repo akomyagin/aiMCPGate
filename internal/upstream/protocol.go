@@ -103,6 +103,18 @@ func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
 	if err := c.transport.notify(ctx, mcp.NotifInitialized, nil); err != nil {
 		return nil, fmt.Errorf("upstream %q: send initialized: %w", c.Name(), err)
 	}
+
+	// With the handshake fully complete (session id known, initialized sent),
+	// open the long-lived GET SSE stream on which a Streamable-HTTP upstream
+	// pushes server-initiated notifications (Round 13) — the HTTP counterpart
+	// of the reader goroutine StartStdio launches up front. Same type-assert
+	// rationale as setNegotiatedVersion above: stdio's reader needs no
+	// separate kick-off, so the shared interface is not widened for one
+	// transport. Idempotent — a session-expiry re-Initialize does not spawn a
+	// second stream (see startSSEStream).
+	if ht, ok := c.transport.(*httpTransport); ok {
+		ht.startSSEStream()
+	}
 	return &res, nil
 }
 
