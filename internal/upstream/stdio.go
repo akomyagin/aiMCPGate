@@ -41,6 +41,12 @@ var ErrConnClosedBeforeSend = fmt.Errorf("%w: request was not sent to upstream",
 // upstream that keeps stdout open must not hang gateway shutdown forever.
 const closeGracePeriod = 5 * time.Second
 
+// stderrRingSize is how many of the child's most recent stderr lines are kept
+// in memory for post-mortem diagnostics: when the process crashes, the
+// registry's supervisor logs this tail (StderrTail) so the operator sees WHY
+// it died without re-running the gateway at debug level.
+const stderrRingSize = 50
+
 // killWaitTimeout bounds how long Close waits, AFTER force-killing the child,
 // for the reader goroutines to see EOF on stdout/stderr. Kill only reaches the
 // direct child: a grandchild (e.g. `sh -c 'helper & exec server'`) may have
@@ -76,6 +82,15 @@ type stdioTransport struct {
 
 	done       chan struct{} // closed when the reader goroutine exits
 	stderrDone chan struct{} // closed when the stderr-draining goroutine exits
+
+	// stderrRing keeps the child's last stderrRingSize stderr lines as a ring:
+	// stderrRingN counts every line ever appended, so the write slot is always
+	// stderrRingN % stderrRingSize — no per-line reslicing or reallocation.
+	// drainStderr fills it REGARDLESS of log level (the whole point: the tail
+	// must exist even when debug logging is off); StderrTail snapshots it.
+	stderrRingMu sync.Mutex
+	stderrRing   [stderrRingSize]string
+	stderrRingN  int
 
 	// closeOnce guards the actual teardown so Close is safe for CONCURRENT
 	// calls, not just repeated sequential ones: Stage 7 introduced the first
@@ -222,21 +237,22 @@ func (c *stdioTransport) readLoop() {
 // have completed" (found by code review; done alone only tracked stdout).
 func (c *stdioTransport) drainStderr() {
 	defer close(c.stderrDone)
-	// With debug logging off, every scanned line would allocate (sc.Text) and
-	// box its slog arguments only for the handler to discard them immediately.
-	// Check the level ONCE and, when debug is disabled, keep the pipe drained
-	// without any per-line work — the child must never block on a full 64KiB
-	// OS pipe buffer either way. context.Background() because slog.Logger.
-	// Enabled only consults the handler's level; there is no per-call context
-	// on this goroutine.
-	if !c.log.Enabled(context.Background(), slog.LevelDebug) {
-		_, _ = io.Copy(io.Discard, c.stderr)
-		return
-	}
+	// Every line goes into the stderr ring (StderrTail) REGARDLESS of log
+	// level — the crash tail must exist even when debug logging is off — so
+	// the scanner always runs and the old "io.Copy straight to Discard when
+	// debug is disabled" fast path is gone by design. The slog side is still
+	// debug-only: check the level ONCE, not per line. context.Background()
+	// because slog.Logger.Enabled only consults the handler's level; there is
+	// no per-call context on this goroutine.
+	debug := c.log.Enabled(context.Background(), slog.LevelDebug)
 	sc := bufio.NewScanner(c.stderr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
-		c.log.Debug("upstream stderr", "upstream", c.name, "line", sc.Text())
+		line := sc.Text()
+		c.appendStderrLine(line)
+		if debug {
+			c.log.Debug("upstream stderr", "upstream", c.name, "line", line)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		// The scanner gave up (e.g. a single line exceeded its 1MiB limit) but
@@ -247,6 +263,35 @@ func (c *stdioTransport) drainStderr() {
 			"upstream", c.name, "err", err)
 		_, _ = io.Copy(io.Discard, c.stderr)
 	}
+}
+
+// appendStderrLine records one stderr line into the fixed-size ring,
+// overwriting the oldest entry once the ring is full.
+func (c *stdioTransport) appendStderrLine(line string) {
+	c.stderrRingMu.Lock()
+	c.stderrRing[c.stderrRingN%stderrRingSize] = line
+	c.stderrRingN++
+	c.stderrRingMu.Unlock()
+}
+
+// StderrTail returns a snapshot (copy) of the child's most recent stderr
+// lines, oldest first — at most stderrRingSize of them. ok is always true for
+// a stdio upstream: it has a real process with a real stderr, even if that
+// process wrote nothing (empty tail). The registry's supervisor calls this on
+// a crashed connection AFTER Close (which waits for the drain goroutine), so
+// the snapshot it logs is complete.
+func (c *stdioTransport) StderrTail() ([]string, bool) {
+	c.stderrRingMu.Lock()
+	defer c.stderrRingMu.Unlock()
+	n := c.stderrRingN
+	if n > stderrRingSize {
+		n = stderrRingSize
+	}
+	out := make([]string, 0, n)
+	for i := c.stderrRingN - n; i < c.stderrRingN; i++ {
+		out = append(out, c.stderrRing[i%stderrRingSize])
+	}
+	return out, true
 }
 
 // deliver routes a response to its waiter (if any) by its id.

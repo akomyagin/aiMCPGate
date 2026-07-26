@@ -38,6 +38,7 @@ func (p *pagingTransport) notify(context.Context, string, json.RawMessage) error
 func (p *pagingTransport) Name() string                                          { return "paging" }
 func (p *pagingTransport) Close() error                                          { return nil }
 func (p *pagingTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (p *pagingTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestListToolsFollowsPagination guards the paginate refactor: a well-behaved
 // multi-page catalog is still aggregated across all pages, in order.
@@ -102,6 +103,7 @@ func (e *errorTransport) notify(context.Context, string, json.RawMessage) error 
 func (e *errorTransport) Name() string                                          { return "erroring" }
 func (e *errorTransport) Close() error                                          { return nil }
 func (e *errorTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (e *errorTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestListResourcesMethodNotFoundIsEmptyCatalog guards the one asymmetry the
 // paginate refactor had to preserve: resources/list answered with
@@ -145,6 +147,7 @@ func (c *captureTransport) notify(context.Context, string, json.RawMessage) erro
 func (c *captureTransport) Name() string                                          { return "capture" }
 func (c *captureTransport) Close() error                                          { return nil }
 func (c *captureTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (c *captureTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestCallToolWireParamsCarryMetaExactly pins the wire contract of the `_meta`
 // passthrough: the params CallTool sends carry the client's `_meta` object

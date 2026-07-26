@@ -354,6 +354,18 @@ func (c *Config) EffectiveRestart() RestartPolicy {
 // when no --config path is given.
 const DefaultConfigName = "config.yaml"
 
+// ResolvePath returns the concrete config file path Load would read for the
+// given --config value: path itself when non-empty, otherwise the default
+// config next to the running binary. It does not check that the file exists —
+// callers that need to watch the path (serve --watch-config stats it for
+// mtime changes) must know WHERE the config lives even before it does.
+func ResolvePath(path string) (string, error) {
+	if path != "" {
+		return path, nil
+	}
+	return defaultConfigPath()
+}
+
 // defaultConfigPath returns <directory of the running binary>/config.yaml —
 // the location Load falls back to when path is empty.
 func defaultConfigPath() (string, error) {

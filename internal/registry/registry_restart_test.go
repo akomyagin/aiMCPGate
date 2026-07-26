@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -525,4 +526,78 @@ func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("subscriber not signalled after upstream list_changed re-list")
 	}
+}
+
+// syncLogBuffer is a mutex-guarded log sink: the supervisor goroutine writes
+// while the test polls the contents, which the plain bytes.Buffer does not
+// tolerate under -race.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestSupervisorLogsStderrTailOnCrash: when a stdio upstream genuinely crashes,
+// the supervisor must surface the process's last stderr lines (the ring buffer
+// StderrTail exposes) in one Warn block — WITHOUT debug logging: the logger
+// here runs at the default info level, exactly like production. The fake
+// server prints its dying words to stderr right before its FAKE_EXIT_AFTER
+// crash-exit; after the auto-restart completes, the crash post-mortem must be
+// in the operational log.
+func TestSupervisorLogsStderrTailOnCrash(t *testing.T) {
+	bin := buildFakeServer(t)
+	const dyingWords = "fatal: connection to mothership lost"
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			MaxAttempts:    5,
+		},
+		Upstreams: []config.Upstream{
+			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":        "ping",
+				"FAKE_ECHO":         "1",
+				"FAKE_EXIT_AFTER":   "1",
+				"FAKE_CRASH_STDERR": dyingWords,
+			}},
+		},
+	}
+	logBuf := &syncLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, nil)) // info level: no debug
+	r := New(cfg, logger, nil, noopPayloadLog(), true, "0.0.0-test")
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	// Trigger the crash, then poll the log until the supervisor's crash branch
+	// has run. (The catalog entry never disappears during a crash-restart, so
+	// waiting on the catalog would not synchronize with anything — the log
+	// lines themselves are the observable under test.)
+	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{}`), nil); err != nil {
+		t.Fatalf("first CallTool: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var logs string
+	for time.Now().Before(deadline) {
+		logs = logBuf.String()
+		if strings.Contains(logs, "stdio upstream stderr before exit") && strings.Contains(logs, dyingWords) {
+			return // both the Warn block and the dying words made it: pass.
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("supervisor never logged the crashed process's stderr tail (want the %q Warn block with %q); log:\n%s",
+		"stdio upstream stderr before exit", dyingWords, logs)
 }

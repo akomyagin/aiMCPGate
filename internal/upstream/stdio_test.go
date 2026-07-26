@@ -459,3 +459,41 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// TestStderrTailCapturedWithDebugOff: the stderr ring must fill REGARDLESS of
+// log level — that is its whole point (the crash tail must exist in production,
+// where debug logging is off). The fake server writes its stderr lines as
+// stdin closes; Close waits for the drain, so afterwards StderrTail must hold
+// them even though the logger here is at the default (info) level.
+func TestStderrTailCapturedWithDebugOff(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx := context.Background()
+
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "tailed", bin, nil, []string{
+		"FAKE_TOOLS=t",
+		"FAKE_STDERR_LINES=3",
+	}, "0.0.0-test", nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tail, ok := conn.StderrTail()
+	if !ok {
+		t.Fatal("StderrTail ok = false for a stdio connection; want true")
+	}
+	want := []string{"shutdown line 0", "shutdown line 1", "shutdown line 2"}
+	if len(tail) != len(want) {
+		t.Fatalf("StderrTail returned %d lines %q, want %d", len(tail), tail, len(want))
+	}
+	for i, w := range want {
+		if tail[i] != w {
+			t.Errorf("tail[%d] = %q, want %q", i, tail[i], w)
+		}
+	}
+}
