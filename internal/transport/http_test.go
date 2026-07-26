@@ -344,17 +344,25 @@ func TestHTTPServerNoAuthTokenAllowsAll(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
-func TestHTTPServerGETNotAllowed(t *testing.T) {
+// TestHTTPServerMethodNotAllowed pins the method gate for everything that is
+// neither POST (one JSON-RPC message) nor GET (the server→client SSE stream,
+// Round 12 — exercised in http_sse_test.go). GET used to be the 405 here; it
+// is a legitimate method now.
+func TestHTTPServerMethodNotAllowed(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
-	resp, err := srv.Client().Get(srv.URL + "/mcp")
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/mcp", nil)
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET /mcp status = %d, want 405 (no SSE server-stream in MVP)", resp.StatusCode)
+		t.Fatalf("DELETE /mcp status = %d, want 405", resp.StatusCode)
 	}
 }
 

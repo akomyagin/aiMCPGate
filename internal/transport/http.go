@@ -1,10 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,13 +26,13 @@ import (
 //
 // Response strategy (docs/MCP_NOTES.md §8): the spec lets a server answer a
 // POSTed request with EITHER a single application/json object OR a
-// text/event-stream SSE stream. The gateway generates no streaming or
-// server-initiated messages of its own in the MVP (no sampling/roots proxying,
-// MCP_NOTES §7), so every request gets a single application/json reply and the
-// GET SSE channel (server→client) is answered 405. This is fully compliant —
-// SSE is optional for the server — and keeps the transport simple; opening SSE
-// only becomes necessary if the gateway starts relaying upstream server→client
-// traffic, which is post-MVP.
+// text/event-stream SSE stream. Every POSTed request still gets a single
+// application/json reply — the gateway never streams a response to a request.
+// Server-INITIATED traffic, however, now has its own channel (Round 12): GET
+// /mcp opens the server→client SSE stream (handleSSE), which carries
+// notifications/tools/list_changed on catalog mutations plus the upstream
+// notifications the registry forwards verbatim (progress, log messages) — the
+// HTTP counterpart of the stdio transport's push path.
 // maxRequestBodyBytes bounds a single client POST body. The gateway's own
 // listen_addr defaults to loopback, but a user who widens it to a network
 // interface (config.example.yaml) would otherwise let any unauthenticated
@@ -72,13 +74,18 @@ type httpServer struct {
 	d    *dispatcher
 	addr string
 	cfg  func() *config.Config
+
+	// onListen, when non-nil, is invoked with the bound listener address just
+	// before Serve starts accepting. Test hook only (the graceful-shutdown
+	// test needs the ephemeral port Serve bound); nil in production wiring.
+	onListen func(net.Addr)
 }
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
 	return &httpServer{
 		reg:  reg,
 		log:  log,
-		d:    newDispatcher(reg, log, version, false), // HTTP is POST-only: no server→client channel
+		d:    newDispatcher(reg, log, version, true), // HTTP pushes list_changed over the GET SSE stream (Round 12)
 		addr: cfg.EffectiveListenAddr(),
 		cfg:  reg.ConfigSnapshot,
 	}
@@ -116,11 +123,24 @@ func (s *httpServer) Serve(ctx context.Context) error {
 	mux.Handle("/mcp", s.authMiddleware(http.HandlerFunc(s.handleMCP)))
 	srv := s.buildServer(mux)
 
+	// Request contexts must die with ctx (Round 12): http.Server.Shutdown only
+	// WAITS for active handlers, it does not cancel their request contexts —
+	// an open GET SSE stream (handleSSE selects on r.Context()) would
+	// otherwise sit in its event loop until the 5s shutdown budget below
+	// expired, on EVERY shutdown. Deriving each connection's base context from
+	// ctx makes cancellation reach r.Context() the moment the process is told
+	// to stop, so SSE handlers return, connections go idle and Shutdown
+	// completes promptly.
+	srv.BaseContext = func(net.Listener) context.Context { return ctx }
+
 	// Bind explicitly so a failed bind (port in use) surfaces here rather than
 	// asynchronously inside ListenAndServe, and so tests can learn the port.
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return err
+	}
+	if s.onListen != nil {
+		s.onListen(ln.Addr())
 	}
 
 	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", s.reg.ToolCount())
@@ -162,13 +182,15 @@ func originAllowed(origin string) bool {
 }
 
 // handleMCP is the single MCP endpoint. POST carries one client JSON-RPC
-// message; GET would open a server→client SSE stream, which the gateway does not
-// offer in the MVP (405, per the spec's allowance).
+// message; GET opens the server→client SSE stream (Round 12).
 //
 // Any request carrying an Origin header (i.e. sent by a browser) must come from
 // a localhost page, otherwise it is rejected 403 before any dispatch — a
 // malicious web page resolving its own hostname to 127.0.0.1 (DNS rebinding)
 // could otherwise call the gateway with the victim's local network position.
+// The Origin check runs BEFORE the method switch and handleMCP itself sits
+// under authMiddleware, so GET SSE passes exactly the same auth+origin gates
+// as POST.
 func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(origin) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
@@ -178,11 +200,122 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.handlePost(w, r)
 	case http.MethodGet:
-		// The client MAY open an SSE stream for server-initiated messages; the
-		// gateway has none to send in the MVP, so decline per the spec.
-		http.Error(w, "SSE stream not offered", http.StatusMethodNotAllowed)
+		s.handleSSE(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleSSE serves the server→client SSE stream on GET /mcp (Round 12) — the
+// HTTP counterpart of the stdio transport's push path in stdioServer.Serve.
+// Everything the gateway can initiate is framed as one SSE event and flushed:
+// a registry catalog change (auto-restart, upstream list_changed, reload)
+// becomes notifications/tools/list_changed, and every upstream notification
+// the registry forwards verbatim (notifications/progress — Round 2,
+// notifications/message — Round 3) is serialized whole, jsonrpc/method/params
+// untouched.
+//
+// Broadcast semantics: every open GET stream receives every event. The
+// registry's Subscribe/SubscribeNotifications already support any number of
+// concurrent subscribers, so several simultaneous clients (or browser tabs)
+// each hold their own subscription — nothing extra is needed here; the gateway
+// is single-user by design but not single-stream.
+//
+// Unlike stdio there is no initialized gate: HTTP requests are stateless to
+// the gateway (no Mcp-Session-Id — the known limitation documented on
+// handlePost), so it cannot know whether "the" client has completed the
+// handshake. Opening the GET stream is taken as the client's own declaration
+// that it is ready for server→client traffic — a spec-conformant client only
+// opens it after initialize anyway.
+//
+// Stream resumption (Last-Event-ID) is deliberately NOT implemented — the
+// spec makes resumability optional, and replaying missed events has little
+// value here (a missed list_changed is re-derivable via tools/list; stale
+// progress is meaningless). The id field is still emitted (a monotonic
+// per-connection counter) so clients see well-formed SSE frames; honoring
+// Last-Event-ID is deferred until a real client needs it.
+func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// Cannot happen with net/http's real ResponseWriter, but a middleware
+		// that wraps w without implementing Flusher would break streaming —
+		// fail loudly instead of buffering events forever.
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	rc := http.NewResponseController(w)
+
+	// Subscribe BEFORE the headers go out, so an event racing the stream open
+	// is queued in the subscription buffers rather than lost.
+	catalogChanged, unsubscribe := s.reg.Subscribe()
+	defer unsubscribe()
+	upstreamNotifs, unsubscribeNotifs := s.reg.SubscribeNotifications()
+	defer unsubscribeNotifs()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// authMiddleware armed a per-request write deadline on this connection,
+	// sized for ONE POST round-trip (call_timeout + slack) — this stream must
+	// outlive it by design, or the first event after call_timeout of idleness
+	// would be cut off with the client alive and reading. And simply extending
+	// the deadline before each write is NOT enough: per
+	// http.ResponseController's contract, a write deadline that has already
+	// been exceeded can no longer be extended, so it must never be left
+	// ticking across an idle gap of unknown length. Therefore: clear it now,
+	// while it is still fresh (armed microseconds ago), and let writeEvent
+	// re-arm a finite deadline around EACH write and clear it again right
+	// after. The POST path keeps its slow-client protection untouched, and a
+	// stalled SSE consumer still cannot hold a single write hostage for more
+	// than call_timeout + slack.
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	// eventID is the monotonic per-connection SSE event id (see the resumption
+	// note in the doc comment).
+	var eventID uint64
+	writeEvent := func(msg *mcp.Message) bool {
+		body, err := mcp.Encode(msg)
+		if err != nil {
+			s.log.Warn("encode SSE event", "method", msg.Method, "err", err)
+			return true // skip this event, keep the stream alive
+		}
+		eventID++
+		// Finite deadline for THIS write only — the live config is consulted
+		// so a SIGHUP reload of call_timeout takes effect on the next event.
+		_ = rc.SetWriteDeadline(time.Now().Add(s.cfg().EffectiveCallTimeout() + httpWriteTimeoutSlack))
+		// SSE framing: "id: N\ndata: <json>\n\n" — the blank line terminates
+		// the event. mcp.Encode appends the stdio '\n' framing; trim it so the
+		// data line stays a single line.
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", eventID, bytes.TrimRight(body, "\n")); err != nil {
+			return false // client gone or write timed out — end the stream
+		}
+		flusher.Flush()
+		// Disarm again immediately, while the per-write deadline is still
+		// live, so the idle gap until the NEXT event can be arbitrarily long.
+		_ = rc.SetWriteDeadline(time.Time{})
+		return true
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			// Client disconnected, or the process is shutting down (Serve
+			// derives every request context from its own ctx via BaseContext).
+			return
+		case <-catalogChanged:
+			if !writeEvent(mcp.NewNotification(mcp.NotifToolsListChanged, nil)) {
+				return
+			}
+		case n := <-upstreamNotifs:
+			// Forwarded verbatim — the registry already carries the whole
+			// upstream message (method + params untouched).
+			if !writeEvent(&n) {
+				return
+			}
+		}
 	}
 }
 
