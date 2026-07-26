@@ -416,6 +416,9 @@ func TestStdioUnknownMethodReturnsMethodNotFound(t *testing.T) {
 	}
 }
 
+// TestStdioResourcesListIsEmpty: with no resource-capable upstream in the mix
+// the aggregated resources/list is an empty (but well-formed) catalog, not an
+// error — well-behaved clients that probe resources stay happy.
 func TestStdioResourcesListIsEmpty(t *testing.T) {
 	c, cancel, done := startServer(t, false)
 	defer func() { cancel(); <-done }()
@@ -430,7 +433,7 @@ func TestStdioResourcesListIsEmpty(t *testing.T) {
 		t.Fatalf("decode resources/list: %v", err)
 	}
 	if len(res.Resources) != 0 {
-		t.Errorf("resources/list should be empty in Phase 1, got %d", len(res.Resources))
+		t.Errorf("resources/list should be empty with no resource upstream, got %d", len(res.Resources))
 	}
 }
 

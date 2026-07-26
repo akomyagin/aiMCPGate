@@ -199,6 +199,36 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 	return resources, nil
 }
 
+// ListResourceTemplates fetches the upstream's resource-template catalog,
+// following pagination (bounded — see maxPaginationPages). Like ListResources
+// — and unlike ListPrompts — a method-not-found error is treated as an empty
+// catalog rather than a hard failure: the resources capability does not
+// promise the templates sub-method, so a resources-capable upstream is still
+// free to not recognize resources/templates/list at all.
+func (c *Conn) ListResourceTemplates(ctx context.Context) ([]mcp.ResourceTemplate, error) {
+	templates, rpcErr, err := paginate(ctx, c, mcp.MethodResourceTemplatesList,
+		func(cursor string) json.RawMessage {
+			return mcp.MustParams(mcp.ResourceTemplatesListParams{Cursor: cursor})
+		},
+		func(result json.RawMessage) ([]mcp.ResourceTemplate, string, error) {
+			var res mcp.ResourceTemplatesListResult
+			if err := json.Unmarshal(result, &res); err != nil {
+				return nil, "", err
+			}
+			return res.ResourceTemplates, res.NextCursor, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	if rpcErr != nil {
+		if rpcErr.Code == mcp.CodeMethodNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("upstream %q: resources/templates/list error: %w", c.Name(), rpcErr)
+	}
+	return templates, nil
+}
+
 // ListPrompts fetches the upstream's prompt catalog, following pagination via
 // nextCursor until exhausted (bounded — see maxPaginationPages). Unlike
 // ListResources there is no method-not-found-as-empty branch: the registry
@@ -250,6 +280,25 @@ func (c *Conn) SetLogLevel(ctx context.Context, level string) error {
 		return fmt.Errorf("upstream %q: logging/setLevel rejected: %w", c.Name(), resp.Error)
 	}
 	return nil
+}
+
+// ReadResource forwards a resources/read to the upstream. uri is the exact
+// URI the client asked for — resources are never namespaced, so no rewrite
+// happens anywhere (the Registry only resolves which upstream OWNS the uri).
+// The response is returned verbatim (*mcp.Message): the gateway never parses
+// the resource contents.
+func (c *Conn) ReadResource(ctx context.Context, uri string) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.ResourceReadParams{URI: uri})
+	return c.transport.call(ctx, mcp.MethodResourceRead, params)
+}
+
+// Complete forwards a completion/complete to the upstream. params is the
+// ready-to-send params object — for a ref/prompt the Registry has already
+// rewritten ref.name back to the upstream's original; everything else
+// (argument, context, _meta) is the client's payload verbatim. The response
+// is returned verbatim (*mcp.Message).
+func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Message, error) {
+	return c.transport.call(ctx, mcp.MethodCompletionComplete, params)
 }
 
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL

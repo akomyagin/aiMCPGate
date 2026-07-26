@@ -18,6 +18,19 @@
 //	                 namespace→original rewrite and verbatim argument passing
 //	                 (Round 4). When empty, no capability is declared and the
 //	                 prompts/* methods fall through to method-not-found.
+//	FAKE_RESOURCES   comma-separated resource URIs to advertise in
+//	                 resources/list. resources/read echoes the requested uri and
+//	                 this server's name back in the contents (Round 5).
+//	FAKE_RESOURCE_TEMPLATES  comma-separated uriTemplates to advertise in
+//	                 resources/templates/list. Either of FAKE_RESOURCES /
+//	                 FAKE_RESOURCE_TEMPLATES being non-empty makes initialize
+//	                 declare the "resources" capability; with both empty the
+//	                 resources/* methods fall through to method-not-found.
+//	FAKE_COMPLETIONS if "1", initialize declares the "completions" capability
+//	                 and completion/complete answers with a single completion
+//	                 value echoing the RAW received params — so gateway tests
+//	                 can assert the ref/prompt name rewrite and verbatim
+//	                 argument forwarding (Round 5).
 //	FAKE_INSTRUCTIONS  if non-empty, reported as `instructions` in the
 //	                 initialize result — used to test the gateway's
 //	                 instructions aggregation
@@ -146,6 +159,16 @@ func main() {
 	if raw := os.Getenv("FAKE_PROMPTS"); raw != "" {
 		prompts = strings.Split(raw, ",")
 	}
+	var resources []string
+	if raw := os.Getenv("FAKE_RESOURCES"); raw != "" {
+		resources = strings.Split(raw, ",")
+	}
+	var templates []string
+	if raw := os.Getenv("FAKE_RESOURCE_TEMPLATES"); raw != "" {
+		templates = strings.Split(raw, ",")
+	}
+	hasResources := len(resources) > 0 || len(templates) > 0
+	completions := os.Getenv("FAKE_COMPLETIONS") == "1"
 	var callDelay time.Duration
 	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
 		callDelay, _ = time.ParseDuration(raw)
@@ -268,14 +291,20 @@ func main() {
 			if initDelay > 0 {
 				time.Sleep(initDelay)
 			}
-			caps := `{"tools":{}`
+			capList := []string{`"tools":{}`}
 			if len(prompts) > 0 {
-				caps += `,"prompts":{}`
+				capList = append(capList, `"prompts":{}`)
 			}
 			if logging {
-				caps += `,"logging":{}`
+				capList = append(capList, `"logging":{}`)
 			}
-			caps += `}`
+			if hasResources {
+				capList = append(capList, `"resources":{}`)
+			}
+			if completions {
+				capList = append(capList, `"completions":{}`)
+			}
+			caps := "{" + strings.Join(capList, ",") + "}"
 			result := fmt.Sprintf(
 				`{"protocolVersion":"2025-06-18","capabilities":%s,"serverInfo":{"name":%q,"version":"1.0.0"}`,
 				caps, name)
@@ -293,7 +322,36 @@ func main() {
 			}
 			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(currentTools(toolsFile, tools)))})
 		case "resources/list":
-			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})
+			if !hasResources {
+				// No FAKE_RESOURCES: behave like a server without the resources
+				// capability — the method is simply unknown (mirrors prompts).
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(resourcesListResult(resources))})
+		case "resources/templates/list":
+			if !hasResources {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/templates/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(templatesListResult(templates))})
+		case "resources/read":
+			if !hasResources {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/read"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(resourceReadResult(name, req.Params))})
+		case "completion/complete":
+			if !completions {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: completion/complete"}})
+				continue
+			}
+			// Echo the received params back inside the completion values, so
+			// gateway tests can assert the ref rewrite (prompt name → original)
+			// and verbatim argument forwarding.
+			b, _ := json.Marshal(string(req.Params))
+			write(message{ID: req.ID, Result: json.RawMessage(
+				fmt.Sprintf(`{"completion":{"values":[%s],"hasMore":false}}`, b))})
 		case "notifications/cancelled":
 			// Record the cancellation so a test can assert the gateway sent it
 			// (and with WHICH requestId). Append, don't truncate: a test may
@@ -439,6 +497,45 @@ func toolsListResult(tools []string) string {
 	}
 	b.WriteString(`]}`)
 	return b.String()
+}
+
+func resourcesListResult(uris []string) string {
+	var b strings.Builder
+	b.WriteString(`{"resources":[`)
+	for i, uri := range uris {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"uri":%q,"name":"res %s","description":"fake resource %s"}`, uri, uri, uri)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+func templatesListResult(templates []string) string {
+	var b strings.Builder
+	b.WriteString(`{"resourceTemplates":[`)
+	for i, tmpl := range templates {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"uriTemplate":%q,"name":"tpl %s"}`, tmpl, tmpl)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// resourceReadResult echoes the requested uri and the serving server's name
+// back in the contents, so gateway tests can assert both the verbatim uri
+// forwarding and WHICH upstream a read was routed to.
+func resourceReadResult(server string, params json.RawMessage) string {
+	var p struct {
+		URI string `json:"uri"`
+	}
+	_ = json.Unmarshal(params, &p)
+	text, _ := json.Marshal("read " + p.URI + " on " + server)
+	uri, _ := json.Marshal(p.URI)
+	return fmt.Sprintf(`{"contents":[{"uri":%s,"text":%s}]}`, uri, text)
 }
 
 func promptsListResult(prompts []string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
@@ -13,18 +14,18 @@ import (
 )
 
 // buildCapabilities assembles the gateway's own capability object, advertised
-// to the client on initialize. Resources are not aggregated in the MVP (see
-// handleResourcesList), so no resources capability is declared — the object is
-// built structurally (map → json.Marshal) rather than as a string literal, so
-// further rounds can keep adding CONDITIONAL capabilities (resources/logging)
-// without rebuilding this function.
+// to the client on initialize. The object is built structurally (map →
+// json.Marshal) rather than as a string literal, so further rounds can keep
+// adding CONDITIONAL capabilities (logging etc.) without rebuilding this
+// function.
 //
-// prompts (Round 4) is CONDITIONAL: declared only when at least one live
-// upstream declared it in its own initialize — advertising it against zero
-// prompt-capable upstreams would be dishonest. listChanged is honestly false:
-// this round does not subscribe to upstream notifications/prompts/list_changed
-// (such a notification is currently dropped as unknown, which is fine), so the
-// gateway cannot promise to emit its own. TODO(post-MVP): wire prompt
+// prompts (Round 4), resources and completions (Round 5) are CONDITIONAL:
+// declared only when at least one live upstream declared them in its own
+// initialize — advertising them against zero capable upstreams would be
+// dishonest. Their sub-flags (prompts/resources listChanged, resources
+// subscribe) are honestly false: this round neither subscribes to the
+// corresponding upstream notifications nor proxies resources/subscribe, so the
+// gateway cannot promise to emit its own. TODO(post-MVP): wire prompt/resource
 // list_changed the way tools' is wired (Stage 7b/7c).
 //
 // listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
@@ -42,8 +43,22 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 	}
 	// nil reg: classification-only tests build a dispatcher without a registry;
 	// a gateway with no registry aggregates nothing, so no extra capabilities.
-	if reg != nil && reg.HasUpstreamCapability("prompts") {
-		caps["prompts"] = map[string]any{"listChanged": false}
+	if reg != nil {
+		if reg.HasUpstreamCapability("prompts") {
+			caps["prompts"] = map[string]any{"listChanged": false}
+		}
+		// resources (Round 5) is conditional like prompts, and its sub-flags are
+		// honestly false: the gateway neither proxies resources/subscribe nor
+		// emits its own notifications/resources/list_changed in this round.
+		if reg.HasUpstreamCapability("resources") {
+			caps["resources"] = map[string]any{"subscribe": false, "listChanged": false}
+		}
+		// completions (Round 5): declared only when at least one live upstream
+		// can actually answer completion/complete. The capability carries no
+		// sub-flags in the spec — an empty object.
+		if reg.HasUpstreamCapability("completions") {
+			caps["completions"] = map[string]any{}
+		}
 	}
 	// logging (Round 3) is CONDITIONAL for the same honesty reason as prompts:
 	// declared only when at least one live upstream declared it — with zero
@@ -180,7 +195,11 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
-		return d.handleResourcesRead(msg)
+		return d.handleResourcesRead(ctx, msg)
+	case mcp.MethodResourceTemplatesList:
+		return d.handleResourceTemplatesList(msg)
+	case mcp.MethodCompletionComplete:
+		return d.handleCompletionComplete(ctx, msg)
 	default:
 		return mcp.NewError(msg.ID, mcp.CodeMethodNotFound, "method not found: "+msg.Method, nil)
 	}
@@ -470,19 +489,97 @@ func (d *dispatcher) handleLoggingSetLevel(ctx context.Context, req *mcp.Message
 	return mcp.NewResult(req.ID, json.RawMessage("{}"))
 }
 
-// handleResourcesList returns an empty resource catalog. Resource aggregation
-// across upstreams is not implemented in the MVP (the registry lists but does
-// not merge resources yet) — TODO(post-MVP): aggregate and route resources the
-// way tools are, then serve them here. Returning an empty list (rather than a
-// method-not-found error) keeps well-behaved clients that probe resources happy.
+// handleResourcesList returns the aggregated resource catalog (Round 5) —
+// handleToolsList's resources twin, except nothing is renamed: a resource URI
+// is the upstream's own identifier and travels to the client verbatim.
+// Pagination is not needed: the registry already merged every upstream's full
+// paginated resource list on launch.
 func (d *dispatcher) handleResourcesList(req *mcp.Message) *mcp.Message {
-	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceListResult{Resources: []mcp.Resource{}}))
+	descs := d.reg.Resources()
+	resources := make([]mcp.Resource, 0, len(descs))
+	for _, dd := range descs {
+		resources = append(resources, dd.Resource)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceListResult{Resources: resources}))
 }
 
-// handleResourcesRead reports an error: with no aggregated resources (see
-// handleResourcesList), any uri the client could ask to read is unknown.
-// TODO(post-MVP): route resources/read to the owning upstream once resources
-// are aggregated.
-func (d *dispatcher) handleResourcesRead(req *mcp.Message) *mcp.Message {
-	return mcp.NewError(req.ID, mcp.CodeInvalidParams, "resources are not aggregated in this build", nil)
+// handleResourceTemplatesList returns the aggregated resource-template catalog
+// (Round 5), in the registry's merge order — the same order resources/read
+// matches templates in, so the listing tells the truth about which template
+// wins an overlap.
+func (d *dispatcher) handleResourceTemplatesList(req *mcp.Message) *mcp.Message {
+	descs := d.reg.ResourceTemplates()
+	templates := make([]mcp.ResourceTemplate, 0, len(descs))
+	for _, dd := range descs {
+		templates = append(templates, dd.Template)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceTemplatesListResult{ResourceTemplates: templates}))
+}
+
+// handleResourcesRead proxies a resources/read through the registry, which
+// resolves the owning upstream by exact URI or template match and forwards the
+// URI untouched (Round 5). A URI no upstream owns is the client's mistake —
+// answered with Invalid params (ErrUnknownResource), not an internal error;
+// other failures follow handleToolsCall's sanitized-error contract.
+func (d *dispatcher) handleResourcesRead(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.ResourceReadParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid resources/read params: "+err.Error(), nil)
+	}
+	if params.URI == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "resources/read missing uri", nil)
+	}
+
+	resp, err := d.reg.ReadResource(ctx, params.URI)
+	if err != nil {
+		code := mcp.CodeInternalError
+		if errors.Is(err, registry.ErrUnknownResource) {
+			code = mcp.CodeInvalidParams
+		}
+		return mcp.NewError(req.ID, code, err.Error(), nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
+}
+
+// handleCompletionComplete proxies a completion/complete through the registry
+// (Round 5), which resolves the owning upstream from the ref — rewriting a
+// ref/prompt's name back to the upstream's original, forwarding a
+// ref/resource's URI as-is — and passes argument/context/_meta verbatim. A ref
+// naming nothing the gateway aggregates is Invalid params
+// (ErrUnknownCompletionRef); malformed or incomplete params are rejected here
+// before touching the registry.
+func (d *dispatcher) handleCompletionComplete(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.CompletionCompleteParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid completion/complete params: "+err.Error(), nil)
+	}
+	switch params.Ref.Type {
+	case mcp.CompletionRefPrompt:
+		if params.Ref.Name == "" {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "completion/complete ref/prompt missing name", nil)
+		}
+	case mcp.CompletionRefResource:
+		if params.Ref.URI == "" {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "completion/complete ref/resource missing uri", nil)
+		}
+	default:
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams,
+			"completion/complete ref.type must be ref/prompt or ref/resource", nil)
+	}
+
+	resp, err := d.reg.Complete(ctx, params)
+	if err != nil {
+		code := mcp.CodeInternalError
+		if errors.Is(err, registry.ErrUnknownCompletionRef) {
+			code = mcp.CodeInvalidParams
+		}
+		return mcp.NewError(req.ID, code, err.Error(), nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
 }
