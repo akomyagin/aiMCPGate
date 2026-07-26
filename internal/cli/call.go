@@ -78,7 +78,7 @@ func runCall(cmd *cobra.Command, configPath, envFile, version string, args []str
 		return err
 	}
 
-	resp, err := reg.CallTool(cmd.Context(), toolName, arguments)
+	resp, err := reg.CallTool(cmd.Context(), toolName, arguments, nil)
 	if err != nil {
 		// Transport/routing failure (unknown tool, dead upstream, timeout).
 		// Returning the error is the shared exit-code path: cobra prints it to
