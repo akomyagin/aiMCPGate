@@ -220,6 +220,16 @@ type Registry struct {
 	subscribers map[int]chan struct{}
 	nextSubID   int
 
+	// notifMu guards notifSubs, the set of client-facing transports that want
+	// upstream notifications forwarded VERBATIM (notifications/progress, Round
+	// 2). It is deliberately its own small mutex — not subMu, relistMu or mu —
+	// so forwardNotification (which runs on an upstream's reader goroutine)
+	// never entangles with the catalog's or the catalog-changed channel's
+	// critical sections. See SubscribeNotifications / forwardNotification.
+	notifMu     sync.Mutex
+	notifSubs   map[int]chan mcp.Message
+	nextNotifID int
+
 	// relistMu guards relistTimers, the per-upstream debounce timers for
 	// tools/list_changed notifications (Stage 7b), and relistStates, the
 	// per-upstream running/dirty flags that serialize the re-lists themselves.
@@ -313,6 +323,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		rawTools:     map[string][]mcp.Tool{},
 		handshakes:   map[string]handshakeMeta{},
 		subscribers:  map[int]chan struct{}{},
+		notifSubs:    map[int]chan mcp.Message{},
 		relistTimers: map[string]*time.Timer{},
 		relistStates: map[string]*relistState{},
 		supCancel:    map[string]context.CancelFunc{},
@@ -359,7 +370,7 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 		env = append(env, k+"="+v)
 	}
 	name := u.Name
-	onNotify := func(method string) { r.onUpstreamNotification(name, method) }
+	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
 	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify)
 }
 
@@ -732,11 +743,18 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 }
 
 // onUpstreamNotification handles a notification pushed by a stdio upstream
-// (Stage 7b). It runs on that upstream's single reader goroutine, so it must
-// not block or re-enter the connection: for tools/list_changed it only (re)arms
-// a debounce timer whose expiry does the actual re-list on a fresh goroutine.
-// Other notification methods are ignored (resources are not aggregated yet).
-func (r *Registry) onUpstreamNotification(name, method string) {
+// (Stage 7b, Round 2). It runs on that upstream's single reader goroutine, so
+// it must not block or re-enter the connection: for tools/list_changed it only
+// (re)arms a debounce timer whose expiry does the actual re-list on a fresh
+// goroutine; for notifications/progress it forwards the params VERBATIM to the
+// notification subscribers via a non-blocking send (the progressToken was
+// minted by the client, the gateway never rewrites it). Other notification
+// methods are ignored (resources are not aggregated yet).
+func (r *Registry) onUpstreamNotification(name, method string, params json.RawMessage) {
+	if method == mcp.NotifProgress {
+		r.forwardNotification(mcp.Message{Method: method, Params: params})
+		return
+	}
 	if method != mcp.NotifToolsListChanged {
 		return
 	}
@@ -1153,6 +1171,53 @@ func (r *Registry) notifyCatalogChanged() {
 		select {
 		case ch <- struct{}{}:
 		default: // a signal is already queued; coalesce.
+		}
+	}
+}
+
+// notifSubBuffer is the per-subscriber buffer of the SubscribeNotifications
+// channel. Unlike the catalog-changed channel (buffer 1, coalescing — "did
+// anything change" is one bit), forwarded notifications each carry a distinct
+// payload, so a burst is buffered up to this depth and only then dropped
+// (progress updates are advisory; losing one under backpressure is harmless).
+const notifSubBuffer = 16
+
+// SubscribeNotifications registers interest in upstream notifications the
+// gateway forwards VERBATIM to its client — today only notifications/progress
+// (Round 2) — and returns a channel of whole mcp.Message values (method +
+// params, no id) plus an unsubscribe function the caller MUST call when it
+// stops listening. Unlike Subscribe's coalescing one-bit signal, each message
+// matters individually, so the channel is buffered (notifSubBuffer); delivery
+// is NON-BLOCKING — a subscriber that stops draining loses messages (Debug-
+// logged), never stalls the upstream reader goroutine publishing them.
+func (r *Registry) SubscribeNotifications() (<-chan mcp.Message, func()) {
+	ch := make(chan mcp.Message, notifSubBuffer)
+	r.notifMu.Lock()
+	id := r.nextNotifID
+	r.nextNotifID++
+	r.notifSubs[id] = ch
+	r.notifMu.Unlock()
+
+	return ch, func() {
+		r.notifMu.Lock()
+		delete(r.notifSubs, id)
+		r.notifMu.Unlock()
+	}
+}
+
+// forwardNotification hands one upstream notification to every notification
+// subscriber. It runs on an upstream's single reader goroutine (via
+// onUpstreamNotification), so the send is strictly non-blocking: a subscriber
+// whose buffer is full has the message dropped — the reader must never stall
+// on a slow client transport.
+func (r *Registry) forwardNotification(msg mcp.Message) {
+	r.notifMu.Lock()
+	defer r.notifMu.Unlock()
+	for _, ch := range r.notifSubs {
+		select {
+		case ch <- msg:
+		default:
+			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
 		}
 	}
 }

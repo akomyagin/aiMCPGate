@@ -27,7 +27,31 @@ const (
 	// triggering a re-list of that upstream) and SENDS it to its own client
 	// (Stage 7c, when the aggregated catalog changes at runtime).
 	NotifToolsListChanged = "notifications/tools/list_changed"
+
+	// NotifProgress carries a progress update for an in-flight request, keyed by
+	// the progressToken the REQUESTER minted in its request's `_meta`. The
+	// gateway RECEIVES it from a stdio upstream mid-tools/call and forwards the
+	// params VERBATIM to its own client — the token belongs to the client's id
+	// space, never rewritten (Round 2).
+	NotifProgress = "notifications/progress"
+
+	// NotifCancelled asks the peer to abandon an in-flight request, identified
+	// by requestId in the SENDER's id space. The gateway both RECEIVES it from
+	// its client (cancelling the matching in-flight tools/call's context) and
+	// SENDS it to a stdio upstream when the forwarded call's context is
+	// cancelled — with the gateway's own upstream-side id, never the client's
+	// (Round 2).
+	NotifCancelled = "notifications/cancelled"
 )
+
+// CancelledParams is the params object of a notifications/cancelled
+// notification. RequestID is raw: JSON-RPC ids may be numbers or strings, and
+// the gateway only ever compares them byte-for-byte in whichever id space the
+// notification travels (client-side in, upstream-side out).
+type CancelledParams struct {
+	RequestID json.RawMessage `json:"requestId"`
+	Reason    string          `json:"reason,omitempty"`
+}
 
 // Implementation identifies a client or server (clientInfo / serverInfo).
 type Implementation struct {

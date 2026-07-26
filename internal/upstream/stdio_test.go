@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -286,7 +287,7 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 	notified := make(chan string, 4)
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "eager", bin, nil,
 		[]string{"FAKE_TOOLS=t", "FAKE_NOTIFY_ON_START=1"}, "0.0.0-test",
-		func(method string) { notified <- method })
+		func(method string, _ json.RawMessage) { notified <- method })
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -299,6 +300,69 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("notification callback was not invoked for the startup list_changed")
+	}
+}
+
+// TestStdioCallCancellationNotifiesUpstream (Round 2): when a call's ctx is
+// cancelled AFTER the request reached the upstream, the transport must send a
+// best-effort notifications/cancelled carrying the UPSTREAM-SIDE id the call
+// minted itself — never any client-side id (the gateway's id spaces are fully
+// separated). FAKE_ASYNC_CALLS keeps the fake server's read loop consuming
+// stdin while the delayed call is pending, so it can record the cancellation
+// (FAKE_CANCEL_FILE) the moment it arrives instead of after the delay.
+func TestStdioCallCancellationNotifiesUpstream(t *testing.T) {
+	bin := buildFakeServer(t)
+	cancelFile := filepath.Join(t.TempDir(), "cancelled.jsonl")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "slow", bin, nil,
+		[]string{
+			"FAKE_TOOLS=t",
+			"FAKE_CALL_DELAY=30s",
+			"FAKE_ASYNC_CALLS=1",
+			"FAKE_CANCEL_FILE=" + cancelFile,
+		}, "0.0.0-test", nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Initialize(ctx); err != nil { // upstream-side id 1
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	callCtx, callCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer callCancel()
+	_, err = conn.CallTool(callCtx, "t", nil, nil) // upstream-side id 2
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool err = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The cancelled-notify is fire-and-forget on its own goroutine — poll for
+	// the fake server's record of it.
+	deadline := time.Now().Add(5 * time.Second)
+	var line string
+	for {
+		data, _ := os.ReadFile(cancelFile)
+		if line = strings.TrimSpace(string(data)); line != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("upstream never received notifications/cancelled after ctx cancellation")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal([]byte(line), &p); err != nil {
+		t.Fatalf("decode recorded cancelled params %q: %v", line, err)
+	}
+	// Initialize minted id 1, the call minted id 2 — the notification must
+	// carry exactly the call's own upstream-side id.
+	if string(p.RequestID) != "2" {
+		t.Errorf("cancelled requestId = %s, want the upstream-side call id 2", p.RequestID)
 	}
 }
 
