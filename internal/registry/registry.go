@@ -507,8 +507,9 @@ func (r *Registry) startUpstream(ctx context.Context, u config.Upstream) (Upstre
 // notification callback (Stage 7b) is handed to StartStdio itself, so it is in
 // place BEFORE the connection's reader goroutine starts — installing it after
 // the fact raced an upstream that notifies immediately on startup (found by
-// independent review). Only stdio upstreams push notifications; HTTP has no
-// long-lived reader (documented limitation), so startHTTP wires nothing.
+// independent review). startHTTP wires the same callback (Round 13): an HTTP
+// upstream pushes notifications over a long-lived GET SSE stream opened after
+// its handshake, so list_changed & co. arrive from both transports alike.
 func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream, error) {
 	env := make([]string, 0, len(u.Env))
 	for k, v := range u.Env {
@@ -523,9 +524,13 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 // startStdio it does no network I/O here — the handshake runs in Initialize, so
 // StartHTTP never fails and a genuinely unreachable HTTP upstream is isolated at
 // the Initialize step in launch, exactly like a stdio upstream that fails its
-// handshake.
+// handshake. The notification callback mirrors startStdio's: it feeds the GET
+// SSE stream the connection opens after its handshake (Round 13) — best-effort,
+// an upstream that does not offer the stream simply pushes no notifications.
 func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
-	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version), nil
+	name := u.Name
+	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
+	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify), nil
 }
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,
@@ -639,9 +644,11 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 		return nil, nil, auxCatalog{}, handshakeMeta{}, fmt.Errorf("failed to start: %w", err)
 	}
 
-	// Upstream→registry notifications (Stage 7b) are wired inside startStdio —
-	// the callback rides into StartStdio itself, so it is set before the reader
-	// goroutine starts and a list_changed arriving immediately is not missed.
+	// Upstream→registry notifications (Stage 7b) are wired inside startStdio /
+	// startHTTP — the callback rides into StartStdio/StartHTTP itself, so it is
+	// set before any reader goroutine starts and a list_changed arriving
+	// immediately is not missed (HTTP's stream opens after the handshake,
+	// Round 13, with the callback already in place).
 
 	var info *mcp.InitializeResult
 	if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
@@ -945,8 +952,9 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 	}
 }
 
-// onUpstreamNotification handles a notification pushed by a stdio upstream
-// (Stage 7b, Round 2, Round 3). It runs on that upstream's single reader
+// onUpstreamNotification handles a notification pushed by an upstream — a
+// stdio child's stdout (Stage 7b, Round 2, Round 3) or an HTTP upstream's GET
+// SSE stream (Round 13). It runs on that upstream's single reader/stream
 // goroutine, so it must not block or re-enter the connection: for
 // tools/list_changed it only (re)arms a debounce timer whose expiry does the
 // actual re-list on a fresh goroutine; for notifications/progress it forwards
