@@ -44,6 +44,10 @@
 //	                   many tools/call requests — simulates a stdio upstream that
 //	                   crashes mid-run, exercising the registry's auto-restart
 //	                   supervisor (Stage 7a).
+//	FAKE_CRASH_STDERR  if non-empty, this text is written to stderr as one line
+//	                   right before the FAKE_EXIT_AFTER crash-exit — the "dying
+//	                   words" the gateway's stderr ring buffer must capture and
+//	                   the supervisor must surface in its crash log.
 //	FAKE_TOOLS_FILE  path to a file whose first line, if present, OVERRIDES
 //	                   FAKE_TOOLS for tools/list; re-read on every tools/list so a
 //	                   test can change the advertised catalog at runtime. When the
@@ -317,7 +321,12 @@ func main() {
 			if exitAfter > 0 && callCount >= exitAfter {
 				// Simulate a crash right after answering: flush is inside write,
 				// so the reply is already on the wire. os.Exit skips deferred
-				// flushes, but there is nothing left to flush.
+				// flushes, but there is nothing left to flush. Dying words to
+				// stderr first, when asked — the crash post-mortem the gateway's
+				// stderr ring must capture.
+				if msg := os.Getenv("FAKE_CRASH_STDERR"); msg != "" {
+					fmt.Fprintln(os.Stderr, msg)
+				}
 				os.Exit(1)
 			}
 		default:

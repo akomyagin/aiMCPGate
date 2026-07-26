@@ -131,6 +131,11 @@ type Upstream interface {
 	// long-lived process (stdio); ok is false when there is no such process
 	// to watch (HTTP), so a supervisor is simply not started for it.
 	Done() (ch <-chan struct{}, ok bool)
+	// StderrTail reports the most recent stderr lines of an upstream backed
+	// by a child process (stdio) — the supervisor logs them when that process
+	// crashes, so the operator sees WHY it died without debug logging. ok is
+	// false when there is no process and hence no stderr (HTTP), like Done.
+	StderrTail() (lines []string, ok bool)
 }
 
 // Registry owns upstream connections and the aggregated catalog.
@@ -697,6 +702,14 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 			// attempting to relaunch.
 			if err := conn.Close(); err != nil {
 				r.log.Debug("close crashed upstream", "upstream", u.Name, "err", err)
+			}
+			// Close waited for the stderr drain goroutine, so the tail is
+			// complete: surface the crashed process's last stderr lines in ONE
+			// Warn block — the post-mortem an operator otherwise only gets by
+			// re-running at debug level and reproducing the crash.
+			if tail, ok := conn.StderrTail(); ok && len(tail) > 0 {
+				r.log.Warn("stdio upstream stderr before exit",
+					"upstream", u.Name, "lines", len(tail), "stderr_tail", strings.Join(tail, "\n"))
 			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
 			newConn, newDone, ok := r.restart(u, conn, supCtx)

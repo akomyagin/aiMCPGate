@@ -139,6 +139,11 @@ func (c *httpTransport) Name() string { return c.name }
 // Unreachability of an HTTP upstream is caught at the next call instead.
 func (c *httpTransport) Done() (<-chan struct{}, bool) { return nil, false }
 
+// StderrTail reports absence, like Done: HTTP has no child process and hence
+// no stderr to tail, so it honestly returns ok=false instead of a faked empty
+// tail.
+func (c *httpTransport) StderrTail() ([]string, bool) { return nil, false }
+
 // Close releases resources. HTTP is connectionless from our side (no child
 // process, no reader goroutine), so there is nothing to tear down beyond
 // idling the transport's connections; the DELETE session-termination request is

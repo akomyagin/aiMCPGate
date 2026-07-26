@@ -32,6 +32,11 @@ type transport interface {
 	// process to watch) — an honest declaration of absence, not a faked
 	// channel that would never fire.
 	Done() (ch <-chan struct{}, ok bool)
+	// StderrTail reports the most recent stderr lines of a transport backed
+	// by a child process (stdio) — post-mortem material the supervisor logs
+	// when that process crashes. ok is false when there is no process and
+	// hence no stderr to tail (HTTP), mirroring Done's honest absence.
+	StderrTail() (lines []string, ok bool)
 }
 
 // Conn is a live connection to one upstream MCP server, regardless of
