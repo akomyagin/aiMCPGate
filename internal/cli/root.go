@@ -26,6 +26,8 @@ func Build(version string) *cobra.Command {
 	}
 	root.AddCommand(newServeCmd(version))
 	root.AddCommand(newDoctorCmd(version))
+	root.AddCommand(newCallCmd(version))
+	root.AddCommand(newCatalogCmd(version))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newVersionCmd(version))
 	root.AddCommand(newTokenCmd())

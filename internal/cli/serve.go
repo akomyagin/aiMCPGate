@@ -22,24 +22,33 @@ import (
 // the client until the process is cancelled (Ctrl-C / SIGTERM). This is the
 // gateway's main run loop; keeping it here keeps main.go trivial (SKILL §1).
 func newServeCmd(version string) *cobra.Command {
-	var configPath *string
+	var (
+		configPath *string
+		envFile    *string
+	)
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the gateway, serving one client and multiplexing upstream MCP servers",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runServe(cmd.Context(), *configPath, version)
+			return runServe(cmd.Context(), *configPath, *envFile, version)
 		},
 	}
 	configPath = addConfigFlag(cmd)
+	envFile = addEnvFileFlag(cmd)
 	return cmd
 }
 
-func runServe(parent context.Context, configPath, version string) error {
+func runServe(parent context.Context, configPath, envFile, version string) error {
 	// Cancel the whole tree on Ctrl-C / SIGTERM so upstream child processes get
 	// torn down cleanly (see internal/registry).
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The env file must land in the environment BEFORE config.Load expands the
+	// ${VAR} references in the config (and before any SIGHUP reload re-loads it).
+	if err := applyEnvFile(envFile); err != nil {
+		return err
+	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
