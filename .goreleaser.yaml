@@ -5,6 +5,15 @@ version: 2
 before:
   hooks:
     - go mod download
+    # Shell completions shipped inside every release archive (Round 10). They
+    # are generated ONCE here, before the builds, by running the source tree on
+    # the CI host — the cross-compiled darwin/windows artifacts could not run
+    # there, so a per-build post hook would not work. Hooks do not go through a
+    # shell, hence the explicit `sh -c` for the output redirection.
+    - mkdir -p completions
+    - sh -c "go run ./cmd completion bash > completions/mcp-gate.bash"
+    - sh -c "go run ./cmd completion zsh > completions/_mcp-gate"
+    - sh -c "go run ./cmd completion fish > completions/mcp-gate.fish"
 
 builds:
   - id: mcp-gate
@@ -35,6 +44,13 @@ archives:
       - goos: windows
         formats:
           - zip
+    # Setting `files` replaces goreleaser's implicit LICENSE*/README* globs, so
+    # they are restated explicitly alongside the generated shell completions.
+    files:
+      - LICENSE
+      - README.md
+      - README_RU.md
+      - completions/*
 
 # OCI images for the MCP registry / Glama.ai (Stage 12): one image per arch
 # pushed to ghcr.io, then stitched into multi-arch manifests below. The

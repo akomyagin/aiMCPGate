@@ -30,3 +30,6 @@ go.work.sum
 docs/
 CLAUDE.md
 .claude/
+
+# Generated shell completions (goreleaser before-hook)
+/completions/
