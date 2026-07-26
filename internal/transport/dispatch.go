@@ -88,10 +88,12 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 // cancelMu) tracks one context.CancelFunc per in-flight tools/call, keyed by
 // the CLIENT's request id, so a notifications/cancelled from the client can
 // abort the matching call. The map is mutex-guarded, so a single dispatcher
-// remains safe to share across concurrent HTTP requests — though over HTTP the
-// cancellation path is moot in practice (each POST is a separate stateless
-// request; two clients reusing one id merely overwrite each other's map entry,
-// harmless because nothing over HTTP ever looks it up).
+// remains safe to share across concurrent HTTP requests. A tools/call whose id
+// is ALREADY in flight is rejected with an explicit error instead of silently
+// overwriting the first call's entry — since Round 2 stdio runs each tools/call
+// on its own goroutine, so an overwrite would wire a later notifications/
+// cancelled to the WRONG call (found by review; over HTTP such an id collision
+// was harmless, but stdio shares the map across concurrent calls).
 type dispatcher struct {
 	reg     *registry.Registry
 	log     *slog.Logger
@@ -356,10 +358,23 @@ func paginatedToolsList(req *mcp.Message, tools []mcp.Tool, pageSize int) *mcp.M
 // handleCancelled — the reply is suppressed entirely: per the MCP cancellation
 // utility the receiver of a cancellation SHOULD NOT answer the cancelled
 // request at all, not even with an error.
+//
+// A second tools/call reusing an id that is still in flight is refused with an
+// explicit Invalid Request instead of being run: silently overwriting the
+// first call's cancels entry would misroute a later notifications/cancelled to
+// whichever call registered last, and the first call's completion would erase
+// the second's entry (found by review) — same "explicit error over silent
+// wrong behaviour" policy as IsMalformedHybrid.
 func (d *dispatcher) dispatchToolsCall(ctx context.Context, req *mcp.Message) *mcp.Message {
 	callCtx, cancel := context.WithCancel(ctx)
 	key := string(req.ID)
 	d.cancelMu.Lock()
+	if _, inFlight := d.cancels[key]; inFlight {
+		d.cancelMu.Unlock()
+		cancel() // release the never-used child context
+		return mcp.NewError(req.ID, mcp.CodeInvalidRequest,
+			"invalid request: a tools/call with this id is already in flight", nil)
+	}
 	d.cancels[key] = cancel
 	d.cancelMu.Unlock()
 

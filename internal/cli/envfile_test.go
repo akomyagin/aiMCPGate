@@ -34,6 +34,7 @@ func TestApplyEnvFileParsesAndSets(t *testing.T) {
 		"MCP_GATE_ENVTEST_PLAIN", "MCP_GATE_ENVTEST_EXPORT", "MCP_GATE_ENVTEST_DQ",
 		"MCP_GATE_ENVTEST_SQ", "MCP_GATE_ENVTEST_EQ", "MCP_GATE_ENVTEST_SPACES",
 		"MCP_GATE_ENVTEST_MISMATCH", "MCP_GATE_ENVTEST_EMPTY",
+		"MCP_GATE_ENVTEST_EXPORT_TAB", "export", "exportNOT",
 	}
 	for _, k := range keys {
 		unsetAfter(t, k)
@@ -45,6 +46,9 @@ func TestApplyEnvFileParsesAndSets(t *testing.T) {
 		"   # an indented comment",
 		"MCP_GATE_ENVTEST_PLAIN=plain-value",
 		"export MCP_GATE_ENVTEST_EXPORT=exported",
+		"export\tMCP_GATE_ENVTEST_EXPORT_TAB=tab-exported", // tab after export (review fix)
+		"export=literal-export-key",                        // NOT the export form: the key IS "export"
+		"exportNOT=glued",                                  // no whitespace: the key keeps its prefix
 		`MCP_GATE_ENVTEST_DQ="double quoted"`,
 		"MCP_GATE_ENVTEST_SQ='single quoted'",
 		"MCP_GATE_ENVTEST_EQ=key=value=chain",
@@ -58,12 +62,15 @@ func TestApplyEnvFileParsesAndSets(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"MCP_GATE_ENVTEST_PLAIN":  "plain-value",
-		"MCP_GATE_ENVTEST_EXPORT": "exported",
-		"MCP_GATE_ENVTEST_DQ":     "double quoted",
-		"MCP_GATE_ENVTEST_SQ":     "single quoted",
-		"MCP_GATE_ENVTEST_EQ":     "key=value=chain",
-		"MCP_GATE_ENVTEST_SPACES": "padded",
+		"MCP_GATE_ENVTEST_PLAIN":      "plain-value",
+		"MCP_GATE_ENVTEST_EXPORT":     "exported",
+		"MCP_GATE_ENVTEST_EXPORT_TAB": "tab-exported",
+		"export":                      "literal-export-key",
+		"exportNOT":                   "glued",
+		"MCP_GATE_ENVTEST_DQ":         "double quoted",
+		"MCP_GATE_ENVTEST_SQ":         "single quoted",
+		"MCP_GATE_ENVTEST_EQ":         "key=value=chain",
+		"MCP_GATE_ENVTEST_SPACES":     "padded",
 		// Mismatched quotes must be kept verbatim, not half-eaten.
 		"MCP_GATE_ENVTEST_MISMATCH": `'mismatched"`,
 		"MCP_GATE_ENVTEST_EMPTY":    "",

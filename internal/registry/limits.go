@@ -114,10 +114,13 @@ func (r *Registry) truncateResult(resp *mcp.Message, upstream string, limit int)
 
 // truncateToolResult is the pure transformation behind truncateResult: given a
 // raw tools/call result larger than limit, it returns a re-marshaled copy
-// whose text blocks are cut so the whole result lands close to limit, with a
-// truncation marker appended to the first cut block. ok=false means the
-// result is not in the expected shape (or has no text to cut) and the caller
-// must pass the original through unchanged.
+// whose text blocks are cut so the whole result fits within limit, with a
+// truncation marker appended to the first cut block (marker and non-text
+// blocks are themselves sacrificed when the budget is too small for them —
+// the returned result NEVER exceeds limit). ok=false means the result is not
+// in the expected shape, has no text to cut, or cannot be represented under
+// limit at all (a limit smaller than the minimal marker skeleton) — the
+// caller must pass the original through unchanged.
 //
 // Every field the gateway does not understand is preserved: blocks and the
 // top-level result are decoded into map[string]json.RawMessage, not into a
@@ -193,16 +196,43 @@ func truncateToolResult(result json.RawMessage, limit int) (out json.RawMessage,
 			budget -= enc
 			continue
 		}
-		room := budget - (len(mustJSONString(marker)) - 2)
-		blocks[i]["text"] = mustJSONString(trimToEncodedBudget(texts[i], room) + marker)
+		if room := budget - (len(mustJSONString(marker)) - 2); room >= 0 {
+			blocks[i]["text"] = mustJSONString(trimToEncodedBudget(texts[i], room) + marker)
+		}
+		// room < 0: not even the marker fits what is left of the budget — the
+		// block stays empty, marker included: a marker that itself overshoots
+		// the limit would defeat the very limit it reports (found by review).
 		cut = true
 	}
-	if !cut {
-		// Every text fit after all: the original only exceeded the limit by
-		// JSON formatting the re-marshal compacted away. Nothing was lost, so
-		// no marker — just return the (now small enough) compact form.
-		return remarshal()
+	out, ok = remarshal()
+	if !ok {
+		return nil, false
 	}
+	if len(out) <= limit {
+		// When nothing was cut the original only exceeded the limit by JSON
+		// formatting the re-marshal compacted away — nothing lost, no marker.
+		return out, true
+	}
+	// Last resort (found by review): even with every text emptied the result
+	// exceeds the limit — the un-cuttable skeleton (schema overhead, non-text
+	// blocks, unknown top-level fields) is bigger than the whole budget, so
+	// cutting text alone cannot honor it. Replace the ENTIRE result with a
+	// single marker-only text block — keeping isError, whose loss would turn a
+	// failed call into an apparent success — and trim the marker itself to
+	// whatever fits. Only when not even that minimal skeleton fits under limit
+	// is the result declared untruncatable (ok=false, the caller passes it
+	// through unchanged with a warning).
+	slim := map[string]json.RawMessage{}
+	if v, hasErr := top["isError"]; hasErr {
+		slim["isError"] = v
+	}
+	top = slim
+	blocks = []map[string]json.RawMessage{{"type": mustJSONString("text"), "text": mustJSONString("")}}
+	skeleton, ok := remarshal()
+	if !ok || len(skeleton) > limit {
+		return nil, false
+	}
+	blocks[0]["text"] = mustJSONString(trimToEncodedBudget(marker, limit-len(skeleton)))
 	return remarshal()
 }
 
@@ -231,10 +261,10 @@ func trimToEncodedBudget(s string, budget int) string {
 // guardedCall applies the per-upstream call-limit guards around one forwarded
 // tools/call, in order: (1) rate limit — Wait respects ctx, so a client
 // cancellation or deadline aborts the queueing honestly; (2) concurrency cap —
-// same ctx semantics for Acquire; (3) the RPC itself under the per-upstream
-// call timeout; (4) opt-in truncation of an oversized successful result. It is
-// the body of callUpstream, split out so the audit/payload records in
-// callUpstream cover every outcome, guard rejections included.
+// same ctx semantics for Acquire; (3)–(4) the RPC itself plus truncation
+// (timedCall). It is the guarded body of callUpstream, split out so the
+// audit/payload records in callUpstream cover every outcome, guard rejections
+// included.
 func (r *Registry) guardedCall(ctx context.Context, conn Upstream, rt route, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	if lim := r.limiterFor(rt.upstream); lim != nil {
 		if err := lim.Wait(ctx); err != nil {
@@ -247,7 +277,17 @@ func (r *Registry) guardedCall(ctx context.Context, conn Upstream, rt route, arg
 		}
 		defer sem.Release(1)
 	}
+	return r.timedCall(ctx, conn, rt, arguments, meta)
+}
 
+// timedCall is guardedCall's tail without the guards: (3) the RPC under the
+// per-upstream call timeout and (4) opt-in truncation of an oversized
+// successful result. Split out so CallTool's ErrConnClosedBeforeSend retry can
+// run WITHOUT re-charging the rate limiter or re-acquiring the semaphore the
+// first attempt already paid for — that attempt sent nothing over the wire,
+// and double-billing one logical client call made a rps=1/burst=1 limit stall
+// the retry a full refill interval (found by review).
+func (r *Registry) timedCall(ctx context.Context, conn Upstream, rt route, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	var resp *mcp.Message
 	err := r.withCallTimeoutFor(ctx, rt.upstream, func(ctx context.Context) error {
 		var err error

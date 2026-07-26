@@ -25,7 +25,8 @@ func addEnvFileFlag(cmd *cobra.Command) *string {
 //
 // Supported syntax (deliberately minimal, no third-party dotenv dependency):
 //   - blank lines and lines starting with '#' (after trimming) are skipped;
-//   - an optional "export " prefix before KEY=VALUE is stripped;
+//   - an optional "export" prefix (followed by any spaces/tabs) before
+//     KEY=VALUE is stripped;
 //   - VALUE is everything after the FIRST '=' to the end of the line, with
 //     surrounding whitespace trimmed and one pair of matching single or double
 //     quotes removed if the value is wrapped in them on both sides.
@@ -47,7 +48,12 @@ func applyEnvFile(path string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		// "export" counts as a prefix only when whitespace follows (a tab is as
+		// good as a space — found by review); "export=1" or "exportFOO=bar"
+		// keep their literal keys.
+		if rest, found := strings.CutPrefix(line, "export"); found && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+			line = strings.TrimSpace(rest)
+		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			return fmt.Errorf("env file %s: line %d: expected KEY=VALUE, got %q", path, i+1, line)

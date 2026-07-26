@@ -312,6 +312,64 @@ func TestTruncateToolResult(t *testing.T) {
 		}
 	})
 
+	t.Run("tiny limit never overshoots", func(t *testing.T) {
+		// Degenerate case found by review: with a limit far smaller than the
+		// emptied-blocks skeleton (three 1000-byte text blocks, limit=50) the
+		// old code still appended the truncation marker and returned 142
+		// bytes against a declared limit of 50.
+		big := `{"content":[` +
+			`{"type":"text","text":"` + strings.Repeat("a", 1000) + `"},` +
+			`{"type":"text","text":"` + strings.Repeat("b", 1000) + `"},` +
+			`{"type":"text","text":"` + strings.Repeat("c", 1000) + `"}]}`
+		out, ok := truncateToolResult(json.RawMessage(big), 50)
+		if !ok {
+			t.Fatal("truncateToolResult: want ok=true for limit 50")
+		}
+		if len(out) > 50 {
+			t.Fatalf("truncated size %d exceeds limit 50: %s", len(out), out)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(out, &top); err != nil {
+			t.Fatalf("truncated result is not valid JSON: %v", err)
+		}
+		if _, has := top["content"]; !has {
+			t.Errorf("last-resort result lost the content field: %s", out)
+		}
+
+		// The last resort keeps isError once the limit admits it: dropping it
+		// would turn a failed call into an apparent success.
+		withErr := json.RawMessage(`{"content":[{"type":"text","text":"` +
+			strings.Repeat("a", 1000) + `"}],"isError":true}`)
+		out, ok = truncateToolResult(withErr, 60)
+		if !ok {
+			t.Fatal("truncateToolResult: want ok=true for limit 60")
+		}
+		if len(out) > 60 {
+			t.Fatalf("truncated size %d exceeds limit 60: %s", len(out), out)
+		}
+		if !strings.Contains(string(out), `"isError":true`) {
+			t.Errorf("isError dropped by the last-resort truncation: %s", out)
+		}
+
+		// Sweep every limit below the original size: whatever the function
+		// reports truncatable must actually fit; a declared-untruncatable
+		// result (ok=false, pass-through) is the only allowed way out.
+		for _, payload := range []string{big, string(withErr)} {
+			for limit := 1; limit < len(payload); limit++ {
+				out, ok := truncateToolResult(json.RawMessage(payload), limit)
+				if !ok {
+					continue
+				}
+				if len(out) > limit {
+					t.Fatalf("limit %d: truncated size %d overshoots: %s", limit, len(out), out)
+				}
+				if !json.Valid(out) {
+					t.Fatalf("limit %d: truncated result is not valid JSON: %s", limit, out)
+				}
+			}
+		}
+	})
+
 	t.Run("unexpected shapes pass through", func(t *testing.T) {
 		for name, raw := range map[string]string{
 			"not an object":     `"just a string"`,

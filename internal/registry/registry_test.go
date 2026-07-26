@@ -882,6 +882,45 @@ func TestCallToolNoRetryOnSameConn(t *testing.T) {
 	}
 }
 
+// TestCallToolRetryDoesNotDoubleChargeRateLimit (review fix): the
+// ErrConnClosedBeforeSend retry must NOT pass the rate-limit/concurrency
+// guards a second time — the first attempt already charged them without
+// sending a byte. With rps=0.001/burst=1 the second token would arrive in ~17
+// minutes, so a retry that re-entered lim.Wait could only finish by blowing
+// the deadline; the fixed retry path (timedCall) completes immediately.
+func TestCallToolRetryDoesNotDoubleChargeRateLimit(t *testing.T) {
+	cfg := &config.Config{
+		RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1},
+		Upstreams: []config.Upstream{{Name: "web", Enabled: true}},
+	}
+	live := &fakeUpstream{name: "web", tools: []string{"fetch"}}
+	dead := &swapConnOnCallUpstream{
+		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
+		repl:         live,
+		err:          upstream.ErrConnClosedBeforeSend,
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	dead.reg = r
+	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return dead, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := r.CallTool(ctx, "web__fetch", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v — one logical call must charge the rate limiter exactly ONE token, retry included", err)
+	}
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("unexpected response after retry: %+v", resp)
+	}
+	if live.lastNamed != "fetch" {
+		t.Errorf("fresh connection received name %q, want original %q", live.lastNamed, "fetch")
+	}
+}
+
 // versionedListUpstream serves a DIFFERENT catalog on each ListTools call
 // (v1 for Start's initial list, v2 for the first re-list, v3 afterwards) and
 // lets the test hold the first re-list "in flight": call 2 signals entered and

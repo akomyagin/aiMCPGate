@@ -81,6 +81,39 @@ func TestDispatchPingAnswersEmptyResult(t *testing.T) {
 	}
 }
 
+// TestDispatchToolsCallDuplicateIDRejected: a second tools/call reusing an id
+// that is still in flight must be answered with an explicit Invalid Request —
+// never run — and must leave the FIRST call's cancels entry untouched, so a
+// later notifications/cancelled still aborts the right call (found by review:
+// concurrent stdio calls silently overwrote each other's entry).
+func TestDispatchToolsCallDuplicateIDRejected(t *testing.T) {
+	d := newDispatcher(nil, quietLogger(), "test", true, false)
+
+	// Simulate the first call being in flight under id 5.
+	firstCancelled := false
+	d.cancelMu.Lock()
+	d.cancels["5"] = func() { firstCancelled = true }
+	d.cancelMu.Unlock()
+
+	reply := d.dispatch(context.Background(), mustDecode(t,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"t"}}`))
+	if reply == nil {
+		t.Fatal("duplicate-id tools/call was silently accepted, want an Invalid Request error")
+	}
+	if reply.Error == nil || reply.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("reply error = %+v, want code %d", reply.Error, mcp.CodeInvalidRequest)
+	}
+	if string(reply.ID) != "5" {
+		t.Errorf("reply id = %s, want 5", reply.ID)
+	}
+
+	// The first call's entry survives and still routes a cancellation.
+	d.handleCancelled(json.RawMessage(`{"requestId":5}`))
+	if !firstCancelled {
+		t.Error("the first call's cancel entry was lost: notifications/cancelled no longer reaches it")
+	}
+}
+
 // TestBuildCapabilitiesMatchesFormerLiteral pins the byte-level compatibility
 // of the structural capability builder with the raw literals it replaced: this
 // round it must produce exactly the tools-only object, per listChanged flavour.
