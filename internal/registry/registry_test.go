@@ -32,11 +32,20 @@ func (fakeUpstreamBase) Initialize(context.Context) (*mcp.InitializeResult, erro
 }
 func (fakeUpstreamBase) ListTools(context.Context) ([]mcp.Tool, error)         { return nil, nil }
 func (fakeUpstreamBase) ListResources(context.Context) ([]mcp.Resource, error) { return nil, nil }
-func (fakeUpstreamBase) ListPrompts(context.Context) ([]mcp.Prompt, error)     { return nil, nil }
+func (fakeUpstreamBase) ListResourceTemplates(context.Context) ([]mcp.ResourceTemplate, error) {
+	return nil, nil
+}
+func (fakeUpstreamBase) ListPrompts(context.Context) ([]mcp.Prompt, error) { return nil, nil }
 func (fakeUpstreamBase) CallTool(context.Context, string, json.RawMessage, json.RawMessage) (*mcp.Message, error) {
 	return nil, nil
 }
 func (fakeUpstreamBase) GetPrompt(context.Context, string, json.RawMessage) (*mcp.Message, error) {
+	return nil, nil
+}
+func (fakeUpstreamBase) ReadResource(context.Context, string) (*mcp.Message, error) {
+	return nil, nil
+}
+func (fakeUpstreamBase) Complete(context.Context, json.RawMessage) (*mcp.Message, error) {
 	return nil, nil
 }
 func (fakeUpstreamBase) Close() error                  { return nil }
@@ -68,6 +77,15 @@ type fakeUpstream struct {
 	promptsErr     error    // if set, ListPrompts fails
 	lastPromptName string
 	lastPromptArgs json.RawMessage
+
+	// Resources (Round 5). Same capability contract: the registry only calls
+	// ListResources/ListResourceTemplates when caps declares "resources".
+	resources          []string // URIs advertised in resources/list
+	templates          []string // uriTemplates advertised in resources/templates/list
+	resourcesErr       error    // if set, ListResources fails
+	templatesErr       error    // if set, ListResourceTemplates fails
+	lastReadURI        string
+	lastCompleteParams json.RawMessage
 }
 
 func (f *fakeUpstream) Name() string { return f.name }
@@ -104,6 +122,42 @@ func (f *fakeUpstream) ListPrompts(context.Context) ([]mcp.Prompt, error) {
 		out = append(out, mcp.Prompt{Name: p, Description: json.RawMessage(`"prompt ` + p + `"`)})
 	}
 	return out, nil
+}
+
+func (f *fakeUpstream) ListResources(context.Context) ([]mcp.Resource, error) {
+	if f.resourcesErr != nil {
+		return nil, f.resourcesErr
+	}
+	out := make([]mcp.Resource, 0, len(f.resources))
+	for _, uri := range f.resources {
+		out = append(out, mcp.Resource{URI: uri, Name: "res " + uri, Description: json.RawMessage(`"resource ` + uri + `"`)})
+	}
+	return out, nil
+}
+
+func (f *fakeUpstream) ListResourceTemplates(context.Context) ([]mcp.ResourceTemplate, error) {
+	if f.templatesErr != nil {
+		return nil, f.templatesErr
+	}
+	out := make([]mcp.ResourceTemplate, 0, len(f.templates))
+	for _, tmpl := range f.templates {
+		out = append(out, mcp.ResourceTemplate{URITemplate: tmpl, Name: "tpl " + tmpl})
+	}
+	return out, nil
+}
+
+func (f *fakeUpstream) ReadResource(_ context.Context, uri string) (*mcp.Message, error) {
+	f.lastReadURI = uri
+	id := mcp.IntID(f.nextID.Add(1))
+	result := json.RawMessage(`{"contents":[{"uri":"` + uri + `","text":"read by ` + f.name + `"}]}`)
+	return mcp.NewResult(id, result), nil
+}
+
+func (f *fakeUpstream) Complete(_ context.Context, params json.RawMessage) (*mcp.Message, error) {
+	f.lastCompleteParams = params
+	id := mcp.IntID(f.nextID.Add(1))
+	result := json.RawMessage(`{"completion":{"values":["from ` + f.name + `"]}}`)
+	return mcp.NewResult(id, result), nil
 }
 
 func (f *fakeUpstream) GetPrompt(_ context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {

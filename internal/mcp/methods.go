@@ -15,6 +15,17 @@ const (
 	MethodPromptsList  = "prompts/list"
 	MethodPromptsGet   = "prompts/get"
 
+	// MethodResourceTemplatesList lists an upstream's parameterized resource
+	// templates (RFC 6570 URI templates), aggregated by the gateway the same
+	// merge path plain resources take (Round 5).
+	MethodResourceTemplatesList = "resources/templates/list"
+
+	// MethodCompletionComplete asks a server for argument autocompletion
+	// suggestions for a prompt argument or a resource-template variable. The
+	// gateway routes it to the upstream owning the referenced prompt/resource
+	// and proxies the payload verbatim (Round 5).
+	MethodCompletionComplete = "completion/complete"
+
 	// MethodPing is the liveness check either side may send at any time —
 	// including BEFORE the initialize handshake completes (the only request the
 	// spec allows there, docs/MCP_NOTES.md §4). The receiver MUST answer
@@ -157,11 +168,21 @@ type PromptsGetParams struct {
 }
 
 // Resource is one entry in a resources/list result.
+//
+// Description/Annotations/Size/Meta are RawMessage for the same reason as
+// Tool.Description — the gateway aggregates resources but never interprets
+// their payload, so the exact JSON each upstream advertises is proxied to the
+// client verbatim (Round 5). Unlike tools and prompts, resources are addressed
+// by URI and are NOT namespaced: the URI the client sees is the upstream's own.
 type Resource struct {
-	URI         string `json:"uri"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
-	MimeType    string `json:"mimeType,omitempty"`
+	URI         string          `json:"uri"`
+	Name        string          `json:"name,omitempty"`
+	Title       string          `json:"title,omitempty"`
+	Description json.RawMessage `json:"description,omitempty"`
+	MimeType    string          `json:"mimeType,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
+	Size        json.RawMessage `json:"size,omitempty"`
+	Meta        json.RawMessage `json:"_meta,omitempty"`
 }
 
 // ResourceListParams carries the optional pagination cursor.
@@ -173,6 +194,75 @@ type ResourceListParams struct {
 type ResourceListResult struct {
 	Resources  []Resource `json:"resources"`
 	NextCursor string     `json:"nextCursor,omitempty"`
+}
+
+// ResourceReadParams is the params object of a resources/read request.
+//
+// There is deliberately NO ResourceReadResult type: the gateway forwards the
+// upstream's result (contents) verbatim as the response payload, exactly like
+// tools/call and prompts/get.
+type ResourceReadParams struct {
+	URI string `json:"uri"`
+}
+
+// ResourceTemplate is one entry in a resources/templates/list result — a
+// parameterized resource whose URITemplate ("file:///logs/{name}.log", RFC
+// 6570) matches a family of URIs instead of naming one. Payload fields are
+// verbatim like Resource's.
+type ResourceTemplate struct {
+	URITemplate string          `json:"uriTemplate"`
+	Name        string          `json:"name,omitempty"`
+	Title       string          `json:"title,omitempty"`
+	Description json.RawMessage `json:"description,omitempty"`
+	MimeType    string          `json:"mimeType,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
+	Meta        json.RawMessage `json:"_meta,omitempty"`
+}
+
+// ResourceTemplatesListParams carries the optional pagination cursor.
+type ResourceTemplatesListParams struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// ResourceTemplatesListResult is the result of a resources/templates/list
+// response.
+type ResourceTemplatesListResult struct {
+	ResourceTemplates []ResourceTemplate `json:"resourceTemplates"`
+	NextCursor        string             `json:"nextCursor,omitempty"`
+}
+
+// Completion ref types: what a completion/complete request's ref.type may be —
+// argument completion for a prompt, or for a resource-template variable.
+const (
+	CompletionRefPrompt   = "ref/prompt"
+	CompletionRefResource = "ref/resource"
+)
+
+// CompletionRef is the ref object of a completion/complete request: which
+// prompt (by name) or resource template (by URI) the argument being completed
+// belongs to. It is typed — not RawMessage — because for ref/prompt the
+// gateway must rewrite Name from the client-facing namespaced form back to
+// the upstream's original before forwarding (the client only ever saw the
+// namespaced name in prompts/list); for ref/resource the URI is never
+// namespaced and travels as-is.
+type CompletionRef struct {
+	Type  string `json:"type"`
+	Name  string `json:"name,omitempty"`  // ref/prompt: prompt name
+	Title string `json:"title,omitempty"` // ref/prompt: optional display title
+	URI   string `json:"uri,omitempty"`   // ref/resource: template or resource URI
+}
+
+// CompletionCompleteParams is the params object of a completion/complete
+// request. Only Ref is interpreted (for routing and the prompt-name rewrite);
+// Argument, Context and Meta are proxied verbatim.
+//
+// There is deliberately NO CompletionCompleteResult type: the upstream's
+// result (completion values) is forwarded verbatim, like prompts/get.
+type CompletionCompleteParams struct {
+	Ref      CompletionRef   `json:"ref"`
+	Argument json.RawMessage `json:"argument"`
+	Context  json.RawMessage `json:"context,omitempty"`
+	Meta     json.RawMessage `json:"_meta,omitempty"`
 }
 
 // MustParams marshals v into a json.RawMessage for use as a message's params.

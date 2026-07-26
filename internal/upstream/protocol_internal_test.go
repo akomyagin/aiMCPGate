@@ -173,9 +173,10 @@ func (e *errorTransport) Done() (<-chan struct{}, bool)                         
 func (e *errorTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestListResourcesMethodNotFoundIsEmptyCatalog guards the one asymmetry the
-// paginate refactor had to preserve: resources/list answered with
-// method-not-found (upstream has no resources capability) is an EMPTY catalog,
-// not an error — while for tools/list the same answer stays fatal.
+// paginate refactor had to preserve: resources/list (and, since Round 5,
+// resources/templates/list) answered with method-not-found (upstream has no
+// resources capability / no templates sub-method) is an EMPTY catalog, not an
+// error — while for tools/list the same answer stays fatal.
 func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 	c := &Conn{transport: &errorTransport{code: mcp.CodeMethodNotFound}}
 
@@ -187,14 +188,25 @@ func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 		t.Fatalf("want empty catalog, got %+v", res)
 	}
 
+	tpls, err := c.ListResourceTemplates(context.Background())
+	if err != nil {
+		t.Fatalf("templates method-not-found must mean empty catalog, got error: %v", err)
+	}
+	if len(tpls) != 0 {
+		t.Fatalf("want empty template catalog, got %+v", tpls)
+	}
+
 	if _, err := c.ListTools(context.Background()); err == nil {
 		t.Fatal("tools/list method-not-found must stay a hard error")
 	}
 
-	// Any OTHER error code stays fatal for resources too.
+	// Any OTHER error code stays fatal for resources and templates too.
 	c = &Conn{transport: &errorTransport{code: mcp.CodeInternalError}}
 	if _, err := c.ListResources(context.Background()); err == nil {
 		t.Fatal("resources/list internal error must stay a hard error")
+	}
+	if _, err := c.ListResourceTemplates(context.Background()); err == nil {
+		t.Fatal("resources/templates/list internal error must stay a hard error")
 	}
 }
 
