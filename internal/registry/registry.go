@@ -1353,8 +1353,9 @@ func templateRegexp(tmpl string) (*regexp.Regexp, error) {
 // formed.
 func (r *Registry) dropUpstream(name string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.dropLocked(name)
+	r.mu.Unlock()
+	r.dropPendingElicits(name)
 }
 
 // Gated catalog mutations. dropUpstreamIfCurrent, replaceUpstreamIfLive and
@@ -1381,11 +1382,13 @@ func (r *Registry) dropUpstream(name string) {
 // give-up path — taking lifecycleMu here would deadlock shutdown.
 func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.conns[name] != conn {
+		r.mu.Unlock()
 		return false
 	}
 	r.dropLocked(name)
+	r.mu.Unlock()
+	r.dropPendingElicits(name)
 	return true
 }
 
@@ -1471,11 +1474,15 @@ func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, a
 // the caller then owns closing the never-installed connection.
 func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta, supCtx context.Context) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if supCtx.Err() != nil {
+		r.mu.Unlock()
 		return false
 	}
 	r.installLocked(name, conn, tools, &aux, &meta, "upstream catalog replaced")
+	r.mu.Unlock()
+	// The dead predecessor's parked elicitations can never be answered through
+	// the fresh connection (its id space is new) — drop them (found by review).
+	r.dropPendingElicits(name)
 	return true
 }
 
@@ -1652,41 +1659,81 @@ func (r *Registry) SubscribeElicitations() (<-chan ElicitationRequest, func()) {
 // toward the upstream, honestly reports it cannot serve the method. Otherwise
 // the request is parked in pendingElicits under a freshly minted gateway id
 // and published to the subscribed transport (non-blocking, like
-// forwardNotification — a dropped request leaves the upstream to its own
-// timeout, the same backpressure contract notifications have).
+// forwardNotification). A publish that reached NO subscriber (none registered,
+// or every buffer full) rolls the parked entry back and answers the upstream
+// with an error immediately: RouteElicitationResponse is the entry's only
+// other remover, so an undeliverable request would otherwise leak in
+// pendingElicits forever (found by review).
 func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMessage) {
 	if !r.clientElicitationCapable.Load() {
-		r.mu.RLock()
-		conn := r.conns[name]
-		r.mu.RUnlock()
-		if conn == nil {
-			return // the upstream vanished between its write and this callback
-		}
-		reply := mcp.NewError(originalID, mcp.CodeMethodNotFound,
-			"elicitation/create not supported: the gateway's client did not declare the elicitation capability", nil)
-		// Off the reader goroutine: a stdin write can block on a stuck child,
-		// and the reader publishing this callback must never stall on it.
-		go func() {
-			if err := conn.RespondUpstreamRequest(reply); err != nil {
-				r.log.Warn("refuse upstream elicitation failed", "upstream", name, "err", err)
-			}
-		}()
+		r.respondElicitError(name, originalID, mcp.CodeMethodNotFound,
+			"elicitation/create not supported: the gateway's client did not declare the elicitation capability")
 		return
 	}
 
 	gatewayID := fmt.Sprintf("elicit-%d", r.elicitID.Add(1))
 	req := ElicitationRequest{GatewayID: gatewayID, Params: params}
+	delivered := false
 	r.elicitMu.Lock()
 	r.pendingElicits[gatewayID] = pendingElicit{upstream: name, originalID: originalID}
 	for _, ch := range r.elicitSubs {
 		select {
 		case ch <- req:
+			delivered = true
 		default:
 			r.log.Debug("elicitation subscriber buffer full, dropping", "upstream", name, "id", gatewayID)
 		}
 	}
+	if !delivered {
+		delete(r.pendingElicits, gatewayID) // roll back: nobody will ever answer it
+	}
 	r.elicitMu.Unlock()
+	if !delivered {
+		r.respondElicitError(name, originalID, mcp.CodeInternalError,
+			"elicitation/create not delivered: no client transport accepted the request")
+		return
+	}
 	r.log.Debug("upstream elicitation proxied to client", "upstream", name, "id", gatewayID)
+}
+
+// respondElicitError answers an upstream's elicitation/create with a JSON-RPC
+// error under the upstream's OWN id — used when the request cannot reach the
+// client (incapable client, or no subscriber accepted the publish), so the
+// upstream gets an immediate honest answer instead of hanging until its own
+// timeout. The write runs off the caller's goroutine: a stdin write can block
+// on a stuck child, and the upstream reader publishing the callback must
+// never stall on it.
+func (r *Registry) respondElicitError(name string, originalID json.RawMessage, code int, text string) {
+	r.mu.RLock()
+	conn := r.conns[name]
+	r.mu.RUnlock()
+	if conn == nil {
+		return // the upstream vanished between its write and this callback
+	}
+	reply := mcp.NewError(originalID, code, text, nil)
+	go func() {
+		if err := conn.RespondUpstreamRequest(reply); err != nil {
+			r.log.Warn("refuse upstream elicitation failed", "upstream", name, "err", err)
+		}
+	}()
+}
+
+// dropPendingElicits discards every parked elicitation belonging to name —
+// called whenever name's connection is removed or replaced (reload removal,
+// restart give-up, a fresh connection installed after a crash): the answer
+// could no longer reach the process that asked, and RouteElicitationResponse
+// is otherwise the ONLY remover, so entries for a gone connection would
+// accumulate forever (found by review). Deliberately NOT part of dropLocked:
+// a same-connection re-merge (relistUpstream's drop-then-merge) must keep its
+// still-answerable pending elicitations.
+func (r *Registry) dropPendingElicits(name string) {
+	r.elicitMu.Lock()
+	for id, p := range r.pendingElicits {
+		if p.upstream == name {
+			delete(r.pendingElicits, id)
+		}
+	}
+	r.elicitMu.Unlock()
 }
 
 // RouteElicitationResponse routes the client's answer to a proxied
@@ -2078,12 +2125,9 @@ func (r *Registry) Prompts() []PromptDescriptor {
 // failure is logged here with full detail and returned as a short message
 // naming only the prompt the client itself asked for (dispatch.go forwards
 // the text verbatim to the client). The returned *mcp.Message is the raw
-// upstream response (which may itself carry a JSON-RPC error).
-//
-// TODO: retry once on upstream.ErrConnClosedBeforeSend against a re-resolved
-// fresh connection, the way CallTool does — skipped in this round for
-// minimality (prompts/get is read-only and far rarer than tools/call, so the
-// race window matters much less; see CallTool for the pattern to copy).
+// upstream response (which may itself carry a JSON-RPC error). Like CallTool
+// it retries once on upstream.ErrConnClosedBeforeSend against a re-resolved
+// fresh connection (callWithConnRetry).
 func (r *Registry) GetPrompt(ctx context.Context, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
 	r.mu.RLock()
 	rt, ok := r.promptRoute[namespaced]
@@ -2094,12 +2138,27 @@ func (r *Registry) GetPrompt(ctx context.Context, namespaced string, arguments j
 		return nil, fmt.Errorf("unknown prompt %q", namespaced)
 	}
 
-	var resp *mcp.Message
-	err := r.withCallTimeoutFor(ctx, rt.upstream, func(ctx context.Context) error {
-		var err error
-		resp, err = conn.GetPrompt(ctx, rt.original, arguments)
-		return err
-	})
+	resolve := func() Upstream {
+		r.mu.RLock()
+		rt2, ok2 := r.promptRoute[namespaced]
+		conn2 := r.conns[rt2.upstream]
+		r.mu.RUnlock()
+		if !ok2 {
+			return nil
+		}
+		rt = rt2
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodPromptsGet, namespaced, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, rt.upstream, func(ctx context.Context) error {
+				var err error
+				resp, err = c.GetPrompt(ctx, rt.original, arguments)
+				return err
+			})
+			return resp, err
+		})
 	if err != nil {
 		r.log.Warn("prompt get failed", "prompt", namespaced, "upstream", rt.upstream, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -2162,7 +2221,8 @@ func (r *Registry) resolveResourceOwner(uri string) (string, bool) {
 // resolveResourceOwner). An unowned uri wraps ErrUnknownResource so the
 // dispatcher can answer Invalid params; transport failures follow the same
 // sanitized-error contract as CallTool/GetPrompt (full detail logged here,
-// only the client's own uri echoed back).
+// only the client's own uri echoed back), including CallTool's one retry on
+// upstream.ErrConnClosedBeforeSend (callWithConnRetry).
 func (r *Registry) ReadResource(ctx context.Context, uri string) (*mcp.Message, error) {
 	owner, ok := r.resolveResourceOwner(uri)
 	r.mu.RLock()
@@ -2173,12 +2233,27 @@ func (r *Registry) ReadResource(ctx context.Context, uri string) (*mcp.Message, 
 		return nil, fmt.Errorf("%w %q", ErrUnknownResource, uri)
 	}
 
-	var resp *mcp.Message
-	err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
-		var err error
-		resp, err = conn.ReadResource(ctx, uri)
-		return err
-	})
+	resolve := func() Upstream {
+		owner2, ok2 := r.resolveResourceOwner(uri)
+		if !ok2 {
+			return nil
+		}
+		owner = owner2
+		r.mu.RLock()
+		conn2 := r.conns[owner]
+		r.mu.RUnlock()
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodResourceRead, uri, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
+				var err error
+				resp, err = c.ReadResource(ctx, uri)
+				return err
+			})
+			return resp, err
+		})
 	if err != nil {
 		r.log.Warn("resource read failed", "uri", uri, "upstream", owner, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -2230,12 +2305,26 @@ func (r *Registry) Complete(ctx context.Context, params mcp.CompletionCompletePa
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCompletionRef, refDesc)
 	}
 
-	var resp *mcp.Message
-	err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
-		var err error
-		resp, err = conn.Complete(ctx, mcp.MustParams(params))
-		return err
-	})
+	// The retry re-resolves by owner name only: for a ref/prompt the name was
+	// already rewritten to the upstream's original above, so re-running the
+	// route lookup is impossible — a fresh connection under the same upstream
+	// name is exactly what a reload/restart installs anyway.
+	resolve := func() Upstream {
+		r.mu.RLock()
+		conn2 := r.conns[owner]
+		r.mu.RUnlock()
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodCompletionComplete, refDesc, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
+				var err error
+				resp, err = c.Complete(ctx, mcp.MustParams(params))
+				return err
+			})
+			return resp, err
+		})
 	if err != nil {
 		r.log.Warn("completion failed", "ref", refDesc, "upstream", owner, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -2366,36 +2455,26 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, m
 		return nil, fmt.Errorf("unknown tool %q", namespaced)
 	}
 
-	resp, err := r.callUpstream(ctx, conn, rt, namespaced, arguments, meta)
-	// The connection can be closed between the RUnlock above and the call — a
-	// concurrent Reload/auto-restart may already have installed a FRESH
-	// connection under the same name. ErrConnClosedBeforeSend guarantees the
-	// request was never written to the upstream, so ONE retry against the
-	// re-resolved connection is safe — but only if it actually resolved to a
-	// DIFFERENT connection (retrying the same dead conn is pointless). A plain
-	// late ErrConnClosed (failure AFTER the request was sent) is deliberately
-	// NOT retried: the upstream may have executed the (potentially
-	// non-idempotent) tool already, and double execution is worse than an
-	// honest error.
-	//
-	// The retry deliberately reuses the caller's ctx rather than granting
-	// itself fresh time — the client's deadline must bound the WHOLE call,
-	// retries included, or it stops meaning anything. In practice the retry
-	// still gets essentially the full budget: ErrConnClosedBeforeSend comes
-	// only from the pre-write closed-connection check (no I/O, ~zero time
-	// spent), and each attempt gets its own EffectiveCallTimeout inside
-	// callUpstream, capped by ctx.
-	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+	resolve := func() Upstream {
 		r.mu.RLock()
 		rt2, ok2 := r.toolRoute[namespaced]
 		conn2 := r.conns[rt2.upstream]
 		r.mu.RUnlock()
-		if ok2 && conn2 != nil && conn2 != conn {
-			r.log.Info("tool call hit a closed connection before send, retrying on the fresh one",
-				"tool", namespaced, "upstream", rt2.upstream)
-			resp, err = r.callUpstream(ctx, conn2, rt2, namespaced, arguments, meta)
+		if !ok2 {
+			return nil
 		}
+		rt = rt2
+		return conn2
 	}
+	resp, err := r.callWithConnRetry(mcp.MethodToolsCall, namespaced, conn, resolve,
+		func(c Upstream, retry bool) (*mcp.Message, error) {
+			// The retry runs UNGUARDED: the first attempt already charged the
+			// rate-limit token and cycled the semaphore without sending a
+			// byte, so charging the guards again would bill one logical client
+			// call twice — at rps=1/burst=1 that stalls the retry a full
+			// refill interval for nothing (found by review).
+			return r.callUpstream(ctx, c, rt, namespaced, arguments, meta, !retry)
+		})
 	if err != nil {
 		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -2406,17 +2485,63 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, m
 	return resp, nil
 }
 
+// callWithConnRetry runs call against conn and, when it fails with
+// upstream.ErrConnClosedBeforeSend, re-resolves the connection (resolve) and
+// retries exactly ONCE against the fresh one — the shared retry policy of
+// CallTool, GetPrompt, ReadResource and Complete. method/target only label the
+// retry log line.
+//
+// The connection can be closed between the caller's route resolution and the
+// call — a concurrent Reload/auto-restart may already have installed a FRESH
+// connection under the same name. ErrConnClosedBeforeSend guarantees the
+// request was never written to the upstream, so ONE retry against the
+// re-resolved connection is safe — but only if resolve actually produced a
+// DIFFERENT live connection (retrying the same dead conn is pointless). A
+// plain late ErrConnClosed (failure AFTER the request was sent) is
+// deliberately NOT retried: the upstream may have executed the (potentially
+// non-idempotent) operation already, and double execution is worse than an
+// honest error.
+//
+// The retry deliberately reuses the attempt's original ctx rather than
+// granting itself fresh time — the client's deadline must bound the WHOLE
+// call, retries included, or it stops meaning anything. In practice the retry
+// still gets essentially the full budget: ErrConnClosedBeforeSend comes only
+// from the pre-write closed-connection check (no I/O, ~zero time spent), and
+// each attempt gets its own EffectiveCallTimeout, capped by ctx.
+//
+// call receives retry=true on the second attempt, so tools/call can skip the
+// rate-limit/concurrency guards the first attempt already charged (see
+// CallTool); the other methods have no guards and ignore the flag.
+func (r *Registry) callWithConnRetry(method, target string, conn Upstream,
+	resolve func() Upstream, call func(conn Upstream, retry bool) (*mcp.Message, error)) (*mcp.Message, error) {
+	resp, err := call(conn, false)
+	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+		if conn2 := resolve(); conn2 != nil && conn2 != conn {
+			r.log.Info("call hit a closed connection before send, retrying on the fresh one",
+				"method", method, "target", target)
+			resp, err = call(conn2, true)
+		}
+	}
+	return resp, err
+}
+
 // callUpstream performs ONE forwarding attempt against a resolved connection,
-// with its own guards (rate limit, concurrency cap, per-upstream timeout,
-// result truncation — see guardedCall in limits.go), audit record and (opt-in)
-// payload record — each attempt CallTool makes is audited separately, the
-// failed first try and the retried second one alike, a guard rejection the
-// same as a transport failure; nothing is hidden from the call journal. The
-// recorded duration includes any time spent queueing on the guards: that is
-// the latency the client actually experienced.
-func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments, meta json.RawMessage) (*mcp.Message, error) {
+// with audit record and (opt-in) payload record — each attempt CallTool makes
+// is audited separately, the failed first try and the retried second one
+// alike, a guard rejection the same as a transport failure; nothing is hidden
+// from the call journal. The recorded duration includes any time spent
+// queueing on the guards: that is the latency the client actually
+// experienced. guarded selects whether the attempt passes the rate-limit/
+// concurrency guards (guardedCall) or skips them (timedCall) — false only for
+// CallTool's ErrConnClosedBeforeSend retry, whose first attempt already
+// charged them (see limits.go).
+func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments, meta json.RawMessage, guarded bool) (*mcp.Message, error) {
 	start := time.Now()
-	resp, err := r.guardedCall(ctx, conn, rt, arguments, meta)
+	call := r.guardedCall
+	if !guarded {
+		call = r.timedCall
+	}
+	resp, err := call(ctx, conn, rt, arguments, meta)
 	r.audit(ctx, rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
 	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
 	return resp, err

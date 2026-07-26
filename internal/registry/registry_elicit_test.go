@@ -113,6 +113,69 @@ func TestElicitationRefusedWithoutClientCapability(t *testing.T) {
 	}
 }
 
+// TestElicitationUndeliveredAnsweredAndNotLeaked (review fix): when the
+// publish reaches NO subscriber (here: none registered at all), the parked
+// pendingElicits entry must be rolled back — RouteElicitationResponse is its
+// only other remover, so it would leak forever — and the upstream must get an
+// immediate error under its ORIGINAL id instead of hanging to its timeout.
+func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
+	r, fake := newElicitTestRegistry("web")
+	r.SetClientElicitationCapable(true) // capable client, but nobody subscribed
+
+	originalID := mcp.IntID(9)
+	r.onUpstreamElicit("web", originalID, json.RawMessage(`{"message":"need input"}`))
+
+	select {
+	case got := <-fake.responses:
+		if string(got.ID) != string(originalID) {
+			t.Errorf("error reply id = %s, want the upstream's original %s", got.ID, originalID)
+		}
+		if got.Error == nil || got.Error.Code != mcp.CodeInternalError {
+			t.Errorf("error reply = %+v, want code %d", got.Error, mcp.CodeInternalError)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received an answer for the undeliverable elicitation")
+	}
+
+	r.elicitMu.Lock()
+	pending := len(r.pendingElicits)
+	r.elicitMu.Unlock()
+	if pending != 0 {
+		t.Errorf("pendingElicits holds %d entries after an undelivered publish, want 0 (leak)", pending)
+	}
+}
+
+// TestDropUpstreamClearsPendingElicits (review fix): removing an upstream from
+// the registry must discard its parked elicitations — the answer could never
+// be delivered anyway, and without cleanup the entries would accumulate
+// forever across reloads/restarts.
+func TestDropUpstreamClearsPendingElicits(t *testing.T) {
+	r, _ := newElicitTestRegistry("web")
+	r.SetClientElicitationCapable(true)
+	ch, unsubscribe := r.SubscribeElicitations()
+	defer unsubscribe()
+
+	r.onUpstreamElicit("web", mcp.IntID(1), json.RawMessage(`{}`))
+	var req ElicitationRequest
+	select {
+	case req = <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber never received the elicitation request")
+	}
+
+	r.dropUpstream("web")
+
+	r.elicitMu.Lock()
+	pending := len(r.pendingElicits)
+	r.elicitMu.Unlock()
+	if pending != 0 {
+		t.Errorf("pendingElicits holds %d entries after dropUpstream, want 0", pending)
+	}
+	if r.RouteElicitationResponse(req.GatewayID, mcp.NewResult(mcp.StringID(req.GatewayID), json.RawMessage(`{}`))) {
+		t.Error("RouteElicitationResponse = true for a dropped upstream's elicitation, want false")
+	}
+}
+
 // TestRouteElicitationResponseUnknownID (Round 14): an answer whose id matches
 // no pending elicitation (stale, duplicate, or plain garbage) is reported
 // false — the caller falls back to its normal unexpected-response handling —

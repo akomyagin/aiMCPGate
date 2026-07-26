@@ -263,22 +263,23 @@ func (c *httpTransport) startSSEStream() {
 // HTTP analogue of stdio's readLoop plus the supervisor's restart loop, scaled
 // down to one goroutine. Policy:
 //
-//   - the upstream cleanly refusing the stream (non-200 or a non-SSE
-//     Content-Type — the spec says a server that does not offer the GET
-//     stream MUST answer 405) means this OPTIONAL feature is simply absent:
-//     one Info log and out, never a retry storm against a server that said no;
-//   - a GET that fails at the transport level before any stream was EVER
-//     established is treated the same way (the upstream answers POSTs fine,
-//     so its GET path is plainly not an MCP stream);
-//   - once a stream HAS been established, drops (EOF, network errors, failed
-//     reconnects) are retried with exponential backoff, resuming via
-//     Last-Event-ID so the server can replay missed events; a stream that
-//     stayed up past sseStreamMaxBackoff resets the backoff (stable again);
+//   - the upstream EXPLICITLY refusing the stream (405/404 — the spec says a
+//     server that does not offer the GET stream MUST answer 405 — or a 200
+//     whose Content-Type is not an event stream) means this OPTIONAL feature
+//     is simply absent: one Info log and out, never a retry storm against a
+//     server that said no;
+//   - everything else — transport-level errors, transient statuses (5xx,
+//     429…), drops of an open stream (EOF, network errors) — is retried with
+//     exponential backoff, the very FIRST attempt included: a transient
+//     failure at startup says nothing about SSE support and must not disable
+//     server push until the gateway restarts (found by review). Reconnects
+//     resume via Last-Event-ID so the server can replay missed events; a
+//     stream that stayed up past sseStreamMaxBackoff resets the backoff
+//     (stable again);
 //   - ctx (the connection's streamCtx) cancelling — i.e. Close — ends the
 //     loop immediately, mid-read or mid-backoff.
 func (c *httpTransport) runSSEStream(ctx context.Context) {
 	lastEventID := ""
-	established := false
 	backoff := sseStreamInitialBackoff
 	for {
 		start := time.Now()
@@ -292,16 +293,8 @@ func (c *httpTransport) runSSEStream(ctx context.Context) {
 				"upstream", c.name)
 			return
 		}
-		if !opened && !established {
-			c.log.Info("upstream SSE stream unavailable; server-initiated notifications disabled",
-				"upstream", c.name, "err", err)
-			return
-		}
-		if opened {
-			established = true
-			if time.Since(start) >= sseStreamMaxBackoff {
-				backoff = sseStreamInitialBackoff
-			}
+		if opened && time.Since(start) >= sseStreamMaxBackoff {
+			backoff = sseStreamInitialBackoff
 		}
 		c.log.Debug("upstream SSE stream ended, reconnecting",
 			"upstream", c.name, "backoff", backoff, "err", err)
@@ -322,10 +315,12 @@ func (c *httpTransport) runSSEStream(ctx context.Context) {
 // streamSSEOnce performs one GET attempt against the endpoint and, if the
 // server answers with an event stream, reads it to its end, dispatching every
 // event to dispatchStreamEvent. opened reports whether a stream was actually
-// established (200 + text/event-stream); a clean non-stream answer returns
-// opened=false with a nil err — the caller's "the server said no" signal.
-// newLastID carries the most recent SSE id seen (or the passed-in one), for
-// the reconnect's Last-Event-ID header.
+// established (200 + text/event-stream). An EXPLICIT refusal (405/404, or a
+// 200 that is not an event stream) returns opened=false with a nil err — the
+// caller's "the server said no" signal; any other failure (transport error,
+// transient non-OK status) returns opened=false with the error, and the
+// caller retries it with backoff. newLastID carries the most recent SSE id
+// seen (or the passed-in one), for the reconnect's Last-Event-ID header.
 func (c *httpTransport) streamSSEOnce(ctx context.Context, lastEventID string) (newLastID string, opened bool, err error) {
 	newLastID = lastEventID
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
@@ -361,9 +356,27 @@ func (c *httpTransport) streamSSEOnce(ctx context.Context, lastEventID string) (
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		// A clean answer that is not an event stream. Drain a small bounded
-		// remainder so the connection returns to the keep-alive pool.
+	switch {
+	case resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound:
+		// The explicit "I do not offer the GET stream" answer (the spec says
+		// MUST be 405; 404 is the same statement from servers that route the
+		// method away entirely). Drain a small bounded remainder so the
+		// connection returns to the keep-alive pool. opened=false with nil err
+		// is the caller's "the server said no" signal.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return newLastID, false, nil
+	case resp.StatusCode != http.StatusOK:
+		// Any other status (503, 500, 429…) is a transient server condition,
+		// NOT a statement about SSE support — report it as an error so the
+		// caller retries with backoff instead of disabling the stream forever
+		// (found by review: a 503 on the very first attempt killed server
+		// push until the gateway restarted).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return newLastID, false, fmt.Errorf("upstream %q: GET %s: unexpected status %d",
+			c.name, redactedEndpoint(c.endpoint), resp.StatusCode)
+	case !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream"):
+		// 200, but the body is not an event stream: whatever answers GETs
+		// here is not an MCP SSE endpoint — a clean "no", like 405.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return newLastID, false, nil
 	}

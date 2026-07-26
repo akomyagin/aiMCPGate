@@ -847,6 +847,57 @@ func TestHTTPSSEStreamNotOffered(t *testing.T) {
 	}
 }
 
+// TestHTTPSSEStreamRetriesTransientFirstAttempt (review fix): a TRANSIENT
+// failure on the very first GET (here a 503) must NOT permanently disable the
+// stream — only an explicit refusal (405/404, or a non-SSE 200) may. The
+// client must retry with backoff and receive notifications once the server
+// recovers.
+func TestHTTPSSEStreamRetriesTransientFirstAttempt(t *testing.T) {
+	f := &fakeHTTPServer{tools: []string{"t"}}
+	notifs := make(chan string, 4)
+	var gets atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			f.handler().ServeHTTP(w, r)
+			return
+		}
+		if gets.Add(1) == 1 {
+			// The upstream is briefly unwell — says nothing about SSE support.
+			http.Error(w, "warming up", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	onNotify := func(method string, _ json.RawMessage) { notifs <- method }
+	conn := upstream.StartHTTP(quietLogger(), "transient", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	select {
+	case got := <-notifs:
+		if got != mcp.NotifToolsListChanged {
+			t.Fatalf("notification = %q, want %q", got, mcp.NotifToolsListChanged)
+		}
+	case <-time.After(10 * time.Second): // the retry includes a 1s backoff
+		t.Fatalf("no notification after a transient first-attempt failure: the stream was never retried (%d GETs)", gets.Load())
+	}
+	if gets.Load() < 2 {
+		t.Fatalf("expected a retry after the 503, saw %d GET attempts", gets.Load())
+	}
+}
+
 // TestHTTPCloseBeforeSSEStreamStarted pins the pre-closed streamDone design:
 // Close on a connection whose stream goroutine never launched (no Initialize
 // ever ran) must not block waiting for a goroutine that does not exist.
