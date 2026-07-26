@@ -156,7 +156,9 @@ On reload the gateway diffs the new config against the running upstreams and
 applies the minimum change: newly added upstreams are launched, removed (or
 `enabled: false`) ones are shut down, upstreams whose launch fields
 (`command`/`args`/`url`/`env`/`headers`) changed are relaunched, and upstreams
-where only the tool `allow`/`deny`/`rename` filter changed are re-projected
+where only the tool filter changed (`allow`/`deny`/`rename`, or the catalog
+projection rules `strip_annotations`/`strip_output_schema`/`max_description`/
+`describe`) are re-projected
 without any restart. Unchanged upstreams keep running untouched. A bad edit
 (invalid YAML, failed validation) is logged and ignored — the currently running
 config stays live, so a typo never takes the gateway down.

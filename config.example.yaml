@@ -66,11 +66,22 @@ upstreams:
     # the default "<upstream>__<tool>". Client-facing names must be unique
     # across the whole config. Editable at runtime via SIGHUP without
     # restarting the upstream process.
+    #
+    # Token optimization (opt-in): strip_annotations / strip_output_schema drop
+    # those heavyweight catalog fields; max_description truncates descriptions
+    # to N characters (runes) with a trailing "…" (0 = unlimited); describe
+    # replaces a tool's description wholesale (keyed by ORIGINAL name, like
+    # rename) and is never re-truncated by max_description.
     # tools:
     #   allow: ["search_repositories", "get_issue", "create_issue"]
     #   deny: ["create_issue"]
     #   rename:
     #     search_repositories: "gh_search"
+    #   strip_annotations: true
+    #   strip_output_schema: true
+    #   max_description: 200
+    #   describe:
+    #     get_issue: "Fetch one GitHub issue by number."
 
   # http upstream (Phase 2): an already-running MCP server reached over
   # Streamable HTTP. Set `url` instead of `command` (exactly one of the two).

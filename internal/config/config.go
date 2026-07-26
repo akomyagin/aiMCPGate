@@ -94,7 +94,14 @@ type Upstream struct {
 //  1. Allow — when non-empty, only the listed tools survive (intersection);
 //  2. Deny — always subtracted, even from an explicit Allow;
 //  3. Rename — maps a surviving original name to its client-facing name;
-//     tools without a rename get the default "<upstream>__<tool>".
+//     tools without a rename get the default "<upstream>__<tool>";
+//  4. Projection rules (token optimization, opt-in): StripAnnotations and
+//     StripOutputSchema drop the heavyweight catalog fields entirely;
+//     Describe replaces a tool's description with the configured text
+//     (keyed by ORIGINAL name, same as Rename); MaxDescription truncates
+//     descriptions NOT overridden by Describe to at most that many runes
+//     (a Describe override is the config author's final word — it is never
+//     re-truncated).
 //
 // Deny is an ADDITIONAL safety barrier, not a replacement for upstream-side
 // auth: it narrows the tool surface the client can even see, independent of
@@ -104,6 +111,19 @@ type ToolFilter struct {
 	Allow  []string          `yaml:"allow"`
 	Deny   []string          `yaml:"deny"`
 	Rename map[string]string `yaml:"rename"`
+
+	// StripAnnotations drops the tools' annotations object from the catalog.
+	StripAnnotations bool `yaml:"strip_annotations"`
+	// StripOutputSchema drops the tools' outputSchema from the catalog.
+	StripOutputSchema bool `yaml:"strip_output_schema"`
+	// MaxDescription, when > 0, truncates tool descriptions to at most this
+	// many runes (an ellipsis is appended when truncation happened). 0 = no
+	// limit. Descriptions overridden via Describe are never truncated.
+	MaxDescription int `yaml:"max_description"`
+	// Describe replaces a tool's description wholesale, keyed by the
+	// upstream's ORIGINAL tool name (before any rename) — the same keying
+	// Rename uses. An empty value is ignored (keeps the upstream's own text).
+	Describe map[string]string `yaml:"describe"`
 }
 
 // SameLaunch reports whether two upstreams would launch identically — same
@@ -125,15 +145,21 @@ func (u Upstream) SameLaunch(other Upstream) bool {
 }
 
 // SameFilter reports whether two upstreams project the same tool filter
-// (allow/deny/rename). It is deliberately SEPARATE from SameLaunch: the launch
-// predicate is about how the upstream PROCESS is reached, while the filter is
-// only a projection of its catalog — hot-reload (Stage 9) uses the distinction
-// to re-apply a changed filter to the stored raw tool list without relaunching
-// (or even re-listing) an otherwise-identical upstream.
+// (allow/deny/rename plus the projection rules: strip_annotations,
+// strip_output_schema, max_description, describe). It is deliberately SEPARATE
+// from SameLaunch: the launch predicate is about how the upstream PROCESS is
+// reached, while the filter is only a projection of its catalog — hot-reload
+// (Stage 9) uses the distinction to re-apply a changed filter to the stored
+// raw tool list without relaunching (or even re-listing) an
+// otherwise-identical upstream.
 func (u Upstream) SameFilter(other Upstream) bool {
 	return slices.Equal(u.Tools.Allow, other.Tools.Allow) &&
 		slices.Equal(u.Tools.Deny, other.Tools.Deny) &&
-		maps.Equal(u.Tools.Rename, other.Tools.Rename)
+		maps.Equal(u.Tools.Rename, other.Tools.Rename) &&
+		u.Tools.StripAnnotations == other.Tools.StripAnnotations &&
+		u.Tools.StripOutputSchema == other.Tools.StripOutputSchema &&
+		u.Tools.MaxDescription == other.Tools.MaxDescription &&
+		maps.Equal(u.Tools.Describe, other.Tools.Describe)
 }
 
 // AllowSet returns Allow as a lookup set. Both consumers of the filter
@@ -535,6 +561,18 @@ func validateToolFilter(u Upstream, clientNames map[string]string) error {
 	f := u.Tools
 	allow := f.AllowSet()
 	deny := f.DenySet()
+
+	if f.MaxDescription < 0 {
+		return fmt.Errorf("upstream %q: tools.max_description must not be negative (0 means unlimited)", u.Name)
+	}
+	// Describe keys follow the same rule as Rename keys: with a non-empty
+	// allow-list, a key outside it could never apply — a config mistake.
+	// Sorted for a deterministic error message (map iteration is randomized).
+	for _, orig := range slices.Sorted(maps.Keys(f.Describe)) {
+		if len(f.Allow) > 0 && !allow[orig] {
+			return fmt.Errorf("upstream %q: tools.describe key %q is not in tools.allow — the description override could never apply", u.Name, orig)
+		}
+	}
 
 	claim := func(clientName, owner string) error {
 		if prev, dup := clientNames[clientName]; dup {
