@@ -102,6 +102,15 @@ type dispatcher struct {
 	// feeds it to buildCapabilities on every handshake.
 	listChanged bool
 
+	// elicitation is whether this transport can proxy an upstream's
+	// elicitation/create REQUEST to the client and route the answer back
+	// (Round 14): true only for stdio. Gates handleInitialize's
+	// SetClientElicitationCapable — over HTTP the registry flag must stay
+	// false even for a client that declares the capability, because the HTTP
+	// transport has no channel for gateway→client requests and never
+	// subscribes to SubscribeElicitations.
+	elicitation bool
+
 	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
 	// that aborts that in-flight tools/call's context (Round 2). Entries live
 	// exactly as long as the call: registered before handleToolsCall, removed
@@ -115,12 +124,15 @@ type dispatcher struct {
 // which tools capability to advertise: true only for a transport that can push
 // a server→client notifications/tools/list_changed — today both stdio (the
 // pipe) and HTTP (the GET SSE stream, Round 12). See buildCapabilities.
-func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
+// elicitation is true only for a transport that proxies upstream
+// elicitation/create requests to the client (Round 14) — today stdio only.
+func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, elicitation bool) *dispatcher {
 	return &dispatcher{
 		reg:         reg,
 		log:         log,
 		version:     version,
 		listChanged: listChanged,
+		elicitation: elicitation,
 		cancels:     map[string]context.CancelFunc{},
 	}
 }
@@ -216,6 +228,13 @@ func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
 	if client := clientString(req.Params); client != "" {
 		d.log.Debug("client initialize", "client", client)
 	}
+	// Record whether the client can answer proxied elicitation/create requests
+	// (Round 14) — stdio only (see the elicitation field). A re-initialize
+	// simply overwrites the flag: the latest handshake wins, matching how the
+	// stdio Serve loop re-binds the client identity.
+	if d.elicitation {
+		d.reg.SetClientElicitationCapable(clientSupportsElicitation(req.Params))
+	}
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
 		Capabilities:    buildCapabilities(d.reg, d.listChanged),
@@ -242,6 +261,25 @@ func clientString(params json.RawMessage) string {
 		return ""
 	}
 	return p.ClientInfo.Name + "/" + p.ClientInfo.Version
+}
+
+// clientSupportsElicitation reports whether the client's initialize params
+// declared the elicitation capability (Round 14). Per MCP the KEY's presence
+// means support, even as an empty object, so only presence is checked. The
+// parse is tolerant like clientString's: absent or malformed params/
+// capabilities mean false (no support), never an error — initialize must
+// succeed regardless, and "cannot tell" safely degrades to "cannot elicit".
+func clientSupportsElicitation(params json.RawMessage) bool {
+	var p mcp.InitializeParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil || len(p.Capabilities) == 0 {
+		return false
+	}
+	var caps map[string]json.RawMessage
+	if json.Unmarshal(p.Capabilities, &caps) != nil {
+		return false
+	}
+	_, ok := caps["elicitation"]
+	return ok
 }
 
 // handleToolsList returns the aggregated, namespaced catalog. Each tool's

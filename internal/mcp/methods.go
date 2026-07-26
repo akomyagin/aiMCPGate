@@ -38,6 +38,16 @@ const (
 	// promptly with an empty result.
 	MethodPing = "ping"
 
+	// MethodElicitationCreate is sent by an UPSTREAM server (not the gateway's
+	// own client) mid-tools/call, asking the human operator for information the
+	// tool needs to finish. The gateway (Round 14) proxies it verbatim to its
+	// own client — stdio↔stdio only — rewriting only the JSON-RPC id (the
+	// upstream's id space and the gateway's client-facing id space are
+	// unrelated and could collide). There are deliberately NO params/result
+	// types: the payload (message/requestedSchema in, action/content out)
+	// travels as raw JSON both ways, so nothing is parsed or lost en route.
+	MethodElicitationCreate = "elicitation/create"
+
 	// NotifInitialized is sent by a client after a successful initialize.
 	NotifInitialized = "notifications/initialized"
 

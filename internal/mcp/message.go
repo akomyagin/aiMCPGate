@@ -135,3 +135,16 @@ func NewError(id json.RawMessage, code int, message string, data json.RawMessage
 func IntID(n int64) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf("%d", n))
 }
+
+// StringID renders a string as a JSON-RPC id (json.RawMessage). Used for the
+// gateway-minted ids of upstream-initiated requests proxied to the client
+// (elicitation/create, Round 14), where a prefixed string keeps them visually
+// apart from the client's own (typically numeric) ids in logs.
+func StringID(s string) json.RawMessage {
+	b, err := json.Marshal(s)
+	if err != nil {
+		// Unreachable: marshaling a Go string cannot fail.
+		panic("mcp: marshal string id: " + err.Error())
+	}
+	return b
+}

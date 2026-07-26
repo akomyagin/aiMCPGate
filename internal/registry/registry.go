@@ -183,6 +183,11 @@ type Upstream interface {
 	// already prepared (ref.name rewritten to the upstream's original for a
 	// prompt ref; everything else verbatim — Round 5).
 	Complete(ctx context.Context, params json.RawMessage) (*mcp.Message, error)
+	// RespondUpstreamRequest writes a response to a request the upstream
+	// itself initiated (elicitation/create, Round 14) into its stdin; msg.ID
+	// must already carry the upstream's original request id. Errors for
+	// transports without server-initiated requests (HTTP).
+	RespondUpstreamRequest(msg *mcp.Message) error
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
 	// long-lived process (stdio); ok is false when there is no such process
@@ -339,6 +344,29 @@ type Registry struct {
 	notifSubs   map[int]chan mcp.Message
 	nextNotifID int
 
+	// clientElicitationCapable records whether the gateway's OWN client
+	// declared the elicitation capability in its initialize (Round 14). A
+	// single global flag is correct because stdio serves exactly ONE client per
+	// process (see stdioServer.Serve); the HTTP transport never sets it, so it
+	// stays false there and any upstream elicitation over HTTP is refused
+	// immediately — the safe default. Atomic: written once per handshake,
+	// read on every upstream elicitation/create from a reader goroutine.
+	clientElicitationCapable atomic.Bool
+
+	// elicitMu guards pendingElicits — gateway-minted id → where the client's
+	// answer must be routed back — and elicitSubs, the transports subscribed
+	// to receive proxied elicitation requests (Round 14). Its own small mutex
+	// for the same reason notifMu is: onUpstreamElicit runs on an upstream's
+	// reader goroutine and must never entangle with the catalog's critical
+	// sections. elicitID mints the "elicit-<n>" client-facing ids — the
+	// upstream's id space and the client's are unrelated and could collide,
+	// so the id is ALWAYS rewritten en route.
+	elicitMu        sync.Mutex
+	pendingElicits  map[string]pendingElicit
+	elicitSubs      map[int]chan ElicitationRequest
+	nextElicitSubID int
+	elicitID        atomic.Int64
+
 	// relistMu guards relistTimers, the per-upstream debounce timers for
 	// tools/list_changed notifications (Stage 7b), and relistStates, the
 	// per-upstream running/dirty flags that serialize the re-lists themselves.
@@ -448,32 +476,34 @@ type auxCatalog struct {
 func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool, version string) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
-		log:           logger,
-		callLog:       callLog,
-		payloadLog:    payloadLog,
-		autoRestart:   supervise,
-		version:       version,
-		conns:         map[string]Upstream{},
-		tools:         map[string]ToolDescriptor{},
-		toolRoute:     map[string]route{},
-		rawTools:      map[string][]mcp.Tool{},
-		prompts:       map[string]PromptDescriptor{},
-		promptRoute:   map[string]route{},
-		rawPrompts:    map[string][]mcp.Prompt{},
-		resources:     map[string]ResourceDescriptor{},
-		resourceRoute: map[string]string{},
-		rawResources:  map[string][]mcp.Resource{},
-		rawTemplates:  map[string][]mcp.ResourceTemplate{},
-		handshakes:    map[string]handshakeMeta{},
-		subscribers:   map[int]chan struct{}{},
-		notifSubs:     map[int]chan mcp.Message{},
-		relistTimers:  map[string]*time.Timer{},
-		relistStates:  map[string]*relistState{},
-		limiters:      map[string]*limiterEntry{},
-		sems:          map[string]*semEntry{},
-		supCancel:     map[string]context.CancelFunc{},
-		procCtx:       procCtx,
-		procCancel:    procCancel,
+		log:            logger,
+		callLog:        callLog,
+		payloadLog:     payloadLog,
+		autoRestart:    supervise,
+		version:        version,
+		conns:          map[string]Upstream{},
+		tools:          map[string]ToolDescriptor{},
+		toolRoute:      map[string]route{},
+		rawTools:       map[string][]mcp.Tool{},
+		prompts:        map[string]PromptDescriptor{},
+		promptRoute:    map[string]route{},
+		rawPrompts:     map[string][]mcp.Prompt{},
+		resources:      map[string]ResourceDescriptor{},
+		resourceRoute:  map[string]string{},
+		rawResources:   map[string][]mcp.Resource{},
+		rawTemplates:   map[string][]mcp.ResourceTemplate{},
+		handshakes:     map[string]handshakeMeta{},
+		subscribers:    map[int]chan struct{}{},
+		notifSubs:      map[int]chan mcp.Message{},
+		pendingElicits: map[string]pendingElicit{},
+		elicitSubs:     map[int]chan ElicitationRequest{},
+		relistTimers:   map[string]*time.Timer{},
+		relistStates:   map[string]*relistState{},
+		limiters:       map[string]*limiterEntry{},
+		sems:           map[string]*semEntry{},
+		supCancel:      map[string]context.CancelFunc{},
+		procCtx:        procCtx,
+		procCancel:     procCancel,
 	}
 	r.cfg.Store(cfg)
 	r.start = r.startUpstream
@@ -517,7 +547,11 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	}
 	name := u.Name
 	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
-	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify)
+	// onElicit is stdio-only (Round 14): StartHTTP takes no such callback —
+	// an HTTP upstream has no channel for server-initiated REQUESTS in this
+	// round, deliberately out of scope.
+	onElicit := func(id, params json.RawMessage) { r.onUpstreamElicit(name, id, params) }
+	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onElicit)
 }
 
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
@@ -1555,6 +1589,145 @@ func (r *Registry) forwardNotification(msg mcp.Message) {
 			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
 		}
 	}
+}
+
+// pendingElicit records where the client's answer to one proxied
+// elicitation/create must be routed back (Round 14): which upstream asked, and
+// under what id in the UPSTREAM's own id space.
+type pendingElicit struct {
+	upstream   string
+	originalID json.RawMessage
+}
+
+// ElicitationRequest is one upstream-initiated elicitation/create the gateway
+// proxies to its client (Round 14). GatewayID is the gateway-minted id the
+// client-facing request must carry ("elicit-<n>" — see onUpstreamElicit for
+// why the upstream's own id never travels); Params is the upstream's params
+// object, verbatim.
+type ElicitationRequest struct {
+	GatewayID string
+	Params    json.RawMessage
+}
+
+// SetClientElicitationCapable records whether the gateway's client declared
+// the elicitation capability in its initialize handshake (Round 14). Called by
+// the stdio transport's dispatcher only — stdio serves exactly one client per
+// process, so the flag is global to the registry. The HTTP transport never
+// calls it; the flag then stays false and every upstream elicitation/create is
+// refused immediately instead of hanging (see onUpstreamElicit).
+func (r *Registry) SetClientElicitationCapable(ok bool) {
+	r.clientElicitationCapable.Store(ok)
+}
+
+// SubscribeElicitations registers interest in upstream-initiated
+// elicitation/create requests the gateway proxies to its client (Round 14) —
+// SubscribeNotifications' twin for the one upstream message that expects an
+// answer back (RouteElicitationResponse). Same delivery contract: buffered
+// channel (notifSubBuffer), strictly non-blocking send from the upstream's
+// reader goroutine, and an unsubscribe function the caller MUST call when it
+// stops listening.
+func (r *Registry) SubscribeElicitations() (<-chan ElicitationRequest, func()) {
+	ch := make(chan ElicitationRequest, notifSubBuffer)
+	r.elicitMu.Lock()
+	id := r.nextElicitSubID
+	r.nextElicitSubID++
+	r.elicitSubs[id] = ch
+	r.elicitMu.Unlock()
+
+	return ch, func() {
+		r.elicitMu.Lock()
+		delete(r.elicitSubs, id)
+		r.elicitMu.Unlock()
+	}
+}
+
+// onUpstreamElicit handles an elicitation/create REQUEST pushed by a stdio
+// upstream mid-tools/call (Round 14). Like onUpstreamNotification it runs on
+// that upstream's single reader goroutine, so it must not block or re-enter
+// the connection synchronously.
+//
+// When the gateway's client never declared the elicitation capability, the
+// upstream is answered immediately with a method-not-found error instead of
+// being left to hang until its own timeout — the gateway, in its client role
+// toward the upstream, honestly reports it cannot serve the method. Otherwise
+// the request is parked in pendingElicits under a freshly minted gateway id
+// and published to the subscribed transport (non-blocking, like
+// forwardNotification — a dropped request leaves the upstream to its own
+// timeout, the same backpressure contract notifications have).
+func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMessage) {
+	if !r.clientElicitationCapable.Load() {
+		r.mu.RLock()
+		conn := r.conns[name]
+		r.mu.RUnlock()
+		if conn == nil {
+			return // the upstream vanished between its write and this callback
+		}
+		reply := mcp.NewError(originalID, mcp.CodeMethodNotFound,
+			"elicitation/create not supported: the gateway's client did not declare the elicitation capability", nil)
+		// Off the reader goroutine: a stdin write can block on a stuck child,
+		// and the reader publishing this callback must never stall on it.
+		go func() {
+			if err := conn.RespondUpstreamRequest(reply); err != nil {
+				r.log.Warn("refuse upstream elicitation failed", "upstream", name, "err", err)
+			}
+		}()
+		return
+	}
+
+	gatewayID := fmt.Sprintf("elicit-%d", r.elicitID.Add(1))
+	req := ElicitationRequest{GatewayID: gatewayID, Params: params}
+	r.elicitMu.Lock()
+	r.pendingElicits[gatewayID] = pendingElicit{upstream: name, originalID: originalID}
+	for _, ch := range r.elicitSubs {
+		select {
+		case ch <- req:
+		default:
+			r.log.Debug("elicitation subscriber buffer full, dropping", "upstream", name, "id", gatewayID)
+		}
+	}
+	r.elicitMu.Unlock()
+	r.log.Debug("upstream elicitation proxied to client", "upstream", name, "id", gatewayID)
+}
+
+// RouteElicitationResponse routes the client's answer to a proxied
+// elicitation/create back to the upstream that asked (Round 14). gatewayID is
+// the gateway-minted id the transport decoded from the client's response;
+// msg is that response, whose ID is rewritten back to the upstream's original
+// before the write. It reports whether gatewayID matched a pending
+// elicitation — false means unknown or stale (a duplicate answer, a request
+// already consumed), which the caller treats like any other unexpected client
+// response: log and drop, never panic.
+func (r *Registry) RouteElicitationResponse(gatewayID string, msg *mcp.Message) bool {
+	r.elicitMu.Lock()
+	p, ok := r.pendingElicits[gatewayID]
+	if ok {
+		delete(r.pendingElicits, gatewayID)
+	}
+	r.elicitMu.Unlock()
+	if !ok {
+		return false
+	}
+
+	r.mu.RLock()
+	conn := r.conns[p.upstream]
+	r.mu.RUnlock()
+	if conn == nil {
+		// The upstream died or was retired while the human was answering: the
+		// answer has nowhere to go. Still consumed (true) — it DID match a real
+		// pending elicitation; it is just undeliverable now.
+		r.log.Warn("elicitation answer for a gone upstream, dropping", "upstream", p.upstream, "id", gatewayID)
+		return true
+	}
+	msg.ID = p.originalID
+	// Off the caller's goroutine (the client transport's Serve loop): a stdin
+	// write can block on a stuck child, and the loop must keep serving other
+	// clients' traffic regardless — same rule as onUpstreamElicit's refusal.
+	go func() {
+		if err := conn.RespondUpstreamRequest(msg); err != nil {
+			r.log.Warn("deliver elicitation answer failed", "upstream", p.upstream, "id", gatewayID, "err", err)
+		}
+	}()
+	return true
 }
 
 // withLogger stamps the emitting upstream's name into a notifications/message

@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -41,7 +42,7 @@ func newStdioServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger
 	return &stdioServer{
 		reg: reg,
 		log: log,
-		d:   newDispatcher(reg, log, version, true), // stdio can push server→client list_changed
+		d:   newDispatcher(reg, log, version, true, true), // stdio can push server→client list_changed AND proxy elicitation (Round 14)
 		r:   mcp.NewReader(in),
 		w:   mcp.NewWriter(out),
 	}
@@ -72,6 +73,14 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	// client over the same pipe, gated on initialized like list_changed.
 	upstreamNotifs, unsubscribeNotifs := s.reg.SubscribeNotifications()
 	defer unsubscribeNotifs()
+
+	// Subscribe to upstream-initiated elicitation/create requests (Round 14):
+	// an upstream needing human input mid-tools/call publishes here; the loop
+	// pushes the request to the client under the gateway-minted id, and the
+	// client's answer is routed back in the frames branch below
+	// (RouteElicitationResponse).
+	elicitReqs, unsubscribeElicits := s.reg.SubscribeElicitations()
+	defer unsubscribeElicits()
 
 	// mcp.Reader.Read blocks and is not context-aware, so run it in its own
 	// goroutine and feed decoded frames over a channel. This lets Serve select
@@ -134,6 +143,19 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				s.log.Warn("write forwarded notification failed", "err", err)
 				return nil
 			}
+		case req := <-elicitReqs:
+			// An upstream's elicitation/create proxied to the client under the
+			// gateway-minted string id (Round 14). Dropped before initialize
+			// like progress: by construction the request cannot precede the
+			// handshake (it only arises mid-tools/call), but the gate stays
+			// consistent with the other push paths.
+			if !initialized {
+				continue
+			}
+			if err := s.writeOrBail(ctx, mcp.NewRequest(mcp.StringID(req.GatewayID), mcp.MethodElicitationCreate, req.Params)); err != nil {
+				s.log.Warn("write elicitation request failed", "err", err)
+				return nil
+			}
 		case fr, ok := <-frames:
 			if !ok {
 				s.log.Info("client disconnected")
@@ -176,6 +198,19 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 					}
 				}(dispatchCtx, fr.msg)
 				continue
+			}
+			if fr.msg.IsResponse() && !fr.msg.IsMalformedHybrid() {
+				// A response FROM the client: the only ones the gateway ever
+				// expects are answers to its own proxied elicitation/create
+				// requests (Round 14), carrying the gateway-minted string id.
+				// Consumed here, never dispatched — it was not a request, so no
+				// reply goes back. Anything unmatched falls through to the
+				// dispatcher, which drops it with a log exactly as before.
+				var gatewayID string
+				if json.Unmarshal(fr.msg.ID, &gatewayID) == nil &&
+					s.reg.RouteElicitationResponse(gatewayID, fr.msg) {
+					continue
+				}
 			}
 			// Everything else — initialize, ping, notifications (including
 			// notifications/cancelled, which must never queue behind a running

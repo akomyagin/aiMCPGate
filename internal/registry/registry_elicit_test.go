@@ -1,0 +1,126 @@
+package registry
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/akomyagin/aiMCPGate/internal/config"
+	"github.com/akomyagin/aiMCPGate/internal/mcp"
+)
+
+// elicitRecordingUpstream records every RespondUpstreamRequest into a channel
+// so tests can await the (asynchronous) write-back without sleeping.
+type elicitRecordingUpstream struct {
+	fakeUpstreamBase
+	responses chan *mcp.Message
+}
+
+func (f *elicitRecordingUpstream) RespondUpstreamRequest(msg *mcp.Message) error {
+	f.responses <- msg
+	return nil
+}
+
+// newElicitTestRegistry builds a registry with one recording fake conn wired
+// in directly — the elicitation plumbing touches no catalog or lifecycle
+// state, so no Start is needed (same rationale as newNotifTestRegistry).
+func newElicitTestRegistry(name string) (*Registry, *elicitRecordingUpstream) {
+	r := New(&config.Config{}, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
+	fake := &elicitRecordingUpstream{responses: make(chan *mcp.Message, 4)}
+	r.mu.Lock()
+	r.conns[name] = fake
+	r.mu.Unlock()
+	return r, fake
+}
+
+// TestElicitationRoundTripThroughRegistry (Round 14): an upstream's
+// elicitation/create reaches the subscriber with params verbatim under a
+// fresh gateway id, and the client's answer is routed back to that upstream
+// with the id rewritten to the upstream's ORIGINAL — the two id spaces never
+// leak into each other.
+func TestElicitationRoundTripThroughRegistry(t *testing.T) {
+	r, fake := newElicitTestRegistry("web")
+	r.SetClientElicitationCapable(true)
+	ch, unsubscribe := r.SubscribeElicitations()
+	defer unsubscribe()
+
+	originalID := mcp.IntID(7)
+	params := json.RawMessage(`{"message":"need input"}`)
+	r.onUpstreamElicit("web", originalID, params)
+
+	var req ElicitationRequest
+	select {
+	case req = <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber never received the elicitation request")
+	}
+	if req.GatewayID == "" || req.GatewayID == string(originalID) {
+		t.Errorf("GatewayID = %q, want a fresh gateway-minted id distinct from the upstream's", req.GatewayID)
+	}
+	if string(req.Params) != string(params) {
+		t.Errorf("params = %s, want verbatim %s", req.Params, params)
+	}
+
+	answer := mcp.NewResult(mcp.StringID(req.GatewayID), json.RawMessage(`{"action":"decline"}`))
+	if !r.RouteElicitationResponse(req.GatewayID, answer) {
+		t.Fatal("RouteElicitationResponse = false for a pending gateway id")
+	}
+	select {
+	case got := <-fake.responses:
+		if string(got.ID) != string(originalID) {
+			t.Errorf("upstream received id %s, want the original %s", got.ID, originalID)
+		}
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("upstream received result %s, want the client's verbatim", got.Result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the answer never reached the upstream")
+	}
+
+	// A second answer under the same id is stale: the pending entry is gone.
+	if r.RouteElicitationResponse(req.GatewayID, answer) {
+		t.Error("RouteElicitationResponse = true for an already-consumed id, want false")
+	}
+}
+
+// TestElicitationRefusedWithoutClientCapability (Round 14): with the client
+// flag unset (the default — HTTP transports never set it), an upstream's
+// elicitation/create is answered immediately with method-not-found under the
+// upstream's ORIGINAL id, and nothing reaches the subscribers.
+func TestElicitationRefusedWithoutClientCapability(t *testing.T) {
+	r, fake := newElicitTestRegistry("web")
+	ch, unsubscribe := r.SubscribeElicitations()
+	defer unsubscribe()
+
+	originalID := mcp.IntID(3)
+	r.onUpstreamElicit("web", originalID, json.RawMessage(`{"message":"need input"}`))
+
+	select {
+	case got := <-fake.responses:
+		if string(got.ID) != string(originalID) {
+			t.Errorf("refusal id = %s, want the upstream's original %s", got.ID, originalID)
+		}
+		if got.Error == nil || got.Error.Code != mcp.CodeMethodNotFound {
+			t.Errorf("refusal error = %+v, want code %d", got.Error, mcp.CodeMethodNotFound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received the immediate refusal")
+	}
+	select {
+	case req := <-ch:
+		t.Fatalf("elicitation reached the subscriber despite an incapable client: %+v", req)
+	default:
+	}
+}
+
+// TestRouteElicitationResponseUnknownID (Round 14): an answer whose id matches
+// no pending elicitation (stale, duplicate, or plain garbage) is reported
+// false — the caller falls back to its normal unexpected-response handling —
+// and nothing panics.
+func TestRouteElicitationResponseUnknownID(t *testing.T) {
+	r := New(&config.Config{}, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
+	msg := mcp.NewResult(mcp.StringID("elicit-999"), json.RawMessage(`{}`))
+	if r.RouteElicitationResponse("elicit-999", msg) {
+		t.Error("RouteElicitationResponse = true for an unknown gateway id, want false")
+	}
+}

@@ -28,7 +28,7 @@ func mustDecode(t *testing.T, line string) *mcp.Message {
 // request-shaped message with -32600 Invalid Request under that id, not
 // dropping it silently.
 func TestDispatchIDWithoutMethodIsInvalidRequest(t *testing.T) {
-	d := newDispatcher(nil, quietLogger(), "test", true)
+	d := newDispatcher(nil, quietLogger(), "test", true, false)
 	reply := d.dispatch(context.Background(), mustDecode(t, `{"jsonrpc":"2.0","id":7}`))
 	if reply == nil {
 		t.Fatal("message with id but no method was silently dropped, want -32600 error")
@@ -45,7 +45,7 @@ func TestDispatchIDWithoutMethodIsInvalidRequest(t *testing.T) {
 // (result present, no method) is unexpected in the server role but legitimate
 // on the wire — it must be ignored (nil), never answered with an error.
 func TestDispatchClientResponseIsIgnored(t *testing.T) {
-	d := newDispatcher(nil, quietLogger(), "test", true)
+	d := newDispatcher(nil, quietLogger(), "test", true, false)
 	if reply := d.dispatch(context.Background(), mustDecode(t, `{"jsonrpc":"2.0","id":7,"result":{}}`)); reply != nil {
 		t.Fatalf("client response must be ignored, got reply %+v", reply)
 	}
@@ -54,7 +54,7 @@ func TestDispatchClientResponseIsIgnored(t *testing.T) {
 // TestDispatchNotificationNeedsNoReply: a notification (no id) produces no
 // reply — unchanged by the missing-method check above.
 func TestDispatchNotificationNeedsNoReply(t *testing.T) {
-	d := newDispatcher(nil, quietLogger(), "test", true)
+	d := newDispatcher(nil, quietLogger(), "test", true, false)
 	if reply := d.dispatch(context.Background(), mustDecode(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)); reply != nil {
 		t.Fatalf("notification must produce no reply, got %+v", reply)
 	}
@@ -65,7 +65,7 @@ func TestDispatchNotificationNeedsNoReply(t *testing.T) {
 // empty result without consulting the registry at all (nil here) and never
 // with method-not-found.
 func TestDispatchPingAnswersEmptyResult(t *testing.T) {
-	d := newDispatcher(nil, quietLogger(), "test", true)
+	d := newDispatcher(nil, quietLogger(), "test", true, false)
 	reply := d.dispatch(context.Background(), mustDecode(t, `{"jsonrpc":"2.0","id":11,"method":"ping"}`))
 	if reply == nil {
 		t.Fatal("ping was not answered")

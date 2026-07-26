@@ -83,9 +83,11 @@ type httpServer struct {
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
 	return &httpServer{
-		reg:  reg,
-		log:  log,
-		d:    newDispatcher(reg, log, version, true), // HTTP pushes list_changed over the GET SSE stream (Round 12)
+		reg: reg,
+		log: log,
+		// HTTP pushes list_changed over the GET SSE stream (Round 12) but has
+		// no channel for gateway→client REQUESTS, so no elicitation (Round 14).
+		d:    newDispatcher(reg, log, version, true, false),
 		addr: cfg.EffectiveListenAddr(),
 		cfg:  reg.ConfigSnapshot,
 	}

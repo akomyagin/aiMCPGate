@@ -111,6 +111,17 @@
 //	                   upstream that declared no logging capability (the file
 //	                   stays absent/empty), and with WHICH level it reached a
 //	                   capable one (Round 3).
+//	FAKE_ELICIT      if "1", every tools/call FIRST sends an elicitation/create
+//	                   REQUEST to its client (id "fake-elicit-<n>", fixed
+//	                   message/requestedSchema params) and waits for the
+//	                   response before answering the call; the tool result text
+//	                   then carries "|elicited=<raw result>" (or
+//	                   "|elicit-error=<code> <message>" when the client/gateway
+//	                   answered with a JSON-RPC error, or "|elicit-timeout"
+//	                   after 10s of silence) — used to test the gateway's
+//	                   upstream→client elicitation proxying (Round 14). Each
+//	                   such call runs on its own goroutine so the main loop
+//	                   keeps reading stdin for the response.
 //	FAKE_ASYNC_CALLS  if "1", each tools/call is answered on its OWN goroutine
 //	                   (FAKE_CALL_DELAY sleeps there), so the main read loop
 //	                   keeps consuming stdin meanwhile — required by the
@@ -189,6 +200,7 @@ func main() {
 	progressFile := os.Getenv("FAKE_PROGRESS_FILE")
 	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
 	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
+	elicit := os.Getenv("FAKE_ELICIT") == "1"
 	logging := os.Getenv("FAKE_LOGGING") == "1"
 	logFile := os.Getenv("FAKE_LOG_FILE")
 	setLevelFile := os.Getenv("FAKE_SETLEVEL_FILE")
@@ -276,6 +288,13 @@ func main() {
 		}()
 	}
 
+	// elicitation plumbing (FAKE_ELICIT): each elicit-enabled tools/call runs
+	// on its own goroutine, registers a waiter for its "fake-elicit-<n>" id and
+	// blocks on it; the main read loop routes RESPONSES (no method) here.
+	var elicitMu sync.Mutex
+	elicitWaiters := map[string]chan message{}
+	elicitSeq := 0
+
 	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -284,6 +303,21 @@ func main() {
 		}
 		var req message
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			continue
+		}
+		if req.Method == "" && (req.Result != nil || req.Error != nil) {
+			// A response to a server-initiated request (elicitation/create):
+			// hand it to the waiting tools/call goroutine by id. An unknown id
+			// is silently dropped, like a real server would.
+			elicitMu.Lock()
+			ch, ok := elicitWaiters[string(req.ID)]
+			if ok {
+				delete(elicitWaiters, string(req.ID))
+			}
+			elicitMu.Unlock()
+			if ok {
+				ch <- req
+			}
 			continue
 		}
 		switch req.Method {
@@ -414,6 +448,35 @@ func main() {
 							`{"progressToken":%s,"progress":1,"total":2}`, p.Meta.ProgressToken))})
 				}
 			}
+			if elicit {
+				// Ask the client for input mid-call and only then answer, per
+				// the MCP elicitation flow (Round 14 test hook). On a goroutine:
+				// the main loop must keep reading stdin to see the response.
+				elicitSeq++
+				elicitID, _ := json.Marshal(fmt.Sprintf("fake-elicit-%d", elicitSeq))
+				ch := make(chan message, 1)
+				elicitMu.Lock()
+				elicitWaiters[string(elicitID)] = ch
+				elicitMu.Unlock()
+				req := req
+				go func() {
+					write(message{ID: elicitID, Method: "elicitation/create",
+						Params: json.RawMessage(`{"message":"need input","requestedSchema":{"type":"object","properties":{"answer":{"type":"string"}}}}`)})
+					var suffix string
+					select {
+					case resp := <-ch:
+						if resp.Error != nil {
+							suffix = fmt.Sprintf("|elicit-error=%d %s", resp.Error.Code, resp.Error.Message)
+						} else {
+							suffix = "|elicited=" + string(resp.Result)
+						}
+					case <-time.After(10 * time.Second):
+						suffix = "|elicit-timeout"
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, suffix))})
+				}()
+				continue
+			}
 			if asyncCalls {
 				// Answer on a goroutine so the read loop keeps consuming stdin
 				// (e.g. a notifications/cancelled arriving mid-delay). write is
@@ -423,7 +486,7 @@ func main() {
 					if callDelay > 0 {
 						time.Sleep(callDelay)
 					}
-					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, ""))})
 				}()
 				continue
 			}
@@ -434,10 +497,10 @@ func main() {
 				// Malformed on purpose: method AND result together, echoing the
 				// request id — the exact shape the gateway's reader must refuse
 				// to deliver as a valid response.
-				write(message{ID: req.ID, Method: "tools/call", Result: json.RawMessage(callResult(req.Params, echo))})
+				write(message{ID: req.ID, Method: "tools/call", Result: json.RawMessage(callResult(req.Params, echo, ""))})
 				continue
 			}
-			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
+			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, ""))})
 			callCount++
 			if exitAfter > 0 && callCount >= exitAfter {
 				// Simulate a crash right after answering: flush is inside write,
@@ -568,7 +631,10 @@ func promptGetResult(params json.RawMessage) string {
 	return fmt.Sprintf(`{"description":"fake prompt %s","messages":[{"role":"user","content":{"type":"text","text":%s}}]}`, p.Name, b)
 }
 
-func callResult(params json.RawMessage, echo bool) string {
+// callResult builds a tools/call result. suffix, when non-empty, is appended
+// to the text verbatim — the FAKE_ELICIT hook uses it to surface what the
+// elicitation round-trip returned.
+func callResult(params json.RawMessage, echo bool, suffix string) string {
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -584,6 +650,7 @@ func callResult(params json.RawMessage, echo bool) string {
 		// proxied through (and, by its absence, that none was invented).
 		text += "|_meta=" + string(p.Meta)
 	}
+	text += suffix
 	b, _ := json.Marshal(text)
 	return fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":false}`, b)
 }
