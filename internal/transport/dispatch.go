@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 	"github.com/akomyagin/aiMCPGate/internal/registry"
@@ -48,8 +49,16 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 // of the MCP method handling (initialize / tools/list / tools/call /
 // resources/*). Each transport is left with only its own framing/plumbing
 // (reading requests, writing replies, SSE vs newline); the protocol logic lives
-// here once. It holds no per-connection state, so a single dispatcher is safe to
-// share across concurrent HTTP requests.
+// here once.
+//
+// Since Round 2 the dispatcher is no longer stateless: cancels (guarded by
+// cancelMu) tracks one context.CancelFunc per in-flight tools/call, keyed by
+// the CLIENT's request id, so a notifications/cancelled from the client can
+// abort the matching call. The map is mutex-guarded, so a single dispatcher
+// remains safe to share across concurrent HTTP requests — though over HTTP the
+// cancellation path is moot in practice (each POST is a separate stateless
+// request; two clients reusing one id merely overwrite each other's map entry,
+// harmless because nothing over HTTP ever looks it up).
 type dispatcher struct {
 	reg     *registry.Registry
 	log     *slog.Logger
@@ -59,6 +68,14 @@ type dispatcher struct {
 	// the POST-only HTTP transport. handleInitialize feeds it to
 	// buildCapabilities on every handshake.
 	listChanged bool
+
+	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
+	// that aborts that in-flight tools/call's context (Round 2). Entries live
+	// exactly as long as the call: registered before handleToolsCall, removed
+	// right after it returns; notifications/cancelled for an id not in the map
+	// (already finished, never existed) is a documented no-op per the spec.
+	cancelMu sync.Mutex
+	cancels  map[string]context.CancelFunc
 }
 
 // newDispatcher builds the shared method-handling core. listChanged tells it
@@ -66,7 +83,13 @@ type dispatcher struct {
 // a server→client notifications/tools/list_changed (stdio), false otherwise
 // (HTTP POST-only). See buildCapabilities for the reasoning.
 func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
-	return &dispatcher{reg: reg, log: log, version: version, listChanged: listChanged}
+	return &dispatcher{
+		reg:         reg,
+		log:         log,
+		version:     version,
+		listChanged: listChanged,
+		cancels:     map[string]context.CancelFunc{},
+	}
 }
 
 // dispatch handles one client message and returns the reply to send back, or
@@ -90,6 +113,14 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 			"message is not a valid request: carries both a method and a result/error", nil)
 	}
 	if msg.IsNotification() {
+		if msg.Method == mcp.NotifCancelled {
+			// The client abandoned an in-flight request: cancel its context
+			// (Round 2). Handled BEFORE the generic drop below — this is the
+			// one client notification with a side effect. Never a reply: a
+			// notification gets none even when it misses.
+			d.handleCancelled(msg.Params)
+			return nil
+		}
 		// notifications/initialized and the like need no reply.
 		d.log.Debug("client notification", "method", msg.Method)
 		return nil
@@ -119,7 +150,7 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 	case mcp.MethodToolsList:
 		return d.handleToolsList(msg)
 	case mcp.MethodToolsCall:
-		return d.handleToolsCall(ctx, msg)
+		return d.dispatchToolsCall(ctx, msg)
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
@@ -183,6 +214,66 @@ func (d *dispatcher) handleToolsList(req *mcp.Message) *mcp.Message {
 		tools = append(tools, t)
 	}
 	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ToolsListResult{Tools: tools}))
+}
+
+// dispatchToolsCall wraps handleToolsCall with the Round 2 cancellation
+// plumbing: the call runs under its own cancellable child context, registered
+// in d.cancels under the CLIENT's request id so a notifications/cancelled can
+// abort it mid-flight (handleCancelled). When the call ends BECAUSE the client
+// cancelled it — the child context is done while the parent is not, and the
+// only holder of that child's CancelFunc besides this function is
+// handleCancelled — the reply is suppressed entirely: per the MCP cancellation
+// utility the receiver of a cancellation SHOULD NOT answer the cancelled
+// request at all, not even with an error.
+func (d *dispatcher) dispatchToolsCall(ctx context.Context, req *mcp.Message) *mcp.Message {
+	callCtx, cancel := context.WithCancel(ctx)
+	key := string(req.ID)
+	d.cancelMu.Lock()
+	d.cancels[key] = cancel
+	d.cancelMu.Unlock()
+
+	reply := d.handleToolsCall(callCtx, req)
+
+	d.cancelMu.Lock()
+	delete(d.cancels, key)
+	d.cancelMu.Unlock()
+	// Read the verdict BEFORE the deferred-style cancel below flips callCtx to
+	// "done" on its own: cancelled-by-client is exactly "child done, parent
+	// alive" at this point.
+	cancelledByClient := callCtx.Err() != nil && ctx.Err() == nil
+	cancel() // release the child context's resources; idempotent if already cancelled
+	if cancelledByClient {
+		d.log.Debug("tools/call cancelled by client, suppressing reply", "id", key)
+		return nil
+	}
+	return reply
+}
+
+// handleCancelled processes a client's notifications/cancelled: find the
+// in-flight tools/call the client is abandoning (by its OWN request id,
+// byte-compared raw) and cancel its context. An unknown or already-finished
+// requestId is a silent no-op — the spec explicitly allows the cancellation to
+// race the response. Malformed params are dropped the same way (a notification
+// never gets an error reply).
+func (d *dispatcher) handleCancelled(params json.RawMessage) {
+	var p mcp.CancelledParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
+		d.log.Debug("ignoring malformed notifications/cancelled")
+		return
+	}
+	key := string(p.RequestID)
+	d.cancelMu.Lock()
+	cancel, ok := d.cancels[key]
+	if ok {
+		delete(d.cancels, key)
+	}
+	d.cancelMu.Unlock()
+	if !ok {
+		d.log.Debug("notifications/cancelled for unknown or finished request", "id", key)
+		return
+	}
+	d.log.Debug("cancelling in-flight tools/call on client request", "id", key, "reason", p.Reason)
+	cancel()
 }
 
 // handleToolsCall proxies a call through the registry, which resolves the owning

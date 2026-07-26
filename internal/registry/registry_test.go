@@ -842,7 +842,7 @@ func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
 
 	// Notification #1: its debounce timer fires and the re-list's ListTools
 	// (call 2) blocks on the latch, in flight.
-	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged)
+	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged, nil)
 	select {
 	case <-up.entered:
 	case <-time.After(5 * time.Second):
@@ -851,7 +851,7 @@ func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
 
 	// Notification #2 lands while the first re-list is still in flight: its
 	// expiry must only mark the upstream dirty, not start a parallel re-list.
-	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged)
+	r.onUpstreamNotification("dyn", mcp.NotifToolsListChanged, nil)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		r.relistMu.Lock()

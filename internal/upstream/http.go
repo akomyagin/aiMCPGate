@@ -54,6 +54,16 @@ var errSessionExpired = errors.New("upstream: session expired (HTTP 404), reinit
 // request/response, so each Call owns its own round-trip and id-demultiplexing
 // is unnecessary. Concurrency safety comes from net/http (safe for concurrent
 // use) plus a mutex guarding the session id.
+//
+// KNOWN LIMITATION (Round 2): cancellation is NOT forwarded to HTTP upstreams.
+// stdioTransport.call sends a best-effort notifications/cancelled down the
+// same pipe when its ctx is cancelled mid-call; here there is no live channel
+// tied to the in-flight request — a cancelled ctx simply aborts the HTTP
+// round-trip (net/http cancels the request), and telling the server "stop the
+// work" would require a SEPARATE POST racing the one being torn down, with no
+// guarantee the server correlates them. Progress notifications from HTTP
+// upstreams are likewise not surfaced (no long-lived reader to receive them;
+// SSE frames other than the awaited response are skipped in post).
 type httpTransport struct {
 	name     string
 	endpoint string

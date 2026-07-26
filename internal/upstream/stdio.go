@@ -88,13 +88,15 @@ type stdioTransport struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// onNotify, when set, is invoked by readLoop for each notification method
-	// received from the upstream (e.g. notifications/tools/list_changed). The
-	// registry sets it to react to a catalog change (Stage 7b). It is set once,
+	// onNotify, when set, is invoked by readLoop for each notification received
+	// from the upstream (e.g. notifications/tools/list_changed) with the method
+	// AND its raw params — Round 2 needs the params to forward a
+	// notifications/progress verbatim; list_changed handling ignores them. The
+	// registry sets it to react to these (Stage 7b, Round 2). It is set once,
 	// inside StartStdio, before the reader goroutine starts — hence no lock
 	// needed. (It used to be set post-factum via a setter, which raced an
 	// upstream notifying immediately on startup — found by independent review.)
-	onNotify func(method string)
+	onNotify func(method string, params json.RawMessage)
 }
 
 // Name returns the upstream's stable identifier.
@@ -116,13 +118,13 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 // version, reported to the upstream as clientInfo.version in the handshake.
 //
 // onNotify, when non-nil, is invoked (from the reader goroutine) for each
-// notification the upstream sends. It must be passed here — not installed
-// after the fact — because the reader goroutine starts before StartStdio
-// returns, and an upstream may notify immediately; the field is written into
-// the struct literal before that goroutine exists, so no lock is needed. The
-// callback must not block or call back into the connection synchronously
-// (Stage 7b).
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string)) (*Conn, error) {
+// notification the upstream sends, with the method and raw params. It must be
+// passed here — not installed after the fact — because the reader goroutine
+// starts before StartStdio returns, and an upstream may notify immediately;
+// the field is written into the struct literal before that goroutine exists,
+// so no lock is needed. The callback must not block or call back into the
+// connection synchronously (Stage 7b).
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string, params json.RawMessage)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -203,7 +205,7 @@ func (c *stdioTransport) readLoop() {
 			// non-blocking — it runs on this single reader goroutine — so the
 			// registry only kicks a debounce timer here, never re-lists inline.
 			if c.onNotify != nil {
-				c.onNotify(msg.Method)
+				c.onNotify(msg.Method, msg.Params)
 			}
 		default:
 			// A request FROM an upstream (e.g. sampling) — not handled in MVP.
@@ -335,6 +337,18 @@ func (c *stdioTransport) call(ctx context.Context, method string, params json.Ra
 		c.mu.Lock()
 		delete(c.waiters, key)
 		c.mu.Unlock()
+		// The request IS on the wire (the write above succeeded) and its caller
+		// just gave up — tell the upstream so it can stop the work, per the MCP
+		// cancellation utility (Round 2). Best-effort AND fire-and-forget: the
+		// id is the upstream-side one this call minted (never the client's),
+		// and notify is a plain pipe write that can block on a stuck child, so
+		// it runs on its own goroutine — returning ctx.Err() promptly must not
+		// wait on it. A failed/lost notification is fine: the spec allows the
+		// race where the upstream finished (or died) meanwhile.
+		go func() {
+			_ = c.notify(context.Background(), mcp.NotifCancelled,
+				mcp.MustParams(mcp.CancelledParams{RequestID: id}))
+		}()
 		return nil, ctx.Err()
 	case msg, ok := <-ch:
 		if !ok {

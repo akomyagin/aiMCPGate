@@ -57,6 +57,26 @@
 //	                   reading any request — reproduces an upstream that
 //	                   notifies the instant it is launched, the window of the
 //	                   onNotify data race found by independent review.
+//	FAKE_PROGRESS    if "1", every tools/call that carries a `_meta.progressToken`
+//	                   emits one notifications/progress (echoing that token
+//	                   verbatim) BEFORE the call's response — used to test the
+//	                   gateway's upstream→client progress forwarding (Round 2).
+//	FAKE_PROGRESS_FILE  path to a file the server polls (like FAKE_NOTIFY_FILE);
+//	                   when it appears non-empty the server emits one
+//	                   notifications/progress with a fixed token, then truncates
+//	                   the file — used to fire a progress push at a test-chosen
+//	                   moment, e.g. before the client's initialize (Round 2).
+//	FAKE_CANCEL_FILE  path to a file the server APPENDS each received
+//	                   notifications/cancelled's params to (one JSON line) —
+//	                   used to assert the gateway forwarded a cancellation with
+//	                   its own upstream-side request id (Round 2).
+//	FAKE_ASYNC_CALLS  if "1", each tools/call is answered on its OWN goroutine
+//	                   (FAKE_CALL_DELAY sleeps there), so the main read loop
+//	                   keeps consuming stdin meanwhile — required by the
+//	                   cancellation tests, where a notifications/cancelled must
+//	                   be read WHILE a delayed call is still pending. Not
+//	                   combined with FAKE_EXIT_AFTER/FAKE_HYBRID_CALL (the sync
+//	                   path keeps those).
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -110,6 +130,10 @@ func main() {
 	hybridCall := os.Getenv("FAKE_HYBRID_CALL") == "1"
 	toolsFile := os.Getenv("FAKE_TOOLS_FILE")
 	notifyFile := os.Getenv("FAKE_NOTIFY_FILE")
+	progress := os.Getenv("FAKE_PROGRESS") == "1"
+	progressFile := os.Getenv("FAKE_PROGRESS_FILE")
+	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
+	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -156,6 +180,24 @@ func main() {
 		}()
 	}
 
+	// progress poller: when progressFile becomes non-empty, emit one
+	// notifications/progress with a fixed token and truncate the file so each
+	// "touch" fires exactly once (Round 2 test hook, same shape as notifyFile).
+	if progressFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Millisecond)
+				data, err := os.ReadFile(progressFile)
+				if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+					continue
+				}
+				_ = os.WriteFile(progressFile, nil, 0o600)
+				write(message{Method: "notifications/progress",
+					Params: json.RawMessage(`{"progressToken":"fake-token","progress":1}`)})
+			}
+		}()
+	}
+
 	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -189,7 +231,47 @@ func main() {
 			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(currentTools(toolsFile, tools)))})
 		case "resources/list":
 			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})
+		case "notifications/cancelled":
+			// Record the cancellation so a test can assert the gateway sent it
+			// (and with WHICH requestId). Append, don't truncate: a test may
+			// expect several.
+			if cancelFile != "" {
+				f, err := os.OpenFile(cancelFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintf(f, "%s\n", req.Params)
+					f.Close()
+				}
+			}
 		case "tools/call":
+			if progress {
+				// Echo the client's progressToken back in a progress
+				// notification BEFORE the response, per the MCP progress
+				// utility. Emitted only when the request carried a token.
+				var p struct {
+					Meta struct {
+						ProgressToken json.RawMessage `json:"progressToken"`
+					} `json:"_meta"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				if len(p.Meta.ProgressToken) > 0 {
+					write(message{Method: "notifications/progress",
+						Params: json.RawMessage(fmt.Sprintf(
+							`{"progressToken":%s,"progress":1,"total":2}`, p.Meta.ProgressToken))})
+				}
+			}
+			if asyncCalls {
+				// Answer on a goroutine so the read loop keeps consuming stdin
+				// (e.g. a notifications/cancelled arriving mid-delay). write is
+				// mutex-guarded, so concurrent replies cannot interleave bytes.
+				req := req
+				go func() {
+					if callDelay > 0 {
+						time.Sleep(callDelay)
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
+				}()
+				continue
+			}
 			if callDelay > 0 {
 				time.Sleep(callDelay)
 			}
