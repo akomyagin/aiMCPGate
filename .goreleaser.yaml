@@ -96,6 +96,55 @@ docker_manifests:
       - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-amd64"
       - "ghcr.io/akomyagin/aimcpgate:{{ .Version }}-arm64"
 
+# Homebrew tap (macOS/Linux: `brew install akomyagin/tap/mcp-gate`).
+#
+# TODO(dist): публикация выключена (skip_upload: true), пока не выполнены два
+# РУЧНЫХ шага вне этого репозитория:
+#   1. создать репозиторий github.com/akomyagin/homebrew-tap;
+#   2. добавить secret HOMEBREW_TAP_GITHUB_TOKEN (PAT с правом push в этот
+#      репозиторий) в GitHub Actions этого репо и пробросить его в env шага
+#      goreleaser в .github/workflows/release.yml.
+# После этого убрать skip_upload. envOrDefault оставляет token пустым, а не
+# роняет весь релиз template-ошибкой, пока секрета нет.
+brews:
+  - name: mcp-gate
+    repository:
+      owner: akomyagin
+      name: homebrew-tap
+      branch: main
+      token: '{{ envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}'
+    directory: Formula
+    homepage: https://github.com/akomyagin/aiMCPGate
+    description: "MCP gateway/proxy: multiplexes tool calls across upstream MCP servers into one catalog."
+    license: MIT
+    commit_msg_template: "chore: brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    test: |
+      system "#{bin}/mcp-gate", "version"
+    skip_upload: true
+
+# Scoop bucket (Windows: `scoop bucket add akomyagin https://github.com/akomyagin/scoop-bucket; scoop install mcp-gate`).
+#
+# TODO(dist): публикация выключена (skip_upload: true), пока не выполнены два
+# РУЧНЫХ шага вне этого репозитория:
+#   1. создать репозиторий github.com/akomyagin/scoop-bucket;
+#   2. добавить secret SCOOP_BUCKET_GITHUB_TOKEN (PAT с правом push в этот
+#      репозиторий) и пробросить его в env шага goreleaser в
+#      .github/workflows/release.yml.
+# После этого убрать skip_upload.
+scoops:
+  - name: mcp-gate
+    repository:
+      owner: akomyagin
+      name: scoop-bucket
+      branch: main
+      token: '{{ envOrDefault "SCOOP_BUCKET_GITHUB_TOKEN" "" }}'
+    directory: bucket
+    homepage: https://github.com/akomyagin/aiMCPGate
+    description: "MCP gateway/proxy: multiplexes tool calls across upstream MCP servers into one catalog."
+    license: MIT
+    commit_msg_template: "chore: scoop manifest update for {{ .ProjectName }} version {{ .Tag }}"
+    skip_upload: true
+
 checksum:
   name_template: SHA256SUMS
   algorithm: sha256
