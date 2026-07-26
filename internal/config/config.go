@@ -49,6 +49,18 @@ const (
 	UpstreamHTTP UpstreamKind = "http"
 )
 
+// Catalog-mode values (Round 8). An empty CatalogMode means CatalogModeNormal.
+const (
+	// CatalogModeNormal exposes every aggregated, namespaced upstream tool in
+	// tools/list — the default behaviour since the MVP.
+	CatalogModeNormal = "normal"
+	// CatalogModeLazy exposes exactly three gateway meta-tools
+	// (gate_search_tools / gate_describe / gate_call) instead of the full
+	// catalog — progressive tool disclosure for very large catalogs. See
+	// internal/transport/lazy.go.
+	CatalogModeLazy = "lazy"
+)
+
 // upstreamNameRe restricts upstream names to characters that survive namespacing
 // into "<upstream>__<tool>" without breaking clients that expect tool names to
 // match ^[a-zA-Z0-9_-]+$ (Claude Code and friends). See docs/MCP_NOTES.md §6.
@@ -84,6 +96,57 @@ type Upstream struct {
 	// aggregated catalog (Stage 9). The zero value passes every tool through
 	// under the default "<upstream>__<tool>" name.
 	Tools ToolFilter `yaml:"tools"`
+
+	// Call-limit knobs (Round 6). These are deliberately NOT part of SameLaunch:
+	// changing a limit never requires relaunching the upstream process — the
+	// registry re-reads them from the live config on every call, so a SIGHUP
+	// reload takes effect on the next tools/call without any upstream downtime.
+
+	// RateLimit overrides the global rate_limit for THIS upstream's forwarded
+	// tools/call requests. nil inherits the global setting; an explicit block
+	// with rps: 0 disables rate limiting for this upstream even when a global
+	// limit is set (see EffectiveRateLimitFor).
+	RateLimit *RateLimit `yaml:"rate_limit"`
+	// MaxConcurrent caps how many tools/call requests may be in flight against
+	// this upstream at once (a semaphore in the registry). 0 = unlimited.
+	// Per-upstream only — there is no global default: the sensible cap depends
+	// entirely on the individual upstream's nature.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// MaxResultBytes overrides the global max_result_bytes for this upstream.
+	// A pointer so "unset" (nil → inherit the global value) is distinguishable
+	// from an explicit 0 (= unlimited, overriding a global limit).
+	MaxResultBytes *int `yaml:"max_result_bytes"`
+	// CallTimeout overrides the global call_timeout for requests to THIS
+	// upstream (handshake, list, forwarded call). 0 = inherit the global
+	// EffectiveCallTimeout (see EffectiveCallTimeoutFor).
+	CallTimeout time.Duration `yaml:"call_timeout"`
+}
+
+// RateLimit is a token-bucket limit on forwarded tools/call requests
+// (golang.org/x/time/rate): RPS tokens are refilled per second, Burst is the
+// bucket size (how many calls may fire back-to-back before the refill rate
+// kicks in). A Burst of 0 is treated as 1 by EffectiveRateLimitFor — a bucket
+// that can never hold a token would block every call forever. RPS of 0 (or an
+// entirely absent block) means no rate limiting.
+type RateLimit struct {
+	RPS   float64 `yaml:"rps"`
+	Burst int     `yaml:"burst"`
+}
+
+// validate rejects a nonsensical rate limit; nil (unset) is fine. where names
+// the config location for the error message ("rate_limit" or
+// "upstream %q: rate_limit").
+func (rl *RateLimit) validate(where string) error {
+	if rl == nil {
+		return nil
+	}
+	if rl.RPS < 0 {
+		return fmt.Errorf("%s.rps must not be negative (0 disables the limit)", where)
+	}
+	if rl.Burst < 0 {
+		return fmt.Errorf("%s.burst must not be negative (0 means 1)", where)
+	}
+	return nil
 }
 
 // ToolFilter selects and renames the tools one upstream exposes to the client.
@@ -94,7 +157,14 @@ type Upstream struct {
 //  1. Allow — when non-empty, only the listed tools survive (intersection);
 //  2. Deny — always subtracted, even from an explicit Allow;
 //  3. Rename — maps a surviving original name to its client-facing name;
-//     tools without a rename get the default "<upstream>__<tool>".
+//     tools without a rename get the default "<upstream>__<tool>";
+//  4. Projection rules (token optimization, opt-in): StripAnnotations and
+//     StripOutputSchema drop the heavyweight catalog fields entirely;
+//     Describe replaces a tool's description with the configured text
+//     (keyed by ORIGINAL name, same as Rename); MaxDescription truncates
+//     descriptions NOT overridden by Describe to at most that many runes
+//     (a Describe override is the config author's final word — it is never
+//     re-truncated).
 //
 // Deny is an ADDITIONAL safety barrier, not a replacement for upstream-side
 // auth: it narrows the tool surface the client can even see, independent of
@@ -104,6 +174,19 @@ type ToolFilter struct {
 	Allow  []string          `yaml:"allow"`
 	Deny   []string          `yaml:"deny"`
 	Rename map[string]string `yaml:"rename"`
+
+	// StripAnnotations drops the tools' annotations object from the catalog.
+	StripAnnotations bool `yaml:"strip_annotations"`
+	// StripOutputSchema drops the tools' outputSchema from the catalog.
+	StripOutputSchema bool `yaml:"strip_output_schema"`
+	// MaxDescription, when > 0, truncates tool descriptions to at most this
+	// many runes (an ellipsis is appended when truncation happened). 0 = no
+	// limit. Descriptions overridden via Describe are never truncated.
+	MaxDescription int `yaml:"max_description"`
+	// Describe replaces a tool's description wholesale, keyed by the
+	// upstream's ORIGINAL tool name (before any rename) — the same keying
+	// Rename uses. An empty value is ignored (keeps the upstream's own text).
+	Describe map[string]string `yaml:"describe"`
 }
 
 // SameLaunch reports whether two upstreams would launch identically — same
@@ -111,7 +194,11 @@ type ToolFilter struct {
 // hot-reload (Stage 7d) to tell an unchanged upstream (leave running) from a
 // changed one (Close + relaunch). Name is assumed equal by the caller (it is the
 // match key); Enabled is intentionally NOT compared here — enable/disable is
-// handled as add/remove by the reload diff, not as a "changed launch".
+// handled as add/remove by the reload diff, not as a "changed launch". The
+// call-limit fields (RateLimit/MaxConcurrent/MaxResultBytes/CallTimeout, Round
+// 6) are intentionally NOT compared either: they never affect how the process
+// is launched, and the registry re-reads them from the live config on every
+// call, so a reload that only tweaks a limit must leave the upstream running.
 func (u Upstream) SameLaunch(other Upstream) bool {
 	if u.ResolveKind() != other.ResolveKind() ||
 		u.Command != other.Command ||
@@ -125,15 +212,21 @@ func (u Upstream) SameLaunch(other Upstream) bool {
 }
 
 // SameFilter reports whether two upstreams project the same tool filter
-// (allow/deny/rename). It is deliberately SEPARATE from SameLaunch: the launch
-// predicate is about how the upstream PROCESS is reached, while the filter is
-// only a projection of its catalog — hot-reload (Stage 9) uses the distinction
-// to re-apply a changed filter to the stored raw tool list without relaunching
-// (or even re-listing) an otherwise-identical upstream.
+// (allow/deny/rename plus the projection rules: strip_annotations,
+// strip_output_schema, max_description, describe). It is deliberately SEPARATE
+// from SameLaunch: the launch predicate is about how the upstream PROCESS is
+// reached, while the filter is only a projection of its catalog — hot-reload
+// (Stage 9) uses the distinction to re-apply a changed filter to the stored
+// raw tool list without relaunching (or even re-listing) an
+// otherwise-identical upstream.
 func (u Upstream) SameFilter(other Upstream) bool {
 	return slices.Equal(u.Tools.Allow, other.Tools.Allow) &&
 		slices.Equal(u.Tools.Deny, other.Tools.Deny) &&
-		maps.Equal(u.Tools.Rename, other.Tools.Rename)
+		maps.Equal(u.Tools.Rename, other.Tools.Rename) &&
+		u.Tools.StripAnnotations == other.Tools.StripAnnotations &&
+		u.Tools.StripOutputSchema == other.Tools.StripOutputSchema &&
+		u.Tools.MaxDescription == other.Tools.MaxDescription &&
+		maps.Equal(u.Tools.Describe, other.Tools.Describe)
 }
 
 // AllowSet returns Allow as a lookup set. Both consumers of the filter
@@ -208,8 +301,41 @@ type Config struct {
 	SkillFile string `yaml:"skill_file"`
 
 	// CallTimeout bounds a single upstream request (handshake, list, or call).
-	// Zero selects DefaultCallTimeout.
+	// Zero selects DefaultCallTimeout. Individual upstreams may override it via
+	// their own call_timeout (EffectiveCallTimeoutFor).
 	CallTimeout time.Duration `yaml:"call_timeout"`
+
+	// RateLimit, when set, applies a token-bucket limit to forwarded tools/call
+	// requests, per upstream (each upstream gets its own bucket with these
+	// parameters — the global value is a default, not a shared budget). nil =
+	// no rate limiting. Individual upstreams may override or disable it via
+	// their own rate_limit block (EffectiveRateLimitFor).
+	RateLimit *RateLimit `yaml:"rate_limit"`
+	// MaxResultBytes, when > 0, truncates oversized textual tool results to
+	// roughly this many bytes before returning them to the client (opt-in token
+	// protection). 0 = unlimited (the default). Individual upstreams may
+	// override it via their own max_result_bytes (EffectiveMaxResultBytesFor).
+	MaxResultBytes int `yaml:"max_result_bytes"`
+
+	// CatalogMode selects how tools/list presents the aggregated catalog
+	// (Round 8). "" or "normal": every namespaced upstream tool, as always.
+	// "lazy": a fixed set of three gateway meta-tools (gate_search_tools,
+	// gate_describe, gate_call) through which the client discovers and calls
+	// the real catalog on demand — progressive tool disclosure that keeps the
+	// client's tool list tiny no matter how many upstreams are aggregated.
+	//
+	// PRECEDENCE (documented contract): when CatalogMode is "lazy", PageSize
+	// is IGNORED — the three meta-tools are a fixed, tiny list that never
+	// paginates. Like the Round 6 limits, this field is read from the live
+	// config on every request, so a SIGHUP reload switches modes without
+	// relaunching anything.
+	CatalogMode string `yaml:"catalog_mode"`
+	// PageSize, when > 0, paginates tools/list responses into pages of at
+	// most this many tools, linked by an opaque nextCursor (MCP pagination).
+	// 0 (the default) keeps the old behaviour: the whole catalog in a single
+	// response, any cursor ignored. Ignored entirely in lazy catalog mode
+	// (see CatalogMode).
+	PageSize int `yaml:"page_size"`
 
 	// Restart is the GLOBAL policy for automatically restarting a stdio upstream
 	// whose child process dies while the gateway is running (Stage 7a). It is a
@@ -279,6 +405,78 @@ func (c *Config) EffectiveCallTimeout() time.Duration {
 	return c.CallTimeout
 }
 
+// upstreamByName returns the upstream config entry with the given name, or nil
+// when the config has no such upstream. Same linear-scan lookup pattern as the
+// registry's filterFor: units-to-tens of upstreams, not a hot path worth an
+// index.
+func (c *Config) upstreamByName(name string) *Upstream {
+	for i := range c.Upstreams {
+		if c.Upstreams[i].Name == name {
+			return &c.Upstreams[i]
+		}
+	}
+	return nil
+}
+
+// EffectiveRateLimitFor resolves the rate limit that applies to the named
+// upstream: its own rate_limit block when set, otherwise the global one.
+// ok=false means no rate limiting applies (neither level configured it, the
+// winning block has rps <= 0, or the upstream is unknown and there is no
+// global limit — an unknown upstream inherits the global default, consistent
+// with per-upstream lookups elsewhere treating "absent from config" as "no
+// overrides"). A Burst of 0 in the winning block is normalized to 1 (a bucket
+// that can never hold a token would block forever).
+func (c *Config) EffectiveRateLimitFor(name string) (rps float64, burst int, ok bool) {
+	rl := c.RateLimit
+	if u := c.upstreamByName(name); u != nil && u.RateLimit != nil {
+		rl = u.RateLimit
+	}
+	if rl == nil || rl.RPS <= 0 {
+		return 0, 0, false
+	}
+	burst = rl.Burst
+	if burst < 1 {
+		burst = 1
+	}
+	return rl.RPS, burst, true
+}
+
+// EffectiveMaxConcurrentFor returns the named upstream's max_concurrent cap,
+// or 0 (unlimited) when unset or the upstream is unknown. Per-upstream only —
+// there is no global default (see the Upstream field comment).
+func (c *Config) EffectiveMaxConcurrentFor(name string) int {
+	if u := c.upstreamByName(name); u != nil && u.MaxConcurrent > 0 {
+		return u.MaxConcurrent
+	}
+	return 0
+}
+
+// EffectiveMaxResultBytesFor resolves the result-size cap for the named
+// upstream: its own max_result_bytes when set (an explicit 0 disables the
+// global cap for this upstream), otherwise the global MaxResultBytes.
+// 0 = unlimited.
+func (c *Config) EffectiveMaxResultBytesFor(name string) int {
+	if u := c.upstreamByName(name); u != nil && u.MaxResultBytes != nil {
+		return *u.MaxResultBytes
+	}
+	return c.MaxResultBytes
+}
+
+// EffectiveCallTimeoutFor resolves the request timeout for the named upstream:
+// its own call_timeout when > 0, otherwise the global EffectiveCallTimeout
+// (which itself falls back to DefaultCallTimeout).
+func (c *Config) EffectiveCallTimeoutFor(name string) time.Duration {
+	if u := c.upstreamByName(name); u != nil && u.CallTimeout > 0 {
+		return u.CallTimeout
+	}
+	return c.EffectiveCallTimeout()
+}
+
+// LazyCatalog reports whether the lazy catalog mode (Round 8) is active —
+// the one place the string comparison lives, so the dispatcher never spells
+// "lazy" itself.
+func (c *Config) LazyCatalog() bool { return c.CatalogMode == CatalogModeLazy }
+
 // EffectiveListenAddr returns ListenAddr or DefaultListenAddr if unset.
 func (c *Config) EffectiveListenAddr() string {
 	if c.ListenAddr == "" {
@@ -327,6 +525,18 @@ func (c *Config) EffectiveRestart() RestartPolicy {
 // DefaultConfigName is the file Load looks for next to the running binary
 // when no --config path is given.
 const DefaultConfigName = "config.yaml"
+
+// ResolvePath returns the concrete config file path Load would read for the
+// given --config value: path itself when non-empty, otherwise the default
+// config next to the running binary. It does not check that the file exists —
+// callers that need to watch the path (serve --watch-config stats it for
+// mtime changes) must know WHERE the config lives even before it does.
+func ResolvePath(path string) (string, error) {
+	if path != "" {
+		return path, nil
+	}
+	return defaultConfigPath()
+}
 
 // defaultConfigPath returns <directory of the running binary>/config.yaml —
 // the location Load falls back to when path is empty.
@@ -448,6 +658,25 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.RateLimit.validate("rate_limit"); err != nil {
+		return err
+	}
+	if c.MaxResultBytes < 0 {
+		return fmt.Errorf("max_result_bytes must not be negative (0 means unlimited)")
+	}
+	if c.CallTimeout < 0 {
+		return fmt.Errorf("call_timeout must not be negative (0 selects the default)")
+	}
+
+	switch c.CatalogMode {
+	case "", CatalogModeNormal, CatalogModeLazy:
+	default:
+		return fmt.Errorf("unknown catalog_mode %q (want %q or %q)", c.CatalogMode, CatalogModeNormal, CatalogModeLazy)
+	}
+	if c.PageSize < 0 {
+		return fmt.Errorf("page_size must not be negative (0 disables tools/list pagination)")
+	}
+
 	// The opt-in payload debug log must never share a file with the audit log:
 	// payloads carry raw arguments/results (possibly secrets), which the audit
 	// log is required to stay free of (SKILL §6). Reject the overlap outright.
@@ -487,6 +716,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 		if err := validateToolFilter(u, clientNames); err != nil {
+			return err
+		}
+		if err := validateUpstreamLimits(u); err != nil {
 			return err
 		}
 	}
@@ -535,6 +767,18 @@ func validateToolFilter(u Upstream, clientNames map[string]string) error {
 	f := u.Tools
 	allow := f.AllowSet()
 	deny := f.DenySet()
+
+	if f.MaxDescription < 0 {
+		return fmt.Errorf("upstream %q: tools.max_description must not be negative (0 means unlimited)", u.Name)
+	}
+	// Describe keys follow the same rule as Rename keys: with a non-empty
+	// allow-list, a key outside it could never apply — a config mistake.
+	// Sorted for a deterministic error message (map iteration is randomized).
+	for _, orig := range slices.Sorted(maps.Keys(f.Describe)) {
+		if len(f.Allow) > 0 && !allow[orig] {
+			return fmt.Errorf("upstream %q: tools.describe key %q is not in tools.allow — the description override could never apply", u.Name, orig)
+		}
+	}
 
 	claim := func(clientName, owner string) error {
 		if prev, dup := clientNames[clientName]; dup {
@@ -597,6 +841,25 @@ func (p RestartPolicy) validate() error {
 	}
 	if p.MaxAttempts < 0 {
 		return fmt.Errorf("restart.max_attempts must not be negative (0 means unlimited)")
+	}
+	return nil
+}
+
+// validateUpstreamLimits rejects actively-wrong per-upstream call-limit values
+// (Round 6). Unset fields are fine: 0 / nil mean "unlimited" or "inherit the
+// global default" (see the field comments and the Effective*For helpers).
+func validateUpstreamLimits(u Upstream) error {
+	if err := u.RateLimit.validate(fmt.Sprintf("upstream %q: rate_limit", u.Name)); err != nil {
+		return err
+	}
+	if u.MaxConcurrent < 0 {
+		return fmt.Errorf("upstream %q: max_concurrent must not be negative (0 means unlimited)", u.Name)
+	}
+	if u.MaxResultBytes != nil && *u.MaxResultBytes < 0 {
+		return fmt.Errorf("upstream %q: max_result_bytes must not be negative (0 means unlimited)", u.Name)
+	}
+	if u.CallTimeout < 0 {
+		return fmt.Errorf("upstream %q: call_timeout must not be negative (0 inherits the global call_timeout)", u.Name)
 	}
 	return nil
 }

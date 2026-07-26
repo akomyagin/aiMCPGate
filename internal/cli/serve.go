@@ -18,28 +18,52 @@ import (
 	"github.com/akomyagin/aiMCPGate/internal/transport"
 )
 
+// defaultWatchConfigInterval is what a bare `--watch-config` (no value) means:
+// poll the config file's mtime every 2s — frequent enough that an edit lands
+// within a breath, rare enough that the stat cost is unmeasurable.
+const defaultWatchConfigInterval = 2 * time.Second
+
 // newServeCmd wires config → logger → registry → transport and blocks serving
 // the client until the process is cancelled (Ctrl-C / SIGTERM). This is the
 // gateway's main run loop; keeping it here keeps main.go trivial (SKILL §1).
 func newServeCmd(version string) *cobra.Command {
-	var configPath *string
+	var (
+		configPath  *string
+		envFile     *string
+		watchConfig time.Duration
+	)
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the gateway, serving one client and multiplexing upstream MCP servers",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runServe(cmd.Context(), *configPath, version)
+			return runServe(cmd.Context(), *configPath, *envFile, watchConfig, version)
 		},
 	}
 	configPath = addConfigFlag(cmd)
+	envFile = addEnvFileFlag(cmd)
+	cmd.Flags().DurationVar(&watchConfig, "watch-config", 0,
+		"poll the config file for changes at this interval and hot-reload on change — "+
+			"the cross-platform alternative to SIGHUP (Windows has none); bare --watch-config means "+
+			defaultWatchConfigInterval.String()+", 0 disables (use --watch-config=INTERVAL, not a space)")
+	cmd.Flags().Lookup("watch-config").NoOptDefVal = defaultWatchConfigInterval.String()
 	return cmd
 }
 
-func runServe(parent context.Context, configPath, version string) error {
+func runServe(parent context.Context, configPath, envFile string, watchConfig time.Duration, version string) error {
+	if watchConfig < 0 {
+		return fmt.Errorf("--watch-config must be a positive interval (got %s)", watchConfig)
+	}
+
 	// Cancel the whole tree on Ctrl-C / SIGTERM so upstream child processes get
 	// torn down cleanly (see internal/registry).
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The env file must land in the environment BEFORE config.Load expands the
+	// ${VAR} references in the config (and before any SIGHUP reload re-loads it).
+	if err := applyEnvFile(envFile); err != nil {
+		return err
+	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
@@ -75,16 +99,27 @@ func runServe(parent context.Context, configPath, version string) error {
 	// waits out ctx — reload is a documented Unix-only convenience there.
 	go watchReload(ctx, configPath, reg, logger)
 
+	// Opt-in polling fallback (--watch-config): reload when the config file's
+	// mtime changes. This is how reload works on Windows (no SIGHUP), but it can
+	// be enabled anywhere — running it ALONGSIDE the SIGHUP watcher is safe,
+	// because Registry.Reload serializes every caller behind its lifecycle
+	// mutex, so two triggers for the same edit just apply the same (idempotent)
+	// diff twice.
+	if watchConfig > 0 {
+		watchPath, err := config.ResolvePath(configPath)
+		if err != nil {
+			return err
+		}
+		go pollConfig(ctx, watchPath, watchConfig, reg, logger)
+	}
+
 	// Serve starts the registry (upstream fan-out) and blocks handling client
 	// requests until ctx is cancelled or the client disconnects.
 	return srv.Serve(ctx)
 }
 
-// watchReload listens for reload signals (SIGHUP) and, on each, reloads the
-// config from configPath and applies it to the running registry. A failed load
-// (e.g. a typo in the edited file) is logged and IGNORED — the currently running
-// configuration stays live, so a bad edit never takes the gateway down. Returns
-// when ctx is cancelled (process shutting down).
+// watchReload listens for reload signals (SIGHUP) and applies a reload on
+// each. Returns when ctx is cancelled (process shutting down).
 func watchReload(ctx context.Context, configPath string, reg *registry.Registry, logger *slog.Logger) {
 	sigs := reloadSignals()
 	if len(sigs) == 0 {
@@ -100,27 +135,68 @@ func watchReload(ctx context.Context, configPath string, reg *registry.Registry,
 			return
 		case <-hup:
 			logger.Info("reload signal received, reloading config")
-			newCfg, err := config.Load(configPath)
-			if err != nil {
-				// Keep the running config: a bad edit must not kill a working gateway.
-				logger.Error("reload failed, keeping current config", "err", err)
-				continue
-			}
-			switch err := reg.Reload(ctx, newCfg); {
-			case err == nil:
-			case errors.Is(err, registry.ErrNotStarted):
-				// SIGHUP landed before Start finished its bring-up (watchReload
-				// starts before srv.Serve). Not fatal — the edit is valid, the
-				// registry just is not ready for it yet; retry shortly.
-				logger.Warn("reload received before startup finished, retrying")
-				retryReload(ctx, reg, newCfg, logger)
-			case errors.Is(err, registry.ErrClosing):
-				// The gateway is shutting down anyway; the reload is moot.
-				logger.Debug("reload ignored: gateway is shutting down")
-			default:
-				logger.Error("reload apply failed", "err", err)
-			}
+			applyReload(ctx, configPath, reg, logger)
 		}
+	}
+}
+
+// pollConfig watches the config file's mtime every interval and applies a
+// reload when it changes — the same applyReload path SIGHUP takes, minus the
+// signal. This is the opt-in --watch-config mechanism: the ONLY reload trigger
+// on Windows, a redundant-but-harmless second trigger elsewhere. A stat
+// failure (e.g. the fleeting window of an editor's atomic rename-over-save) is
+// skipped silently and retried on the next tick. Returns when ctx is cancelled.
+func pollConfig(ctx context.Context, path string, interval time.Duration, reg *registry.Registry, logger *slog.Logger) {
+	var lastMod time.Time
+	if fi, err := os.Stat(path); err == nil {
+		lastMod = fi.ModTime()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if fi.ModTime().Equal(lastMod) {
+			continue
+		}
+		lastMod = fi.ModTime()
+		logger.Info("config file changed, reloading", "path", path)
+		applyReload(ctx, path, reg, logger)
+	}
+}
+
+// applyReload is the shared body of BOTH reload triggers (SIGHUP and
+// --watch-config polling): load the config from configPath and apply it to the
+// running registry. A failed load (e.g. a typo in the edited file) is logged
+// and IGNORED — the currently running configuration stays live, so a bad edit
+// never takes the gateway down.
+func applyReload(ctx context.Context, configPath string, reg *registry.Registry, logger *slog.Logger) {
+	newCfg, err := config.Load(configPath)
+	if err != nil {
+		// Keep the running config: a bad edit must not kill a working gateway.
+		logger.Error("reload failed, keeping current config", "err", err)
+		return
+	}
+	switch err := reg.Reload(ctx, newCfg); {
+	case err == nil:
+	case errors.Is(err, registry.ErrNotStarted):
+		// The reload landed before Start finished its bring-up (both watchers
+		// start before srv.Serve). Not fatal — the edit is valid, the registry
+		// just is not ready for it yet; retry shortly.
+		logger.Warn("reload received before startup finished, retrying")
+		retryReload(ctx, reg, newCfg, logger)
+	case errors.Is(err, registry.ErrClosing):
+		// The gateway is shutting down anyway; the reload is moot.
+		logger.Debug("reload ignored: gateway is shutting down")
+	default:
+		logger.Error("reload apply failed", "err", err)
 	}
 }
 

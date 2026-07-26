@@ -2,31 +2,76 @@ package transport
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"sort"
+	"sync"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// Gateway capability objects advertised to the client on initialize. Resources
-// are not aggregated in the MVP (see handleResourcesList), so only the tools
-// capability is declared. They are raw JSON literals because the gateway does
-// not otherwise interpret its own capability object.
+// buildCapabilities assembles the gateway's own capability object, advertised
+// to the client on initialize. The object is built structurally (map →
+// json.Marshal) rather than as a string literal, so further rounds can keep
+// adding CONDITIONAL capabilities (logging etc.) without rebuilding this
+// function.
+//
+// prompts (Round 4), resources and completions (Round 5) are CONDITIONAL:
+// declared only when at least one live upstream declared them in its own
+// initialize — advertising them against zero capable upstreams would be
+// dishonest. Their sub-flags (prompts/resources listChanged, resources
+// subscribe) are honestly false: this round neither subscribes to the
+// corresponding upstream notifications nor proxies resources/subscribe, so the
+// gateway cannot promise to emit its own. TODO(post-MVP): wire prompt/resource
+// list_changed the way tools' is wired (Stage 7b/7c).
 //
 // listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
 // catalog is dynamic (auto-restart, upstream list_changed, reload), so the
 // gateway CAN emit notifications/tools/list_changed — but only over a transport
-// with a server→client channel. stdio has one (the same pipe), so it advertises
-// listChanged:true and pushes the notification. The HTTP transport is POST-only
-// here (no GET SSE stream, MCP_NOTES §8 п.3), so it CANNOT push server→client
-// notifications; it truthfully advertises listChanged:false and clients simply
-// see the updated catalog on their next tools/list. Building the GET SSE channel
-// is deferred future work.
-var (
-	gatewayCapabilitiesListChanged   = json.RawMessage(`{"tools":{"listChanged":true}}`)
-	gatewayCapabilitiesNoListChanged = json.RawMessage(`{"tools":{"listChanged":false}}`)
-)
+// with a server→client channel. stdio has one (the same pipe) and advertises
+// listChanged:true. Since Round 12 the HTTP transport has one too — the GET
+// /mcp SSE stream (handleSSE) — so it also advertises listChanged:true; the
+// parameter stays so a future channel-less transport can still tell the truth.
+func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage {
+	caps := map[string]any{
+		"tools": map[string]any{"listChanged": listChanged},
+	}
+	// nil reg: classification-only tests build a dispatcher without a registry;
+	// a gateway with no registry aggregates nothing, so no extra capabilities.
+	if reg != nil {
+		if reg.HasUpstreamCapability("prompts") {
+			caps["prompts"] = map[string]any{"listChanged": false}
+		}
+		// resources (Round 5) is conditional like prompts, and its sub-flags are
+		// honestly false: the gateway neither proxies resources/subscribe nor
+		// emits its own notifications/resources/list_changed in this round.
+		if reg.HasUpstreamCapability("resources") {
+			caps["resources"] = map[string]any{"subscribe": false, "listChanged": false}
+		}
+		// completions (Round 5): declared only when at least one live upstream
+		// can actually answer completion/complete. The capability carries no
+		// sub-flags in the spec — an empty object.
+		if reg.HasUpstreamCapability("completions") {
+			caps["completions"] = map[string]any{}
+		}
+	}
+	// logging (Round 3) is CONDITIONAL for the same honesty reason as prompts:
+	// declared only when at least one live upstream declared it — with zero
+	// logging-capable upstreams a logging/setLevel would be a silent no-op and
+	// no notifications/message could ever arrive.
+	if reg != nil && reg.HasUpstreamCapability("logging") {
+		caps["logging"] = map[string]any{}
+	}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		// Unreachable for a map of plain bools; keep initialize alive anyway.
+		return json.RawMessage(`{}`)
+	}
+	return b
+}
 
 // dispatcher is the transport-agnostic core of the client-facing gateway: given
 // one decoded client message it produces the reply (or nil, for a notification
@@ -34,30 +79,64 @@ var (
 //
 // It exists so the stdio and HTTP transports share exactly one implementation
 // of the MCP method handling (initialize / tools/list / tools/call /
-// resources/*). Each transport is left with only its own framing/plumbing
+// prompts/* / resources/*). Each transport is left with only its own
+// framing/plumbing
 // (reading requests, writing replies, SSE vs newline); the protocol logic lives
-// here once. It holds no per-connection state, so a single dispatcher is safe to
-// share across concurrent HTTP requests.
+// here once.
+//
+// Since Round 2 the dispatcher is no longer stateless: cancels (guarded by
+// cancelMu) tracks one context.CancelFunc per in-flight tools/call, keyed by
+// the CLIENT's request id, so a notifications/cancelled from the client can
+// abort the matching call. The map is mutex-guarded, so a single dispatcher
+// remains safe to share across concurrent HTTP requests. A tools/call whose id
+// is ALREADY in flight is rejected with an explicit error instead of silently
+// overwriting the first call's entry — since Round 2 stdio runs each tools/call
+// on its own goroutine, so an overwrite would wire a later notifications/
+// cancelled to the WRONG call (found by review; over HTTP such an id collision
+// was harmless, but stdio shares the map across concurrent calls).
 type dispatcher struct {
 	reg     *registry.Registry
 	log     *slog.Logger
 	version string
-	// capabilities is what handleInitialize advertises. It is chosen per
-	// transport (Stage 7c): stdio can push server→client notifications so it
-	// declares listChanged:true, HTTP (POST-only) cannot so it declares false.
-	capabilities json.RawMessage
+	// listChanged is whether this transport can push a server→client
+	// notifications/tools/list_changed (Stage 7c): true for stdio (the pipe)
+	// and, since Round 12, for HTTP too (the GET SSE stream). handleInitialize
+	// feeds it to buildCapabilities on every handshake.
+	listChanged bool
+
+	// elicitation is whether this transport can proxy an upstream's
+	// elicitation/create REQUEST to the client and route the answer back
+	// (Round 14): true only for stdio. Gates handleInitialize's
+	// SetClientElicitationCapable — over HTTP the registry flag must stay
+	// false even for a client that declares the capability, because the HTTP
+	// transport has no channel for gateway→client requests and never
+	// subscribes to SubscribeElicitations.
+	elicitation bool
+
+	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
+	// that aborts that in-flight tools/call's context (Round 2). Entries live
+	// exactly as long as the call: registered before handleToolsCall, removed
+	// right after it returns; notifications/cancelled for an id not in the map
+	// (already finished, never existed) is a documented no-op per the spec.
+	cancelMu sync.Mutex
+	cancels  map[string]context.CancelFunc
 }
 
 // newDispatcher builds the shared method-handling core. listChanged tells it
 // which tools capability to advertise: true only for a transport that can push
-// a server→client notifications/tools/list_changed (stdio), false otherwise
-// (HTTP POST-only). See gatewayCapabilities* for the reasoning.
-func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged bool) *dispatcher {
-	caps := gatewayCapabilitiesNoListChanged
-	if listChanged {
-		caps = gatewayCapabilitiesListChanged
+// a server→client notifications/tools/list_changed — today both stdio (the
+// pipe) and HTTP (the GET SSE stream, Round 12). See buildCapabilities.
+// elicitation is true only for a transport that proxies upstream
+// elicitation/create requests to the client (Round 14) — today stdio only.
+func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, elicitation bool) *dispatcher {
+	return &dispatcher{
+		reg:         reg,
+		log:         log,
+		version:     version,
+		listChanged: listChanged,
+		elicitation: elicitation,
+		cancels:     map[string]context.CancelFunc{},
 	}
-	return &dispatcher{reg: reg, log: log, version: version, capabilities: caps}
 }
 
 // dispatch handles one client message and returns the reply to send back, or
@@ -81,6 +160,14 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 			"message is not a valid request: carries both a method and a result/error", nil)
 	}
 	if msg.IsNotification() {
+		if msg.Method == mcp.NotifCancelled {
+			// The client abandoned an in-flight request: cancel its context
+			// (Round 2). Handled BEFORE the generic drop below — this is the
+			// one client notification with a side effect. Never a reply: a
+			// notification gets none even when it misses.
+			d.handleCancelled(msg.Params)
+			return nil
+		}
 		// notifications/initialized and the like need no reply.
 		d.log.Debug("client notification", "method", msg.Method)
 		return nil
@@ -100,40 +187,121 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 	}
 
 	switch msg.Method {
+	case mcp.MethodPing:
+		// Liveness check, answered with an empty result — the one request the
+		// spec allows at ANY time, including before the initialize handshake
+		// (MCP_NOTES §4), so it deliberately consults nothing and cannot fail.
+		return mcp.NewResult(msg.ID, json.RawMessage("{}"))
 	case mcp.MethodInitialize:
 		return d.handleInitialize(msg)
 	case mcp.MethodToolsList:
 		return d.handleToolsList(msg)
 	case mcp.MethodToolsCall:
-		return d.handleToolsCall(ctx, msg)
+		return d.dispatchToolsCall(ctx, msg)
+	case mcp.MethodPromptsList:
+		return d.handlePromptsList(msg)
+	case mcp.MethodPromptsGet:
+		return d.handlePromptsGet(ctx, msg)
+	case mcp.MethodLoggingSetLevel:
+		return d.handleLoggingSetLevel(ctx, msg)
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
-		return d.handleResourcesRead(msg)
+		return d.handleResourcesRead(ctx, msg)
+	case mcp.MethodResourceTemplatesList:
+		return d.handleResourceTemplatesList(msg)
+	case mcp.MethodCompletionComplete:
+		return d.handleCompletionComplete(ctx, msg)
 	default:
 		return mcp.NewError(msg.ID, mcp.CodeMethodNotFound, "method not found: "+msg.Method, nil)
 	}
 }
 
 // handleInitialize answers the client handshake with the gateway's own
-// serverInfo and aggregated capabilities, echoing the client's id.
+// serverInfo, its aggregated capabilities and the concatenated upstream
+// instructions, echoing the client's id.
+//
+// The client's own params (clientInfo etc.) are parsed TOLERANTLY, for the
+// debug log only: malformed initialize params must not fail the handshake —
+// the gateway needs nothing from them to answer, so the worst case is an
+// unidentified client. (The transports run the same tolerant parse via
+// clientString to attach the identity to later calls' contexts.)
 func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
+	if client := clientString(req.Params); client != "" {
+		d.log.Debug("client initialize", "client", client)
+	}
+	// Record whether the client can answer proxied elicitation/create requests
+	// (Round 14) — stdio only (see the elicitation field). A re-initialize
+	// simply overwrites the flag: the latest handshake wins, matching how the
+	// stdio Serve loop re-binds the client identity.
+	if d.elicitation {
+		d.reg.SetClientElicitationCapable(clientSupportsElicitation(req.Params))
+	}
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    d.capabilities,
+		Capabilities:    buildCapabilities(d.reg, d.listChanged),
 		ServerInfo: mcp.Implementation{
 			Name:    "aiMCPGate",
 			Version: d.version,
 		},
+		Instructions: d.reg.Instructions(),
 	}
 	return mcp.NewResult(req.ID, mcp.MustParams(result))
 }
 
+// clientString extracts the calling client's identity from initialize params
+// as "name/version" — the string CallRecord.Client carries. The parse is
+// tolerant by design: malformed or absent params yield "" (an unidentified
+// client), never an error — initialize must succeed regardless. Empty when
+// both clientInfo fields are empty.
+func clientString(params json.RawMessage) string {
+	var p mcp.InitializeParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil {
+		return ""
+	}
+	if p.ClientInfo.Name == "" && p.ClientInfo.Version == "" {
+		return ""
+	}
+	return p.ClientInfo.Name + "/" + p.ClientInfo.Version
+}
+
+// clientSupportsElicitation reports whether the client's initialize params
+// declared the elicitation capability (Round 14). Per MCP the KEY's presence
+// means support, even as an empty object, so only presence is checked. The
+// parse is tolerant like clientString's: absent or malformed params/
+// capabilities mean false (no support), never an error — initialize must
+// succeed regardless, and "cannot tell" safely degrades to "cannot elicit".
+func clientSupportsElicitation(params json.RawMessage) bool {
+	var p mcp.InitializeParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil || len(p.Capabilities) == 0 {
+		return false
+	}
+	var caps map[string]json.RawMessage
+	if json.Unmarshal(p.Capabilities, &caps) != nil {
+		return false
+	}
+	_, ok := caps["elicitation"]
+	return ok
+}
+
 // handleToolsList returns the aggregated, namespaced catalog. Each tool's
 // schema (description/inputSchema/...) is carried through verbatim so the client
-// sees the exact contract each upstream advertises. Pagination is not needed:
-// the registry already merged every upstream's full paginated catalog on Start.
+// sees the exact contract each upstream advertises. The registry already merged
+// every upstream's full paginated catalog on Start; the OUTGOING list is served
+// whole by default, or in pages when page_size is set (Round 8).
+//
+// Both Round 8 knobs are read from the LIVE config on every request (the
+// registry holds it atomically), so a SIGHUP reload flips catalog_mode /
+// page_size without restarting anything.
 func (d *dispatcher) handleToolsList(req *mcp.Message) *mcp.Message {
+	cfg := d.reg.ConfigSnapshot()
+	// Lazy catalog mode (Round 8): the client sees exactly the three gateway
+	// meta-tools instead of the aggregated catalog (lazy.go). page_size is
+	// deliberately IGNORED here — documented precedence (config.Config
+	// .CatalogMode): a fixed list of three never paginates.
+	if cfg.LazyCatalog() {
+		return mcp.NewResult(req.ID, mcp.MustParams(mcp.ToolsListResult{Tools: lazyCatalogTools()}))
+	}
 	descs := d.reg.Tools()
 	tools := make([]mcp.Tool, 0, len(descs))
 	for _, dd := range descs {
@@ -141,7 +309,117 @@ func (d *dispatcher) handleToolsList(req *mcp.Message) *mcp.Message {
 		t.Name = dd.Name // client-facing namespaced name, not the upstream original
 		tools = append(tools, t)
 	}
+	if cfg.PageSize > 0 {
+		return paginatedToolsList(req, tools, cfg.PageSize)
+	}
+	// page_size unset: the whole catalog in one response, any cursor ignored —
+	// the pre-Round 8 behaviour, unchanged.
 	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ToolsListResult{Tools: tools}))
+}
+
+// paginatedToolsList serves one page of the (name-sorted) catalog. The cursor
+// is opaque to the client: base64 of the LAST tool name on the previous page.
+// It is name-based, not index-based, on purpose — Registry.Tools() is sorted
+// by name, so when the catalog mutates BETWEEN pages (upstream restart,
+// reload, list_changed) the next page simply resumes at the first name
+// lexicographically AFTER the cursor: no duplicates and no skips of tools
+// that existed on both sides of the mutation, whereas a positional cursor
+// would silently shift. Per MCP, an unparseable cursor is answered with
+// -32602 Invalid params.
+func paginatedToolsList(req *mcp.Message, tools []mcp.Tool, pageSize int) *mcp.Message {
+	var params mcp.ToolsListParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid tools/list params: "+err.Error(), nil)
+		}
+	}
+	start := 0
+	if params.Cursor != "" {
+		last, err := base64.StdEncoding.DecodeString(params.Cursor)
+		if err != nil {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid tools/list cursor", nil)
+		}
+		start = sort.Search(len(tools), func(i int) bool { return tools[i].Name > string(last) })
+	}
+	end := min(start+pageSize, len(tools))
+	res := mcp.ToolsListResult{Tools: tools[start:end]}
+	if end < len(tools) {
+		res.NextCursor = base64.StdEncoding.EncodeToString([]byte(tools[end-1].Name))
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(res))
+}
+
+// dispatchToolsCall wraps handleToolsCall with the Round 2 cancellation
+// plumbing: the call runs under its own cancellable child context, registered
+// in d.cancels under the CLIENT's request id so a notifications/cancelled can
+// abort it mid-flight (handleCancelled). When the call ends BECAUSE the client
+// cancelled it — the child context is done while the parent is not, and the
+// only holder of that child's CancelFunc besides this function is
+// handleCancelled — the reply is suppressed entirely: per the MCP cancellation
+// utility the receiver of a cancellation SHOULD NOT answer the cancelled
+// request at all, not even with an error.
+//
+// A second tools/call reusing an id that is still in flight is refused with an
+// explicit Invalid Request instead of being run: silently overwriting the
+// first call's cancels entry would misroute a later notifications/cancelled to
+// whichever call registered last, and the first call's completion would erase
+// the second's entry (found by review) — same "explicit error over silent
+// wrong behaviour" policy as IsMalformedHybrid.
+func (d *dispatcher) dispatchToolsCall(ctx context.Context, req *mcp.Message) *mcp.Message {
+	callCtx, cancel := context.WithCancel(ctx)
+	key := string(req.ID)
+	d.cancelMu.Lock()
+	if _, inFlight := d.cancels[key]; inFlight {
+		d.cancelMu.Unlock()
+		cancel() // release the never-used child context
+		return mcp.NewError(req.ID, mcp.CodeInvalidRequest,
+			"invalid request: a tools/call with this id is already in flight", nil)
+	}
+	d.cancels[key] = cancel
+	d.cancelMu.Unlock()
+
+	reply := d.handleToolsCall(callCtx, req)
+
+	d.cancelMu.Lock()
+	delete(d.cancels, key)
+	d.cancelMu.Unlock()
+	// Read the verdict BEFORE the deferred-style cancel below flips callCtx to
+	// "done" on its own: cancelled-by-client is exactly "child done, parent
+	// alive" at this point.
+	cancelledByClient := callCtx.Err() != nil && ctx.Err() == nil
+	cancel() // release the child context's resources; idempotent if already cancelled
+	if cancelledByClient {
+		d.log.Debug("tools/call cancelled by client, suppressing reply", "id", key)
+		return nil
+	}
+	return reply
+}
+
+// handleCancelled processes a client's notifications/cancelled: find the
+// in-flight tools/call the client is abandoning (by its OWN request id,
+// byte-compared raw) and cancel its context. An unknown or already-finished
+// requestId is a silent no-op — the spec explicitly allows the cancellation to
+// race the response. Malformed params are dropped the same way (a notification
+// never gets an error reply).
+func (d *dispatcher) handleCancelled(params json.RawMessage) {
+	var p mcp.CancelledParams
+	if len(params) == 0 || json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
+		d.log.Debug("ignoring malformed notifications/cancelled")
+		return
+	}
+	key := string(p.RequestID)
+	d.cancelMu.Lock()
+	cancel, ok := d.cancels[key]
+	if ok {
+		delete(d.cancels, key)
+	}
+	d.cancelMu.Unlock()
+	if !ok {
+		d.log.Debug("notifications/cancelled for unknown or finished request", "id", key)
+		return
+	}
+	d.log.Debug("cancelling in-flight tools/call on client request", "id", key, "reason", p.Reason)
+	cancel()
 }
 
 // handleToolsCall proxies a call through the registry, which resolves the owning
@@ -160,7 +438,25 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "tools/call missing tool name", nil)
 	}
 
-	resp, err := d.reg.CallTool(ctx, params.Name, params.Arguments)
+	// Lazy catalog mode (Round 8): the three gateway meta-tools are handled
+	// HERE, before Registry.CallTool ever sees the name — this ordering IS the
+	// reserved-name policy: even if some upstream tool ended up namespaced as
+	// gate_search_tools / gate_describe / gate_call, in lazy mode the
+	// gateway's meta-tool wins at the dispatcher, before routing (the shadowed
+	// upstream tool stays reachable through gate_call, which routes any name
+	// through the normal registry path). In normal mode the names are not
+	// special and route as usual. Any OTHER name falls through below, so a
+	// client that already knows a namespaced name may still call it directly
+	// even in lazy mode.
+	if d.reg.ConfigSnapshot().LazyCatalog() {
+		if reply, handled := d.handleLazyCall(ctx, req, params); handled {
+			return reply
+		}
+	}
+
+	// params.Meta (the client's `_meta`, e.g. progressToken) rides along
+	// verbatim — the registry hands it to the upstream untouched.
+	resp, err := d.reg.CallTool(ctx, params.Name, params.Arguments, params.Meta)
 	if err != nil {
 		// Routing/transport failure (unknown tool, dead upstream, timeout):
 		// surface it as a JSON-RPC error under the client's id. err.Error() is
@@ -180,19 +476,161 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 	return mcp.NewResult(req.ID, resp.Result)
 }
 
-// handleResourcesList returns an empty resource catalog. Resource aggregation
-// across upstreams is not implemented in the MVP (the registry lists but does
-// not merge resources yet) — TODO(post-MVP): aggregate and route resources the
-// way tools are, then serve them here. Returning an empty list (rather than a
-// method-not-found error) keeps well-behaved clients that probe resources happy.
-func (d *dispatcher) handleResourcesList(req *mcp.Message) *mcp.Message {
-	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceListResult{Resources: []mcp.Resource{}}))
+// handlePromptsList returns the aggregated, namespaced prompt catalog —
+// handleToolsList's prompts twin (Round 4). Each prompt's description/arguments
+// are carried through verbatim. Pagination is not needed: the registry already
+// merged every upstream's full paginated prompt list on launch.
+func (d *dispatcher) handlePromptsList(req *mcp.Message) *mcp.Message {
+	descs := d.reg.Prompts()
+	prompts := make([]mcp.Prompt, 0, len(descs))
+	for _, dd := range descs {
+		p := dd.Prompt
+		p.Name = dd.Name // client-facing namespaced name, not the upstream original
+		prompts = append(prompts, p)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.PromptsListResult{Prompts: prompts}))
 }
 
-// handleResourcesRead reports an error: with no aggregated resources (see
-// handleResourcesList), any uri the client could ask to read is unknown.
-// TODO(post-MVP): route resources/read to the owning upstream once resources
-// are aggregated.
-func (d *dispatcher) handleResourcesRead(req *mcp.Message) *mcp.Message {
-	return mcp.NewError(req.ID, mcp.CodeInvalidParams, "resources are not aggregated in this build", nil)
+// handlePromptsGet proxies a prompts/get through the registry, which resolves
+// the owning upstream and rewrites the name back to the upstream's original —
+// handleToolsCall's prompts twin (Round 4). The upstream's raw result/error is
+// forwarded to the client verbatim under the CLIENT's id; a routing/transport
+// failure surfaces as a JSON-RPC error whose text the registry already
+// sanitized (only the prompt name the client itself supplied).
+func (d *dispatcher) handlePromptsGet(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.PromptsGetParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid prompts/get params: "+err.Error(), nil)
+	}
+	if params.Name == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "prompts/get missing prompt name", nil)
+	}
+
+	resp, err := d.reg.GetPrompt(ctx, params.Name, params.Arguments)
+	if err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
+}
+
+// handleLoggingSetLevel fans the client's logging/setLevel out to every
+// logging-capable upstream via the registry (Round 3). The level VALUE is not
+// validated here — it travels verbatim, and an upstream that rejects an
+// unknown level does so with its own JSON-RPC error, Warn-logged per upstream
+// inside the registry. Per the spec the reply is an empty result; a partial
+// upstream failure does NOT fail the client's request (see Registry.
+// SetLogLevel). Only a structurally broken request — unparseable params or a
+// missing level — is answered with invalid-params: there is nothing to fan out.
+func (d *dispatcher) handleLoggingSetLevel(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.LoggingSetLevelParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid logging/setLevel params: "+err.Error(), nil)
+	}
+	if params.Level == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "logging/setLevel missing level", nil)
+	}
+	if err := d.reg.SetLogLevel(ctx, params.Level); err != nil {
+		// Unreachable today (SetLogLevel always returns nil); kept so a future
+		// aggregate-failure policy surfaces cleanly.
+		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+	}
+	return mcp.NewResult(req.ID, json.RawMessage("{}"))
+}
+
+// handleResourcesList returns the aggregated resource catalog (Round 5) —
+// handleToolsList's resources twin, except nothing is renamed: a resource URI
+// is the upstream's own identifier and travels to the client verbatim.
+// Pagination is not needed: the registry already merged every upstream's full
+// paginated resource list on launch.
+func (d *dispatcher) handleResourcesList(req *mcp.Message) *mcp.Message {
+	descs := d.reg.Resources()
+	resources := make([]mcp.Resource, 0, len(descs))
+	for _, dd := range descs {
+		resources = append(resources, dd.Resource)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceListResult{Resources: resources}))
+}
+
+// handleResourceTemplatesList returns the aggregated resource-template catalog
+// (Round 5), in the registry's merge order — the same order resources/read
+// matches templates in, so the listing tells the truth about which template
+// wins an overlap.
+func (d *dispatcher) handleResourceTemplatesList(req *mcp.Message) *mcp.Message {
+	descs := d.reg.ResourceTemplates()
+	templates := make([]mcp.ResourceTemplate, 0, len(descs))
+	for _, dd := range descs {
+		templates = append(templates, dd.Template)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ResourceTemplatesListResult{ResourceTemplates: templates}))
+}
+
+// handleResourcesRead proxies a resources/read through the registry, which
+// resolves the owning upstream by exact URI or template match and forwards the
+// URI untouched (Round 5). A URI no upstream owns is the client's mistake —
+// answered with Invalid params (ErrUnknownResource), not an internal error;
+// other failures follow handleToolsCall's sanitized-error contract.
+func (d *dispatcher) handleResourcesRead(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.ResourceReadParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid resources/read params: "+err.Error(), nil)
+	}
+	if params.URI == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "resources/read missing uri", nil)
+	}
+
+	resp, err := d.reg.ReadResource(ctx, params.URI)
+	if err != nil {
+		code := mcp.CodeInternalError
+		if errors.Is(err, registry.ErrUnknownResource) {
+			code = mcp.CodeInvalidParams
+		}
+		return mcp.NewError(req.ID, code, err.Error(), nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
+}
+
+// handleCompletionComplete proxies a completion/complete through the registry
+// (Round 5), which resolves the owning upstream from the ref — rewriting a
+// ref/prompt's name back to the upstream's original, forwarding a
+// ref/resource's URI as-is — and passes argument/context/_meta verbatim. A ref
+// naming nothing the gateway aggregates is Invalid params
+// (ErrUnknownCompletionRef); malformed or incomplete params are rejected here
+// before touching the registry.
+func (d *dispatcher) handleCompletionComplete(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.CompletionCompleteParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid completion/complete params: "+err.Error(), nil)
+	}
+	switch params.Ref.Type {
+	case mcp.CompletionRefPrompt:
+		if params.Ref.Name == "" {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "completion/complete ref/prompt missing name", nil)
+		}
+	case mcp.CompletionRefResource:
+		if params.Ref.URI == "" {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "completion/complete ref/resource missing uri", nil)
+		}
+	default:
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams,
+			"completion/complete ref.type must be ref/prompt or ref/resource", nil)
+	}
+
+	resp, err := d.reg.Complete(ctx, params)
+	if err != nil {
+		code := mcp.CodeInternalError
+		if errors.Is(err, registry.ErrUnknownCompletionRef) {
+			code = mcp.CodeInvalidParams
+		}
+		return mcp.NewError(req.ID, code, err.Error(), nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
 }

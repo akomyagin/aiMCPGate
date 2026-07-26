@@ -510,6 +510,22 @@ func TestValidateToolFilter(t *testing.T) {
 			ToolFilter{Deny: []string{"t1"}, Rename: map[string]string{"t1": "shared"}},
 			ToolFilter{Rename: map[string]string{"x": "shared"}},
 		), false},
+		{"negative max_description", mk(
+			ToolFilter{MaxDescription: -1},
+			ToolFilter{},
+		), true},
+		{"describe without allow", mk(
+			ToolFilter{Describe: map[string]string{"t1": "short text"}},
+			ToolFilter{},
+		), false},
+		{"describe key inside allow", mk(
+			ToolFilter{Allow: []string{"t1"}, Describe: map[string]string{"t1": "short text"}},
+			ToolFilter{},
+		), false},
+		{"describe key outside allow", mk(
+			ToolFilter{Allow: []string{"t1"}, Describe: map[string]string{"t2": "never applies"}},
+			ToolFilter{},
+		), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -526,16 +542,24 @@ func TestValidateToolFilter(t *testing.T) {
 // two predicates separate: filter-only reload must not relaunch the process).
 func TestSameFilter(t *testing.T) {
 	base := Upstream{Name: "x", Command: "cmd", Tools: ToolFilter{
-		Allow:  []string{"a", "b"},
-		Deny:   []string{"c"},
-		Rename: map[string]string{"a": "short_a"},
+		Allow:             []string{"a", "b"},
+		Deny:              []string{"c"},
+		Rename:            map[string]string{"a": "short_a"},
+		StripAnnotations:  true,
+		StripOutputSchema: true,
+		MaxDescription:    100,
+		Describe:          map[string]string{"a": "text"},
 	}}
 	clone := func() Upstream {
 		u := base
 		u.Tools = ToolFilter{
-			Allow:  append([]string(nil), base.Tools.Allow...),
-			Deny:   append([]string(nil), base.Tools.Deny...),
-			Rename: map[string]string{"a": "short_a"},
+			Allow:             append([]string(nil), base.Tools.Allow...),
+			Deny:              append([]string(nil), base.Tools.Deny...),
+			Rename:            map[string]string{"a": "short_a"},
+			StripAnnotations:  true,
+			StripOutputSchema: true,
+			MaxDescription:    100,
+			Describe:          map[string]string{"a": "text"},
 		}
 		return u
 	}
@@ -548,6 +572,11 @@ func TestSameFilter(t *testing.T) {
 		{"allow differs", func(u *Upstream) { u.Tools.Allow = []string{"a"} }, false},
 		{"deny differs", func(u *Upstream) { u.Tools.Deny = []string{"c", "d"} }, false},
 		{"rename differs", func(u *Upstream) { u.Tools.Rename["a"] = "other" }, false},
+		{"strip_annotations differs", func(u *Upstream) { u.Tools.StripAnnotations = false }, false},
+		{"strip_output_schema differs", func(u *Upstream) { u.Tools.StripOutputSchema = false }, false},
+		{"max_description differs", func(u *Upstream) { u.Tools.MaxDescription = 50 }, false},
+		{"describe differs", func(u *Upstream) { u.Tools.Describe["a"] = "other" }, false},
+		{"describe key added", func(u *Upstream) { u.Tools.Describe["b"] = "more" }, false},
 		{"launch fields ignored by SameFilter", func(u *Upstream) { u.Command = "other" }, true},
 	}
 	for _, tt := range tests {
@@ -575,7 +604,7 @@ func TestSameFilter(t *testing.T) {
 }
 
 // TestLoadParsesToolFilter confirms the YAML shape of the tools block
-// (allow/deny/rename) round-trips through Load.
+// (allow/deny/rename plus the projection rules) round-trips through Load.
 func TestLoadParsesToolFilter(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -589,6 +618,11 @@ upstreams:
       deny: ["delete_dashboard"]
       rename:
         query_prometheus: "grafana_query"
+      strip_annotations: true
+      strip_output_schema: true
+      max_description: 200
+      describe:
+        list_dashboards: "List Grafana dashboards."
 `
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
@@ -607,6 +641,15 @@ upstreams:
 	if f.Rename["query_prometheus"] != "grafana_query" {
 		t.Errorf("rename = %v, want query_prometheus→grafana_query", f.Rename)
 	}
+	if !f.StripAnnotations || !f.StripOutputSchema {
+		t.Errorf("strip flags = %v/%v, want true/true", f.StripAnnotations, f.StripOutputSchema)
+	}
+	if f.MaxDescription != 200 {
+		t.Errorf("max_description = %d, want 200", f.MaxDescription)
+	}
+	if f.Describe["list_dashboards"] != "List Grafana dashboards." {
+		t.Errorf("describe = %v, want list_dashboards→\"List Grafana dashboards.\"", f.Describe)
+	}
 }
 
 // TestSameLaunchHTTP checks url/headers are compared for http upstreams.
@@ -621,5 +664,53 @@ func TestSameLaunchHTTP(t *testing.T) {
 	c.Headers = map[string]string{"Authorization": "Bearer a"}
 	if !a.SameLaunch(c) {
 		t.Error("http upstreams with identical url/headers must be SameLaunch")
+	}
+}
+
+// TestValidateCatalogModeAndPageSize covers the Round 8 knobs: the three legal
+// catalog_mode spellings (unset/normal/lazy), rejection of anything else, the
+// non-negative page_size constraint, and that lazy + page_size together is a
+// VALID config (the documented precedence — lazy ignores page_size — is a
+// runtime rule in the dispatcher, not a validation error).
+func TestValidateCatalogModeAndPageSize(t *testing.T) {
+	mk := func(mode string, pageSize int) *Config {
+		return &Config{
+			Transport:   TransportStdio,
+			CatalogMode: mode,
+			PageSize:    pageSize,
+			Upstreams:   []Upstream{{Name: "a", Command: "x"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		mode    string
+		ps      int
+		wantErr bool
+	}{
+		{"unset defaults", "", 0, false},
+		{"explicit normal", CatalogModeNormal, 0, false},
+		{"lazy", CatalogModeLazy, 0, false},
+		{"page_size positive", "", 5, false},
+		{"lazy with page_size is valid (precedence is runtime, not validation)", CatalogModeLazy, 10, false},
+		{"unknown mode", "eager", 0, true},
+		{"negative page_size", "", -1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mk(tt.mode, tt.ps).Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate(catalog_mode=%q, page_size=%d) err = %v, wantErr %v", tt.mode, tt.ps, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLazyCatalogHelper pins the one place the "lazy" comparison lives.
+func TestLazyCatalogHelper(t *testing.T) {
+	if (&Config{}).LazyCatalog() || (&Config{CatalogMode: CatalogModeNormal}).LazyCatalog() {
+		t.Error("normal/unset config must not report LazyCatalog")
+	}
+	if !(&Config{CatalogMode: CatalogModeLazy}).LazyCatalog() {
+		t.Error("catalog_mode lazy must report LazyCatalog")
 	}
 }

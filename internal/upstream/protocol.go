@@ -32,6 +32,11 @@ type transport interface {
 	// process to watch) — an honest declaration of absence, not a faked
 	// channel that would never fire.
 	Done() (ch <-chan struct{}, ok bool)
+	// StderrTail reports the most recent stderr lines of a transport backed
+	// by a child process (stdio) — post-mortem material the supervisor logs
+	// when that process crashes. ok is false when there is no process and
+	// hence no stderr to tail (HTTP), mirroring Done's honest absence.
+	StderrTail() (lines []string, ok bool)
 }
 
 // Conn is a live connection to one upstream MCP server, regardless of
@@ -97,6 +102,18 @@ func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
 
 	if err := c.transport.notify(ctx, mcp.NotifInitialized, nil); err != nil {
 		return nil, fmt.Errorf("upstream %q: send initialized: %w", c.Name(), err)
+	}
+
+	// With the handshake fully complete (session id known, initialized sent),
+	// open the long-lived GET SSE stream on which a Streamable-HTTP upstream
+	// pushes server-initiated notifications (Round 13) — the HTTP counterpart
+	// of the reader goroutine StartStdio launches up front. Same type-assert
+	// rationale as setNegotiatedVersion above: stdio's reader needs no
+	// separate kick-off, so the shared interface is not widened for one
+	// transport. Idempotent — a session-expiry re-Initialize does not spawn a
+	// second stream (see startSSEStream).
+	if ht, ok := c.transport.(*httpTransport); ok {
+		ht.startSSEStream()
 	}
 	return &res, nil
 }
@@ -194,8 +211,132 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 	return resources, nil
 }
 
+// ListResourceTemplates fetches the upstream's resource-template catalog,
+// following pagination (bounded — see maxPaginationPages). Like ListResources
+// — and unlike ListPrompts — a method-not-found error is treated as an empty
+// catalog rather than a hard failure: the resources capability does not
+// promise the templates sub-method, so a resources-capable upstream is still
+// free to not recognize resources/templates/list at all.
+func (c *Conn) ListResourceTemplates(ctx context.Context) ([]mcp.ResourceTemplate, error) {
+	templates, rpcErr, err := paginate(ctx, c, mcp.MethodResourceTemplatesList,
+		func(cursor string) json.RawMessage {
+			return mcp.MustParams(mcp.ResourceTemplatesListParams{Cursor: cursor})
+		},
+		func(result json.RawMessage) ([]mcp.ResourceTemplate, string, error) {
+			var res mcp.ResourceTemplatesListResult
+			if err := json.Unmarshal(result, &res); err != nil {
+				return nil, "", err
+			}
+			return res.ResourceTemplates, res.NextCursor, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	if rpcErr != nil {
+		if rpcErr.Code == mcp.CodeMethodNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("upstream %q: resources/templates/list error: %w", c.Name(), rpcErr)
+	}
+	return templates, nil
+}
+
+// ListPrompts fetches the upstream's prompt catalog, following pagination via
+// nextCursor until exhausted (bounded — see maxPaginationPages). Unlike
+// ListResources there is no method-not-found-as-empty branch: the registry
+// calls this only for upstreams that DECLARED the prompts capability in their
+// initialize response, so a prompts/list error here is a real failure for the
+// caller to judge, never "this upstream simply has no prompts".
+func (c *Conn) ListPrompts(ctx context.Context) ([]mcp.Prompt, error) {
+	prompts, rpcErr, err := paginate(ctx, c, mcp.MethodPromptsList,
+		func(cursor string) json.RawMessage {
+			return mcp.MustParams(mcp.PromptsListParams{Cursor: cursor})
+		},
+		func(result json.RawMessage) ([]mcp.Prompt, string, error) {
+			var res mcp.PromptsListResult
+			if err := json.Unmarshal(result, &res); err != nil {
+				return nil, "", err
+			}
+			return res.Prompts, res.NextCursor, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	if rpcErr != nil {
+		return nil, fmt.Errorf("upstream %q: prompts/list error: %w", c.Name(), rpcErr)
+	}
+	return prompts, nil
+}
+
+// GetPrompt forwards a prompts/get to the upstream. name is the ORIGINAL
+// (un-namespaced) prompt name expected by the upstream — the
+// namespace→original rewrite happens in the Registry, symmetric with CallTool.
+// The response is returned verbatim (*mcp.Message): the gateway never parses
+// the prompt's description/messages.
+func (c *Conn) GetPrompt(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.PromptsGetParams{Name: name, Arguments: arguments})
+	return c.transport.call(ctx, mcp.MethodPromptsGet, params)
+}
+
+// SetLogLevel forwards a logging/setLevel to the upstream (Round 3). The level
+// string travels verbatim — validation is the upstream's job (see
+// mcp.LoggingSetLevelParams). A JSON-RPC error from the upstream (e.g. an
+// unknown level rejected) is surfaced as an error; the registry's fan-out
+// Warn-logs it per upstream instead of failing the client's request.
+func (c *Conn) SetLogLevel(ctx context.Context, level string) error {
+	resp, err := c.transport.call(ctx, mcp.MethodLoggingSetLevel, mcp.MustParams(mcp.LoggingSetLevelParams{Level: level}))
+	if err != nil {
+		return fmt.Errorf("upstream %q: logging/setLevel: %w", c.Name(), err)
+	}
+	if resp.Error != nil {
+		return fmt.Errorf("upstream %q: logging/setLevel rejected: %w", c.Name(), resp.Error)
+	}
+	return nil
+}
+
+// ReadResource forwards a resources/read to the upstream. uri is the exact
+// URI the client asked for — resources are never namespaced, so no rewrite
+// happens anywhere (the Registry only resolves which upstream OWNS the uri).
+// The response is returned verbatim (*mcp.Message): the gateway never parses
+// the resource contents.
+func (c *Conn) ReadResource(ctx context.Context, uri string) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.ResourceReadParams{URI: uri})
+	return c.transport.call(ctx, mcp.MethodResourceRead, params)
+}
+
+// Complete forwards a completion/complete to the upstream. params is the
+// ready-to-send params object — for a ref/prompt the Registry has already
+// rewritten ref.name back to the upstream's original; everything else
+// (argument, context, _meta) is the client's payload verbatim. The response
+// is returned verbatim (*mcp.Message).
+func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Message, error) {
+	return c.transport.call(ctx, mcp.MethodCompletionComplete, params)
+}
+
+// RespondUpstreamRequest writes msg — a response to a request the UPSTREAM
+// itself initiated (elicitation/create, Round 14) — into the upstream's stdin.
+// msg.ID must already be the upstream's ORIGINAL request id (the registry
+// rewrites it back from the gateway-minted client-facing id before calling).
+//
+// Only the stdio transport supports server-initiated requests today; for an
+// HTTP upstream this returns an explicit error instead of silently dropping —
+// the caller logs it and the upstream simply times out on its own answer,
+// which is the documented out-of-scope behaviour of Round 14. A type assertion
+// rather than a transport-interface method, same rationale as
+// setNegotiatedVersion above: the shared interface is not widened for the need
+// of exactly one transport.
+func (c *Conn) RespondUpstreamRequest(msg *mcp.Message) error {
+	st, ok := c.transport.(*stdioTransport)
+	if !ok {
+		return fmt.Errorf("upstream %q: responding to an upstream-initiated request is not supported for this transport", c.Name())
+	}
+	return st.respond(msg)
+}
+
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
-// (un-namespaced) tool name expected by the upstream.
+// (un-namespaced) tool name expected by the upstream. meta is the client's
+// optional `_meta` object (progressToken etc.), forwarded verbatim — nil when
+// the client sent none, so the upstream sees exactly what the client sent.
 //
 // If the transport reports an expired HTTP session (the server answered 404 to
 // a request carrying Mcp-Session-Id — per the spec it may drop a session at
@@ -204,8 +345,8 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 // means the upstream refused the request outright, so the tool was never
 // executed and cannot run twice. Exactly one retry — a second expiry in a row
 // is a genuinely broken upstream, not an expired session.
-func (c *Conn) CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
-	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments})
+func (c *Conn) CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.ToolsCallParams{Name: name, Arguments: arguments, Meta: meta})
 	resp, err := c.transport.call(ctx, mcp.MethodToolsCall, params)
 	if err != nil && errors.Is(err, errSessionExpired) {
 		// The transport already cleared the stale session id; a fresh

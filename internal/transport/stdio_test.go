@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -415,6 +416,9 @@ func TestStdioUnknownMethodReturnsMethodNotFound(t *testing.T) {
 	}
 }
 
+// TestStdioResourcesListIsEmpty: with no resource-capable upstream in the mix
+// the aggregated resources/list is an empty (but well-formed) catalog, not an
+// error — well-behaved clients that probe resources stay happy.
 func TestStdioResourcesListIsEmpty(t *testing.T) {
 	c, cancel, done := startServer(t, false)
 	defer func() { cancel(); <-done }()
@@ -429,7 +433,7 @@ func TestStdioResourcesListIsEmpty(t *testing.T) {
 		t.Fatalf("decode resources/list: %v", err)
 	}
 	if len(res.Resources) != 0 {
-		t.Errorf("resources/list should be empty in Phase 1, got %d", len(res.Resources))
+		t.Errorf("resources/list should be empty with no resource upstream, got %d", len(res.Resources))
 	}
 }
 
@@ -606,4 +610,476 @@ func keys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestStdioPingBeforeAndAfterInitialize: ping is the ONE request the spec
+// allows before the handshake completes — it must be answered with an empty
+// result both before and after initialize, never with method-not-found.
+func TestStdioPingBeforeAndAfterInitialize(t *testing.T) {
+	c, cancel, done := startServer(t, false)
+	defer func() { cancel(); <-done }()
+
+	// BEFORE initialize.
+	id := c.request(mcp.MethodPing, nil)
+	resp := c.readResponse()
+	if string(resp.ID) != string(id) {
+		t.Fatalf("ping reply id = %s, want %s", resp.ID, id)
+	}
+	if resp.Error != nil {
+		t.Fatalf("ping before initialize failed: %+v", resp.Error)
+	}
+	if string(resp.Result) != "{}" {
+		t.Errorf("ping result = %s, want {}", resp.Result)
+	}
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	// AFTER initialize.
+	id2 := c.request(mcp.MethodPing, nil)
+	resp2 := c.readResponse()
+	if string(resp2.ID) != string(id2) || resp2.Error != nil || string(resp2.Result) != "{}" {
+		t.Fatalf("ping after initialize: id=%s err=%+v result=%s", resp2.ID, resp2.Error, resp2.Result)
+	}
+}
+
+// TestStdioToolsCallForwardsMetaEndToEnd drives `_meta` through the WHOLE
+// stack — client framing → dispatcher → registry → stdio upstream process —
+// and back: the fakeserver (FAKE_ECHO) appends the _meta object it received to
+// its reply, so its presence proves verbatim delivery; a second call without
+// _meta must come back without the marker (nothing invented en route).
+func TestStdioToolsCallForwardsMetaEndToEnd(t *testing.T) {
+	c, cancel, done := startServer(t, false)
+	defer func() { cancel(); <-done }()
+
+	id := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
+		Name:      "github__search",
+		Arguments: json.RawMessage(`{"q":"golang"}`),
+		Meta:      json.RawMessage(`{"progressToken":7}`),
+	}))
+	resp := c.readResponse()
+	if string(resp.ID) != string(id) || resp.Error != nil {
+		t.Fatalf("tools/call with _meta: id=%s err=%+v", resp.ID, resp.Error)
+	}
+	if !strings.Contains(string(resp.Result), `_meta={\"progressToken\":7}`) {
+		t.Errorf("upstream did not receive the _meta object: %s", resp.Result)
+	}
+
+	c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
+		Name:      "github__search",
+		Arguments: json.RawMessage(`{"q":"golang"}`),
+	}))
+	resp = c.readResponse()
+	if resp.Error != nil {
+		t.Fatalf("tools/call without _meta: %+v", resp.Error)
+	}
+	if strings.Contains(string(resp.Result), "_meta") {
+		t.Errorf("gateway invented a _meta the client never sent: %s", resp.Result)
+	}
+}
+
+// TestStdioForwardsProgressDuringToolsCall (Round 2): an upstream emitting
+// notifications/progress mid-tools/call (FAKE_PROGRESS echoes the client's
+// progressToken) must have it forwarded to the initialized client VERBATIM —
+// same method, same params, token untouched — alongside the call's own reply.
+// Progress and reply travel independent paths (forward channel vs per-call
+// goroutine), so no relative order between them is asserted.
+func TestStdioForwardsProgressDuringToolsCall(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_NAME":     "web",
+			"FAKE_TOOLS":    "fetch",
+			"FAKE_ECHO":     "1",
+			"FAKE_PROGRESS": "1",
+		}},
+	}}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	callID := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
+		Name: "web__fetch",
+		Meta: json.RawMessage(`{"progressToken":42}`),
+	}))
+
+	var gotProgress, gotReply bool
+	for i := 0; i < 2; i++ {
+		msg := c.readResponse()
+		switch {
+		case msg.IsNotification() && msg.Method == mcp.NotifProgress:
+			gotProgress = true
+			if !strings.Contains(string(msg.Params), `"progressToken":42`) {
+				t.Errorf("progress params = %s, want the client's token 42 verbatim", msg.Params)
+			}
+		case string(msg.ID) == string(callID):
+			gotReply = true
+			if msg.Error != nil {
+				t.Errorf("tools/call error: %v", msg.Error)
+			}
+		default:
+			t.Fatalf("unexpected message: method=%q id=%s", msg.Method, msg.ID)
+		}
+	}
+	if !gotProgress || !gotReply {
+		t.Fatalf("gotProgress=%v gotReply=%v, want both", gotProgress, gotReply)
+	}
+}
+
+// TestStdioDropsProgressBeforeInitialize (Round 2): a progress notification
+// arriving BEFORE the client's initialize is dropped, not parked — unlike a
+// list_changed there is nothing durable to defer (progress is only meaningful
+// against an in-flight client call, impossible pre-handshake). After
+// initialize the path works normally.
+func TestStdioDropsProgressBeforeInitialize(t *testing.T) {
+	bin := buildFakeServer(t)
+	progressFile := filepath.Join(t.TempDir(), "progress-trigger")
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{
+			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":         "fetch",
+				"FAKE_PROGRESS_FILE": progressFile,
+			}},
+		},
+	}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	// Single long-lived reader (same pattern as
+	// TestStdioNoListChangedBeforeInitialize): "no message" waits must not
+	// leave a competing Read stealing later frames.
+	msgs := make(chan *mcp.Message, 8)
+	go func() {
+		for {
+			m, err := c.fromSrv.Read()
+			if err != nil {
+				return // pipe closed on teardown
+			}
+			msgs <- m
+		}
+	}()
+
+	trigger := func() {
+		if err := os.WriteFile(progressFile, []byte("go"), 0o600); err != nil {
+			t.Fatalf("touch progress trigger: %v", err)
+		}
+	}
+
+	// Fire a progress push before initialize: nothing may reach the client.
+	trigger()
+	select {
+	case m := <-msgs:
+		t.Fatalf("server pushed a message before initialize: method=%q", m.Method)
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	// Initialize. The response comes, and the dropped progress must NOT be
+	// flushed after it (drop, not park).
+	id := c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	select {
+	case first := <-msgs:
+		if string(first.ID) != string(id) {
+			t.Fatalf("first message id = %s, want initialize id %s", first.ID, id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no initialize response within deadline")
+	}
+	select {
+	case m := <-msgs:
+		t.Fatalf("pre-initialize progress was parked and flushed (%q), want dropped", m.Method)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// After initialize the same trigger must reach the client.
+	trigger()
+	select {
+	case m := <-msgs:
+		if !m.IsNotification() || m.Method != mcp.NotifProgress {
+			t.Fatalf("got %q, want notifications/progress", m.Method)
+		}
+		if !strings.Contains(string(m.Params), "fake-token") {
+			t.Errorf("progress params = %s, want the fake server's token verbatim", m.Params)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("progress after initialize never arrived")
+	}
+}
+
+// TestStdioConcurrentToolsCallsDoNotBlock (Round 2): tools/call dispatches on
+// a goroutine per request, so a hung call against one upstream must not delay
+// the reply of a fast call against another — the fast reply arrives while the
+// slow call is still sleeping.
+func TestStdioConcurrentToolsCallsDoNotBlock(t *testing.T) {
+	bin := buildFakeServer(t)
+	const slowDelay = 3 * time.Second
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_NAME":       "slow",
+			"FAKE_TOOLS":      "hang",
+			"FAKE_CALL_DELAY": slowDelay.String(),
+		}},
+		{Name: "fast", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_NAME":  "fast",
+			"FAKE_TOOLS": "quick",
+			"FAKE_ECHO":  "1",
+		}},
+	}}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	start := time.Now()
+	c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "slow__hang"}))
+	fastID := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "fast__quick"}))
+
+	// The FIRST reply on the wire must be the fast call's, well before the
+	// slow upstream's delay elapses.
+	resp := c.readResponse()
+	elapsed := time.Since(start)
+	if string(resp.ID) != string(fastID) {
+		t.Fatalf("first reply id = %s, want the fast call's %s (blocked behind the slow one?)", resp.ID, fastID)
+	}
+	if resp.Error != nil {
+		t.Fatalf("fast call error: %v", resp.Error)
+	}
+	if elapsed >= slowDelay {
+		t.Fatalf("fast reply took %v — serialized behind the %v slow call", elapsed, slowDelay)
+	}
+}
+
+// TestStdioCancelledAbortsInFlightCall (Round 2): a notifications/cancelled
+// from the client mid-tools/call must (a) be READ at all while the call is
+// running (the loop no longer blocks on dispatch), (b) cancel the forwarded
+// call's context — observable as the gateway's own notifications/cancelled
+// reaching the upstream (FAKE_CANCEL_FILE) long before the upstream's delay
+// elapses — and (c) leave the cancelled request UNANSWERED, per the spec's
+// cancellation semantics (silence, not an error reply), while the connection
+// keeps serving (ping answered).
+func TestStdioCancelledAbortsInFlightCall(t *testing.T) {
+	bin := buildFakeServer(t)
+	cancelFile := filepath.Join(t.TempDir(), "cancelled.jsonl")
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_NAME":        "slow",
+			"FAKE_TOOLS":       "hang",
+			"FAKE_CALL_DELAY":  "30s",
+			"FAKE_ASYNC_CALLS": "1", // keep reading stdin while the call sleeps
+			"FAKE_CANCEL_FILE": cancelFile,
+		}},
+	}}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	// Single long-lived reader so the "no reply arrives" waits below cannot
+	// strand a blocked Read that would steal later frames.
+	msgs := make(chan *mcp.Message, 8)
+	go func() {
+		for {
+			m, err := c.fromSrv.Read()
+			if err != nil {
+				return
+			}
+			msgs <- m
+		}
+	}()
+
+	callID := c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "slow__hang"}))
+	// Let the per-call goroutine register its CancelFunc and reach the
+	// upstream before the cancellation lands.
+	time.Sleep(300 * time.Millisecond)
+	c.notify(mcp.NotifCancelled, mcp.MustParams(mcp.CancelledParams{
+		RequestID: callID,
+		Reason:    "user changed their mind",
+	}))
+
+	// (b) The upstream receives the gateway's own notifications/cancelled
+	// promptly — proof the forwarded call's context really was cancelled (the
+	// upstream-side notify fires only from the ctx.Done branch of a sent call).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, _ := os.ReadFile(cancelFile)
+		if strings.TrimSpace(string(data)) != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("upstream never saw a cancellation — the client's notifications/cancelled did not abort the call")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// (c) The connection still serves: ping answered while nothing else is on
+	// the wire...
+	pingID := c.request(mcp.MethodPing, nil)
+	select {
+	case m := <-msgs:
+		if string(m.ID) != string(pingID) {
+			t.Fatalf("got message id=%s method=%q, want the ping reply %s (cancelled call must stay unanswered)",
+				m.ID, m.Method, pingID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ping after cancellation never answered")
+	}
+	// ...and the cancelled call gets NO reply at all — not even an error.
+	select {
+	case m := <-msgs:
+		t.Fatalf("cancelled call produced a reply: id=%s method=%q err=%+v", m.ID, m.Method, m.Error)
+	case <-time.After(1 * time.Second):
+	}
+}
+
+// TestStdioInitializeAggregatesInstructions: each upstream's initialize
+// instructions must surface in the GATEWAY's own InitializeResult.Instructions
+// as sorted "## <upstream>" sections, upstreams without instructions skipped.
+func TestStdioInitializeAggregatesInstructions(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "zeta", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_TOOLS": "z", "FAKE_INSTRUCTIONS": "Zeta usage notes.",
+		}},
+		{Name: "alpha", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_TOOLS": "a", "FAKE_INSTRUCTIONS": "Alpha usage notes.",
+		}},
+		{Name: "quiet", Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_TOOLS": "q",
+		}},
+	}}
+	c, cancel, done := startServerWithConfig(t, cfg, nil)
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	resp := c.readResponse()
+	if resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+	var res mcp.InitializeResult
+	if err := json.Unmarshal(resp.Result, &res); err != nil {
+		t.Fatalf("decode initialize result: %v", err)
+	}
+	want := "## alpha\nAlpha usage notes.\n\n## zeta\nZeta usage notes."
+	if res.Instructions != want {
+		t.Errorf("instructions = %q, want %q", res.Instructions, want)
+	}
+}
+
+// TestStdioCallLogRecordsClient: after an initialize carrying clientInfo,
+// every audited tools/call must record the client as "name/version"
+// (CallRecord.Client) — the transport wraps the dispatch context once and the
+// registry's audit picks it up.
+func TestStdioCallLogRecordsClient(t *testing.T) {
+	var logBuf bytes.Buffer
+	c, cancel, done := startServerWithConfig(t, oneUpstreamConfig(t), logging.NewCallLogWriter(&logBuf))
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__fetch"}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("tools/call error: %v", resp.Error)
+	}
+	if !strings.Contains(logBuf.String(), `"client":"test-client/9.9.9"`) {
+		t.Errorf("call log missing client identity:\n%s", logBuf.String())
+	}
+}
+
+// TestStdioCallLogClientEmptyWithoutClientInfo: an initialize whose clientInfo
+// is empty leaves the audit records without a client field — the gateway
+// records only what the client actually declared.
+func TestStdioCallLogClientEmptyWithoutClientInfo(t *testing.T) {
+	var logBuf bytes.Buffer
+	c, cancel, done := startServerWithConfig(t, oneUpstreamConfig(t), logging.NewCallLogWriter(&logBuf))
+	defer func() { cancel(); <-done }()
+
+	c.request(mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+	}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("initialize error: %v", resp.Error)
+	}
+
+	c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__fetch"}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("tools/call error: %v", resp.Error)
+	}
+	if strings.Contains(logBuf.String(), `"client"`) {
+		t.Errorf("call log carries a client field despite empty clientInfo:\n%s", logBuf.String())
+	}
+}
+
+// TestStdioMalformedInitializeParamsStillSucceeds: initialize params the
+// gateway cannot decode (here: an array) must NOT fail the handshake — the
+// gateway needs nothing from them to answer; the client merely stays
+// unidentified. The connection keeps working afterwards.
+func TestStdioMalformedInitializeParamsStillSucceeds(t *testing.T) {
+	c, cancel, done := startServerWithConfig(t, oneUpstreamConfig(t), nil)
+	defer func() { cancel(); <-done }()
+
+	id := c.request(mcp.MethodInitialize, json.RawMessage(`[42]`))
+	resp := c.readResponse()
+	if string(resp.ID) != string(id) {
+		t.Fatalf("initialize reply id = %s, want %s", resp.ID, id)
+	}
+	if resp.Error != nil {
+		t.Fatalf("malformed initialize params broke the handshake: %+v", resp.Error)
+	}
+	var res mcp.InitializeResult
+	if err := json.Unmarshal(resp.Result, &res); err != nil {
+		t.Fatalf("decode initialize result: %v", err)
+	}
+	if res.ServerInfo.Name != "aiMCPGate" {
+		t.Errorf("serverInfo.name = %q, want aiMCPGate", res.ServerInfo.Name)
+	}
+
+	// The session is fully usable after the odd handshake.
+	c.request(mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__fetch"}))
+	if resp := c.readResponse(); resp.Error != nil {
+		t.Fatalf("tools/call after malformed initialize: %+v", resp.Error)
+	}
 }

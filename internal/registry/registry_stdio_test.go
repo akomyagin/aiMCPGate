@@ -63,7 +63,7 @@ func TestRegistryStartDoesNotKillUpstreamsAfterReturning(t *testing.T) {
 
 	callCtx, cancelCall := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelCall()
-	msg, err := r.CallTool(callCtx, "echoer__ping", []byte(`{"x":1}`))
+	msg, err := r.CallTool(callCtx, "echoer__ping", []byte(`{"x":1}`), nil)
 	if err != nil {
 		t.Fatalf("CallTool after Start returned: %v (upstream was killed prematurely)", err)
 	}

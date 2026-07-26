@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -83,7 +84,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 	defer r.Close()
 
 	// First call succeeds, then the child exits (FAKE_EXIT_AFTER=1).
-	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{"x":1}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{"x":1}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 
@@ -172,7 +173,7 @@ func TestSupervisorReapsCrashedProcess(t *testing.T) {
 
 	// Trigger the crash (fakeserver exits after answering, FAKE_EXIT_AFTER=1)
 	// and wait for the supervisor to relaunch it.
-	if _, err := r.CallTool(context.Background(), "crasher__ping", nil); err != nil {
+	if _, err := r.CallTool(context.Background(), "crasher__ping", nil, nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 	waitForTool(t, r, "crasher__ping", 5*time.Second)
@@ -192,7 +193,7 @@ func callSucceedsWithin(r *Registry, ns string, within time.Duration) bool {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, err := r.CallTool(ctx, ns, []byte(`{}`))
+		_, err := r.CallTool(ctx, ns, []byte(`{}`), nil)
 		cancel()
 		if err == nil {
 			return true
@@ -246,7 +247,7 @@ func TestSupervisorGivesUpAndDrops(t *testing.T) {
 	if err := os.Remove(bin); err != nil {
 		t.Fatalf("remove binary: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "doomed__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "doomed__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 
@@ -276,7 +277,7 @@ func TestSupervisorDisabled(t *testing.T) {
 	}
 	defer r.Close()
 
-	if _, err := r.CallTool(context.Background(), "solo__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "solo__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("first CallTool: %v", err)
 	}
 	// The child has now exited. With restart disabled it never comes back, so a
@@ -312,7 +313,7 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "flapper__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "flapper__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
 	// Let a couple of restart cycles happen so the supervisor is genuinely busy.
@@ -398,7 +399,7 @@ func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
 		t.Fatalf("connB.ListTools: %v", err)
 	}
 	r.mu.Lock()
-	r.installLocked("up", connB, toolsB, "test: fresh conn installed")
+	r.installLocked("up", connB, toolsB, nil, nil, "test: fresh conn installed")
 	r.mu.Unlock()
 	if !hasTool(r, "up__b") {
 		t.Fatal("precondition: up__b not in catalog after installing the fresh conn")
@@ -525,4 +526,78 @@ func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("subscriber not signalled after upstream list_changed re-list")
 	}
+}
+
+// syncLogBuffer is a mutex-guarded log sink: the supervisor goroutine writes
+// while the test polls the contents, which the plain bytes.Buffer does not
+// tolerate under -race.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestSupervisorLogsStderrTailOnCrash: when a stdio upstream genuinely crashes,
+// the supervisor must surface the process's last stderr lines (the ring buffer
+// StderrTail exposes) in one Warn block — WITHOUT debug logging: the logger
+// here runs at the default info level, exactly like production. The fake
+// server prints its dying words to stderr right before its FAKE_EXIT_AFTER
+// crash-exit; after the auto-restart completes, the crash post-mortem must be
+// in the operational log.
+func TestSupervisorLogsStderrTailOnCrash(t *testing.T) {
+	bin := buildFakeServer(t)
+	const dyingWords = "fatal: connection to mothership lost"
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			MaxAttempts:    5,
+		},
+		Upstreams: []config.Upstream{
+			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":        "ping",
+				"FAKE_ECHO":         "1",
+				"FAKE_EXIT_AFTER":   "1",
+				"FAKE_CRASH_STDERR": dyingWords,
+			}},
+		},
+	}
+	logBuf := &syncLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, nil)) // info level: no debug
+	r := New(cfg, logger, nil, noopPayloadLog(), true, "0.0.0-test")
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	// Trigger the crash, then poll the log until the supervisor's crash branch
+	// has run. (The catalog entry never disappears during a crash-restart, so
+	// waiting on the catalog would not synchronize with anything — the log
+	// lines themselves are the observable under test.)
+	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{}`), nil); err != nil {
+		t.Fatalf("first CallTool: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var logs string
+	for time.Now().Before(deadline) {
+		logs = logBuf.String()
+		if strings.Contains(logs, "stdio upstream stderr before exit") && strings.Contains(logs, dyingWords) {
+			return // both the Warn block and the dying words made it: pass.
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("supervisor never logged the crashed process's stderr tail (want the %q Warn block with %q); log:\n%s",
+		"stdio upstream stderr before exit", dyingWords, logs)
 }

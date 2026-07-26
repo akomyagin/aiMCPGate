@@ -157,7 +157,12 @@ kill -HUP $(pgrep -f 'mcp-gate serve')
 удалённые (или переведённые в `enabled: false`) — останавливаются, upstream с
 изменёнными полями запуска (`command`/`args`/`url`/`env`/`headers`) —
 перезапускаются, а те, у которых поменялся только фильтр инструментов
-`allow`/`deny`/`rename`, — перепроецируются вообще без перезапуска.
+(`allow`/`deny`/`rename` или правила проекции каталога
+`strip_annotations`/`strip_output_schema`/`max_description`/`describe`), —
+перепроецируются вообще без перезапуска. Лимиты вызовов (`rate_limit`,
+`max_concurrent`, `max_result_bytes`, `call_timeout` — глобальные или
+per-upstream) тоже применяются на лету: они никогда не требуют перезапуска
+upstream, следующий вызов просто использует новые значения.
 Неизменённые upstream продолжают работать нетронутыми. Ошибочная правка
 (битый YAML, непройденная валидация) логируется и игнорируется — продолжает
 действовать текущий конфиг, так что опечатка никогда не уронит шлюз.
@@ -193,6 +198,10 @@ transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
 listen_addr: "127.0.0.1:28080"  # только для transport: http; по умолчанию loopback
 # auth_token: ${AIMCPGATE_TOKEN}  # обязателен, если listen_addr шире loopback
 log_file: ./logs/calls.jsonl
+# Необязательные глобальные лимиты вызовов (каждый можно переопределить per-upstream):
+# rate_limit: { rps: 5, burst: 2 }  # token bucket на upstream для tools/call
+# max_result_bytes: 65536           # усечение огромных текстовых результатов (0 = выкл)
+# call_timeout: 30s                 # таймаут одного запроса к upstream
 upstreams:
   - name: filesystem        # stdio-upstream
     command: npx
@@ -203,6 +212,11 @@ upstreams:
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}   # из окружения, не хардкод
     enabled: true
+    # Необязательные per-upstream лимиты (переопределяют глобальные для этого upstream):
+    # rate_limit: { rps: 1, burst: 1 }  # rps: 0 отключает глобальный лимит здесь
+    # max_concurrent: 4                 # потолок одновременных вызовов
+    # max_result_bytes: 32768           # 0 отключает глобальный лимит здесь
+    # call_timeout: 120s                # медленному upstream — больше времени
   - name: remote            # http-upstream (Фаза 2)
     url: https://mcp.example.com/mcp
     headers:

@@ -41,6 +41,12 @@ var ErrConnClosedBeforeSend = fmt.Errorf("%w: request was not sent to upstream",
 // upstream that keeps stdout open must not hang gateway shutdown forever.
 const closeGracePeriod = 5 * time.Second
 
+// stderrRingSize is how many of the child's most recent stderr lines are kept
+// in memory for post-mortem diagnostics: when the process crashes, the
+// registry's supervisor logs this tail (StderrTail) so the operator sees WHY
+// it died without re-running the gateway at debug level.
+const stderrRingSize = 50
+
 // killWaitTimeout bounds how long Close waits, AFTER force-killing the child,
 // for the reader goroutines to see EOF on stdout/stderr. Kill only reaches the
 // direct child: a grandchild (e.g. `sh -c 'helper & exec server'`) may have
@@ -77,6 +83,15 @@ type stdioTransport struct {
 	done       chan struct{} // closed when the reader goroutine exits
 	stderrDone chan struct{} // closed when the stderr-draining goroutine exits
 
+	// stderrRing keeps the child's last stderrRingSize stderr lines as a ring:
+	// stderrRingN counts every line ever appended, so the write slot is always
+	// stderrRingN % stderrRingSize — no per-line reslicing or reallocation.
+	// drainStderr fills it REGARDLESS of log level (the whole point: the tail
+	// must exist even when debug logging is off); StderrTail snapshots it.
+	stderrRingMu sync.Mutex
+	stderrRing   [stderrRingSize]string
+	stderrRingN  int
+
 	// closeOnce guards the actual teardown so Close is safe for CONCURRENT
 	// calls, not just repeated sequential ones: Stage 7 introduced the first
 	// callers that can race to close the same connection (the auto-restart
@@ -88,13 +103,23 @@ type stdioTransport struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// onNotify, when set, is invoked by readLoop for each notification method
-	// received from the upstream (e.g. notifications/tools/list_changed). The
-	// registry sets it to react to a catalog change (Stage 7b). It is set once,
+	// onNotify, when set, is invoked by readLoop for each notification received
+	// from the upstream (e.g. notifications/tools/list_changed) with the method
+	// AND its raw params — Round 2 needs the params to forward a
+	// notifications/progress verbatim; list_changed handling ignores them. The
+	// registry sets it to react to these (Stage 7b, Round 2). It is set once,
 	// inside StartStdio, before the reader goroutine starts — hence no lock
 	// needed. (It used to be set post-factum via a setter, which raced an
 	// upstream notifying immediately on startup — found by independent review.)
-	onNotify func(method string)
+	onNotify func(method string, params json.RawMessage)
+
+	// onElicit, when set, is invoked by readLoop for an elicitation/create
+	// REQUEST received from the upstream — its original id plus raw params
+	// (Round 14). The registry sets it to proxy the request to the gateway's
+	// own client. Same contract as onNotify: set once in StartStdio before the
+	// reader goroutine starts (no lock needed), must not block or call back
+	// into the connection synchronously.
+	onElicit func(id json.RawMessage, params json.RawMessage)
 }
 
 // Name returns the upstream's stable identifier.
@@ -116,13 +141,18 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 // version, reported to the upstream as clientInfo.version in the handshake.
 //
 // onNotify, when non-nil, is invoked (from the reader goroutine) for each
-// notification the upstream sends. It must be passed here — not installed
-// after the fact — because the reader goroutine starts before StartStdio
-// returns, and an upstream may notify immediately; the field is written into
-// the struct literal before that goroutine exists, so no lock is needed. The
-// callback must not block or call back into the connection synchronously
-// (Stage 7b).
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string)) (*Conn, error) {
+// notification the upstream sends, with the method and raw params. It must be
+// passed here — not installed after the fact — because the reader goroutine
+// starts before StartStdio returns, and an upstream may notify immediately;
+// the field is written into the struct literal before that goroutine exists,
+// so no lock is needed. The callback must not block or call back into the
+// connection synchronously (Stage 7b).
+//
+// onElicit, when non-nil, is invoked (from the same reader goroutine, same
+// contract) for each elicitation/create REQUEST the upstream sends mid-call
+// (Round 14), with the upstream's original id and raw params. nil means such
+// requests are ignored, the pre-Round 14 behaviour.
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string, params json.RawMessage), onElicit func(id json.RawMessage, params json.RawMessage)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -161,6 +191,7 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 		done:       make(chan struct{}),
 		stderrDone: make(chan struct{}),
 		onNotify:   onNotify, // must be set before go t.readLoop() below
+		onElicit:   onElicit, // same rule: the reader may see an elicit request immediately
 	}
 
 	go t.readLoop()
@@ -203,11 +234,19 @@ func (c *stdioTransport) readLoop() {
 			// non-blocking — it runs on this single reader goroutine — so the
 			// registry only kicks a debounce timer here, never re-lists inline.
 			if c.onNotify != nil {
-				c.onNotify(msg.Method)
+				c.onNotify(msg.Method, msg.Params)
 			}
 		default:
-			// A request FROM an upstream (e.g. sampling) — not handled in MVP.
-			c.log.Debug("upstream request ignored", "upstream", c.name, "method", msg.Method)
+			// A request FROM an upstream. Only elicitation/create is proxied
+			// through to the gateway's client (Round 14); every other
+			// server-initiated request (sampling, roots, unknown) keeps the
+			// old log-and-ignore behaviour — the round's scope is deliberately
+			// limited to elicitation.
+			if msg.Method == mcp.MethodElicitationCreate && c.onElicit != nil {
+				c.onElicit(msg.ID, msg.Params)
+			} else {
+				c.log.Debug("upstream request ignored", "upstream", c.name, "method", msg.Method)
+			}
 		}
 	}
 }
@@ -222,21 +261,22 @@ func (c *stdioTransport) readLoop() {
 // have completed" (found by code review; done alone only tracked stdout).
 func (c *stdioTransport) drainStderr() {
 	defer close(c.stderrDone)
-	// With debug logging off, every scanned line would allocate (sc.Text) and
-	// box its slog arguments only for the handler to discard them immediately.
-	// Check the level ONCE and, when debug is disabled, keep the pipe drained
-	// without any per-line work — the child must never block on a full 64KiB
-	// OS pipe buffer either way. context.Background() because slog.Logger.
-	// Enabled only consults the handler's level; there is no per-call context
-	// on this goroutine.
-	if !c.log.Enabled(context.Background(), slog.LevelDebug) {
-		_, _ = io.Copy(io.Discard, c.stderr)
-		return
-	}
+	// Every line goes into the stderr ring (StderrTail) REGARDLESS of log
+	// level — the crash tail must exist even when debug logging is off — so
+	// the scanner always runs and the old "io.Copy straight to Discard when
+	// debug is disabled" fast path is gone by design. The slog side is still
+	// debug-only: check the level ONCE, not per line. context.Background()
+	// because slog.Logger.Enabled only consults the handler's level; there is
+	// no per-call context on this goroutine.
+	debug := c.log.Enabled(context.Background(), slog.LevelDebug)
 	sc := bufio.NewScanner(c.stderr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
-		c.log.Debug("upstream stderr", "upstream", c.name, "line", sc.Text())
+		line := sc.Text()
+		c.appendStderrLine(line)
+		if debug {
+			c.log.Debug("upstream stderr", "upstream", c.name, "line", line)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		// The scanner gave up (e.g. a single line exceeded its 1MiB limit) but
@@ -247,6 +287,35 @@ func (c *stdioTransport) drainStderr() {
 			"upstream", c.name, "err", err)
 		_, _ = io.Copy(io.Discard, c.stderr)
 	}
+}
+
+// appendStderrLine records one stderr line into the fixed-size ring,
+// overwriting the oldest entry once the ring is full.
+func (c *stdioTransport) appendStderrLine(line string) {
+	c.stderrRingMu.Lock()
+	c.stderrRing[c.stderrRingN%stderrRingSize] = line
+	c.stderrRingN++
+	c.stderrRingMu.Unlock()
+}
+
+// StderrTail returns a snapshot (copy) of the child's most recent stderr
+// lines, oldest first — at most stderrRingSize of them. ok is always true for
+// a stdio upstream: it has a real process with a real stderr, even if that
+// process wrote nothing (empty tail). The registry's supervisor calls this on
+// a crashed connection AFTER Close (which waits for the drain goroutine), so
+// the snapshot it logs is complete.
+func (c *stdioTransport) StderrTail() ([]string, bool) {
+	c.stderrRingMu.Lock()
+	defer c.stderrRingMu.Unlock()
+	n := c.stderrRingN
+	if n > stderrRingSize {
+		n = stderrRingSize
+	}
+	out := make([]string, 0, n)
+	for i := c.stderrRingN - n; i < c.stderrRingN; i++ {
+		out = append(out, c.stderrRing[i%stderrRingSize])
+	}
+	return out, true
 }
 
 // deliver routes a response to its waiter (if any) by its id.
@@ -335,6 +404,18 @@ func (c *stdioTransport) call(ctx context.Context, method string, params json.Ra
 		c.mu.Lock()
 		delete(c.waiters, key)
 		c.mu.Unlock()
+		// The request IS on the wire (the write above succeeded) and its caller
+		// just gave up — tell the upstream so it can stop the work, per the MCP
+		// cancellation utility (Round 2). Best-effort AND fire-and-forget: the
+		// id is the upstream-side one this call minted (never the client's),
+		// and notify is a plain pipe write that can block on a stuck child, so
+		// it runs on its own goroutine — returning ctx.Err() promptly must not
+		// wait on it. A failed/lost notification is fine: the spec allows the
+		// race where the upstream finished (or died) meanwhile.
+		go func() {
+			_ = c.notify(context.Background(), mcp.NotifCancelled,
+				mcp.MustParams(mcp.CancelledParams{RequestID: id}))
+		}()
 		return nil, ctx.Err()
 	case msg, ok := <-ch:
 		if !ok {
@@ -342,6 +423,20 @@ func (c *stdioTransport) call(ctx context.Context, method string, params json.Ra
 		}
 		return msg, nil
 	}
+}
+
+// respond writes a RESPONSE to a request the upstream itself initiated
+// (elicitation/create, Round 14). Unlike call it mints no id and waits for
+// nothing — msg must already carry the upstream's ORIGINAL request id. The
+// write shares mcp.Writer's mutex with call/notify, so concurrent use is safe.
+func (c *stdioTransport) respond(msg *mcp.Message) error {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return ErrConnClosed
+	}
+	return c.w.Write(msg)
 }
 
 // notify sends a one-way notification (no id, no response expected). ctx is

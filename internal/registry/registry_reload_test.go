@@ -137,7 +137,7 @@ func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 		t.Fatal("unchanged upstream keep__k disappeared across reload")
 	}
 	// keep must still be callable (was never torn down).
-	if _, err := r.CallTool(context.Background(), "keep__k", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "keep__k", []byte(`{}`), nil); err != nil {
 		t.Fatalf("unchanged upstream not callable after reload: %v", err)
 	}
 }
@@ -307,7 +307,7 @@ func TestReloadRemovedUpstreamNotResurrectedByRestart(t *testing.T) {
 	// Crash the upstream (FAKE_EXIT_AFTER=1): its supervisor notices the exit,
 	// passes the 5ms backoff and enters launch(), where the relaunched child
 	// holds initialize for 500ms.
-	if _, err := r.CallTool(context.Background(), "gone__g", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "gone__g", []byte(`{}`), nil); err != nil {
 		t.Fatalf("crashing CallTool: %v", err)
 	}
 	// Give the supervisor time to get INTO launch() (crash detection + 5ms
@@ -378,7 +378,7 @@ func TestReloadChangedUpstreamNotDoubledByRestart(t *testing.T) {
 
 	// Crash the old instance: its supervisor passes the 5ms backoff and blocks
 	// inside launch() (old env → 500ms initialize stall).
-	if _, err := r.CallTool(context.Background(), "svc__old", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "svc__old", []byte(`{}`), nil); err != nil {
 		t.Fatalf("crashing CallTool: %v", err)
 	}
 	// Land the reload while that launch() is still in flight: 100ms is far past
@@ -479,7 +479,7 @@ func TestReloadUpdatesRestartPolicyForUnchangedUpstream(t *testing.T) {
 	if err := os.Remove(bin); err != nil {
 		t.Fatalf("remove binary: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "phoenix__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "phoenix__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("crashing CallTool: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -710,7 +710,7 @@ func TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch(t *testing.T) 
 	// Mid-reload client semantics: the dropped entry yields "unknown tool" —
 	// NOT a transport failure against the closed old connection, which is what
 	// a lingering entry would produce.
-	if _, err := r.CallTool(context.Background(), "svc__old", []byte(`{}`)); err == nil {
+	if _, err := r.CallTool(context.Background(), "svc__old", []byte(`{}`), nil); err == nil {
 		t.Fatal("CallTool(svc__old) succeeded mid-reload, want unknown-tool error")
 	} else if !strings.Contains(err.Error(), "unknown tool") {
 		t.Fatalf("CallTool(svc__old) mid-reload = %q, want an unknown-tool error, not a transport error", err)
@@ -1027,7 +1027,7 @@ func TestReloadDisablesRunningSupervisor(t *testing.T) {
 	if err := os.Remove(bin); err != nil {
 		t.Fatalf("remove binary: %v", err)
 	}
-	if _, err := r.CallTool(context.Background(), "mayfly__ping", []byte(`{}`)); err != nil {
+	if _, err := r.CallTool(context.Background(), "mayfly__ping", []byte(`{}`), nil); err != nil {
 		t.Fatalf("crashing CallTool: %v", err)
 	}
 	// Let it genuinely loop through a few failed attempts before the reload.
@@ -1068,7 +1068,7 @@ func TestReloadDisablesRunningSupervisor(t *testing.T) {
 	if hasTool(r, "mayfly__ping") {
 		t.Fatal("upstream still in catalog after reload disabled auto-restart mid-backoff — want it dropped")
 	}
-	if _, err := r.CallTool(context.Background(), "mayfly__ping", []byte(`{}`)); err == nil {
+	if _, err := r.CallTool(context.Background(), "mayfly__ping", []byte(`{}`), nil); err == nil {
 		t.Fatal("upstream recovered after reload disabled auto-restart — supervisor ignored Enabled=false")
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +53,18 @@ var ErrNotStarted = errors.New("registry: reload before start completed")
 // let the process exit.
 var ErrClosing = errors.New("registry: reload during shutdown")
 
+// ErrUnknownResource is wrapped by ReadResource when no upstream owns the
+// requested uri — neither an exact catalog entry nor a template match. The
+// dispatcher checks it with errors.Is to answer -32602 Invalid params (a bad
+// argument from the client) instead of the generic internal error a transport
+// failure gets.
+var ErrUnknownResource = errors.New("unknown resource")
+
+// ErrUnknownCompletionRef is wrapped by Complete when the referenced prompt or
+// resource resolves to no upstream — same -32602 contract as
+// ErrUnknownResource, for completion/complete.
+var ErrUnknownCompletionRef = errors.New("unknown completion ref")
+
 // phase is the registry's lifecycle position, guarded by lifecycleMu. It gates
 // Reload so it can only run between a completed Start and the beginning of
 // Close (see ErrNotStarted / ErrClosing).
@@ -74,7 +87,48 @@ type ToolDescriptor struct {
 	Tool     mcp.Tool
 }
 
-// route maps a namespaced tool name back to its upstream and original name.
+// PromptDescriptor is one aggregated prompt entry in the merged catalog
+// (Round 4) — ToolDescriptor's prompts twin. Name is the client-facing
+// namespaced name; unlike tools, prompts do NOT pass through config.ToolFilter
+// (no allow/deny/rename mechanism exists for them in this round), so Name is
+// always "<upstream>__<original>", without exception. The prompt itself
+// (Description/Arguments) is carried verbatim from the upstream.
+type PromptDescriptor struct {
+	Name     string
+	Upstream string
+	Prompt   mcp.Prompt
+}
+
+// ResourceDescriptor is one aggregated resource entry in the merged catalog
+// (Round 5). Unlike tools and prompts, resources are addressed by URI and are
+// NOT namespaced — the client-facing URI is the upstream's own, verbatim; the
+// registry only records which upstream OWNS it (keep-first on a cross-upstream
+// URI collision), so resources/read can be routed without any rewrite.
+type ResourceDescriptor struct {
+	URI      string
+	Upstream string
+	Resource mcp.Resource
+}
+
+// ResourceTemplateDescriptor is one aggregated resource-template entry
+// (Round 5). Templates are MATCHED against a concrete URI, never resolved by
+// exact lookup, so they live in an ordered slice, not a map: two upstreams may
+// legitimately advertise overlapping (even identical) templates, and
+// resolveResourceOwner picks the FIRST match in merge order — deterministic,
+// because Start/Reload merge upstreams sequentially in config order.
+type ResourceTemplateDescriptor struct {
+	URITemplate string
+	Upstream    string
+	Template    mcp.ResourceTemplate
+
+	// re is the compiled matcher for URITemplate ({var} → one path segment),
+	// built once at merge time. nil when the template failed to compile — the
+	// descriptor is still listed to the client verbatim, it just never matches.
+	re *regexp.Regexp
+}
+
+// route maps a namespaced tool or prompt name back to its upstream and
+// original name.
 type route struct {
 	upstream string
 	original string
@@ -102,13 +156,48 @@ type upstreamStarter func(ctx context.Context, u config.Upstream) (Upstream, err
 type Upstream interface {
 	Initialize(ctx context.Context) (*mcp.InitializeResult, error)
 	ListTools(ctx context.Context) ([]mcp.Tool, error)
+	// ListResources / ListResourceTemplates fetch the upstream's resource
+	// catalog and its parameterized templates (Round 5). Like ListPrompts, the
+	// registry calls them only for upstreams that declared the resources
+	// capability in initialize — never as a blind probe.
 	ListResources(ctx context.Context) ([]mcp.Resource, error)
-	CallTool(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error)
+	ListResourceTemplates(ctx context.Context) ([]mcp.ResourceTemplate, error)
+	// ListPrompts fetches the upstream's prompt catalog (Round 4). The registry
+	// calls it only for upstreams that declared the prompts capability in
+	// initialize — never as a blind probe.
+	ListPrompts(ctx context.Context) ([]mcp.Prompt, error)
+	// CallTool forwards one tools/call. meta is the client's optional `_meta`
+	// object, proxied verbatim (nil when the client sent none).
+	CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error)
+	// GetPrompt forwards one prompts/get with the upstream's ORIGINAL prompt
+	// name (the registry resolves the namespace before calling).
+	GetPrompt(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error)
+	// SetLogLevel forwards one logging/setLevel with the client's level string
+	// verbatim (Round 3). The registry calls it only for upstreams that
+	// declared the logging capability in initialize — never as a blind probe.
+	SetLogLevel(ctx context.Context, level string) error
+	// ReadResource forwards one resources/read with the client's exact URI —
+	// resources are never namespaced, so nothing is rewritten (Round 5).
+	ReadResource(ctx context.Context, uri string) (*mcp.Message, error)
+	// Complete forwards one completion/complete whose params the registry has
+	// already prepared (ref.name rewritten to the upstream's original for a
+	// prompt ref; everything else verbatim — Round 5).
+	Complete(ctx context.Context, params json.RawMessage) (*mcp.Message, error)
+	// RespondUpstreamRequest writes a response to a request the upstream
+	// itself initiated (elicitation/create, Round 14) into its stdin; msg.ID
+	// must already carry the upstream's original request id. Errors for
+	// transports without server-initiated requests (HTTP).
+	RespondUpstreamRequest(msg *mcp.Message) error
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
 	// long-lived process (stdio); ok is false when there is no such process
 	// to watch (HTTP), so a supervisor is simply not started for it.
 	Done() (ch <-chan struct{}, ok bool)
+	// StderrTail reports the most recent stderr lines of an upstream backed
+	// by a child process (stdio) — the supervisor logs them when that process
+	// crashes, so the operator sees WHY it died without debug logging. ok is
+	// false when there is no process and hence no stderr (HTTP), like Done.
+	StderrTail() (lines []string, ok bool)
 }
 
 // Registry owns upstream connections and the aggregated catalog.
@@ -181,6 +270,41 @@ type Registry struct {
 	// re-list. Guarded by the same r.mu as conns/tools/toolRoute because the
 	// four are always mutated together (mergeLocked/dropLocked).
 	rawTools map[string][]mcp.Tool
+	// prompts/promptRoute are the aggregated prompt catalog and its routing
+	// table (Round 4) — the prompts twins of tools/toolRoute, mutated only by
+	// mergeLocked/dropLocked under the same r.mu. rawPrompts keeps the
+	// per-upstream prompt list so catalog rewrites that fetched no fresh
+	// prompts (a tools-only re-list, a filter-only re-projection) can carry the
+	// existing prompts over instead of losing them — the same role rawTools
+	// plays for filter reloads. Prompts do not pass through config.ToolFilter:
+	// the client-facing name is always "<upstream>__<original>".
+	prompts     map[string]PromptDescriptor
+	promptRoute map[string]route
+	rawPrompts  map[string][]mcp.Prompt
+	// resources/resourceRoute are the aggregated resource catalog and its
+	// ownership table (Round 5), mutated only by mergeLocked/dropLocked under
+	// the same r.mu. There is no namespacing and no rename for resources — the
+	// client-facing URI is the upstream's own, so resourceRoute carries only
+	// uri→owner (keep-first on a cross-upstream URI collision, Warn+skip).
+	// resourceTemplates is the ordered template list resolveResourceOwner
+	// matches against when the exact uri lookup misses (see
+	// ResourceTemplateDescriptor for why it is a slice). rawResources/
+	// rawTemplates keep the per-upstream lists so catalog rewrites that fetched
+	// no fresh resources (a tools-only re-list, a filter-only re-projection)
+	// carry the existing ones over — the same role rawPrompts plays.
+	resources         map[string]ResourceDescriptor
+	resourceRoute     map[string]string // uri → owning upstream name
+	resourceTemplates []ResourceTemplateDescriptor
+	rawResources      map[string][]mcp.Resource
+	rawTemplates      map[string][]mcp.ResourceTemplate
+	// handshakes holds the per-upstream slice of the initialize handshake the
+	// gateway keeps after launch: the upstream's instructions (aggregated into
+	// the gateway's own InitializeResult.Instructions) and its raw capabilities
+	// object (consulted by HasUpstreamCapability when the transport builds the
+	// gateway's capabilities). Guarded by the same r.mu as conns/tools —
+	// written by mergeLocked, cleared by dropLocked, always in step with the
+	// catalog.
+	handshakes map[string]handshakeMeta
 	// cachedTools is the sorted catalog slice Tools() hands out, rebuilt lazily
 	// on the first read after a mutation: the catalog changes only at discrete
 	// points (mergeLocked/dropLocked), while tools/list reads it on every client
@@ -210,6 +334,39 @@ type Registry struct {
 	subscribers map[int]chan struct{}
 	nextSubID   int
 
+	// notifMu guards notifSubs, the set of client-facing transports that want
+	// upstream notifications forwarded VERBATIM (notifications/progress, Round
+	// 2). It is deliberately its own small mutex — not subMu, relistMu or mu —
+	// so forwardNotification (which runs on an upstream's reader goroutine)
+	// never entangles with the catalog's or the catalog-changed channel's
+	// critical sections. See SubscribeNotifications / forwardNotification.
+	notifMu     sync.Mutex
+	notifSubs   map[int]chan mcp.Message
+	nextNotifID int
+
+	// clientElicitationCapable records whether the gateway's OWN client
+	// declared the elicitation capability in its initialize (Round 14). A
+	// single global flag is correct because stdio serves exactly ONE client per
+	// process (see stdioServer.Serve); the HTTP transport never sets it, so it
+	// stays false there and any upstream elicitation over HTTP is refused
+	// immediately — the safe default. Atomic: written once per handshake,
+	// read on every upstream elicitation/create from a reader goroutine.
+	clientElicitationCapable atomic.Bool
+
+	// elicitMu guards pendingElicits — gateway-minted id → where the client's
+	// answer must be routed back — and elicitSubs, the transports subscribed
+	// to receive proxied elicitation requests (Round 14). Its own small mutex
+	// for the same reason notifMu is: onUpstreamElicit runs on an upstream's
+	// reader goroutine and must never entangle with the catalog's critical
+	// sections. elicitID mints the "elicit-<n>" client-facing ids — the
+	// upstream's id space and the client's are unrelated and could collide,
+	// so the id is ALWAYS rewritten en route.
+	elicitMu        sync.Mutex
+	pendingElicits  map[string]pendingElicit
+	elicitSubs      map[int]chan ElicitationRequest
+	nextElicitSubID int
+	elicitID        atomic.Int64
+
 	// relistMu guards relistTimers, the per-upstream debounce timers for
 	// tools/list_changed notifications (Stage 7b), and relistStates, the
 	// per-upstream running/dirty flags that serialize the re-lists themselves.
@@ -236,6 +393,20 @@ type Registry struct {
 	// started); the flag makes "no new registrations" and "start waiting"
 	// a single ordered handoff.
 	relistWG sync.WaitGroup
+
+	// limiterMu guards limiters and sems, the per-upstream call-limit state
+	// (Round 6): token-bucket rate limiters and concurrency semaphores, created
+	// lazily on the first guarded call to each upstream. Deliberately its OWN
+	// mutex, not r.mu — the limiters have no relationship with the catalog's
+	// critical section, and coupling them would make every rate-limited call
+	// contend with catalog reads/writes. Each entry remembers the config values
+	// it was built from; when a reload changes them, the next call detects the
+	// mismatch under this mutex and swaps in a fresh limiter/semaphore (an old
+	// semaphore still held by in-flight calls simply drains as they finish —
+	// the new one starts life with zero permits held).
+	limiterMu sync.Mutex
+	limiters  map[string]*limiterEntry
+	sems      map[string]*semEntry
 
 	// supMu guards supCancel, one context.CancelFunc per supervised stdio
 	// upstream (Stage 7d). Each supervisor runs under its own context derived
@@ -271,6 +442,29 @@ type relistState struct {
 	dirty   bool
 }
 
+// handshakeMeta is what the registry retains from one upstream's
+// InitializeResult beyond the handshake itself: its human-readable
+// instructions and its raw capabilities object. Everything else
+// (protocolVersion, serverInfo) is consumed at launch time and not needed
+// later.
+type handshakeMeta struct {
+	instructions string
+	capabilities json.RawMessage
+}
+
+// auxCatalog bundles the AUXILIARY catalog slices launch fetches alongside the
+// tools: prompts (Round 4), resources and resource templates (Round 5). They
+// travel together because every path that carries one carries them all —
+// launch fetches them best-effort, merge installs them, installLocked's
+// carry-over preserves them as a unit. Tools stay a separate parameter: they
+// are the catalog the gateway exists for (a tools/list failure is fatal to the
+// launch; a failure here merely degrades).
+type auxCatalog struct {
+	prompts   []mcp.Prompt
+	resources []mcp.Resource
+	templates []mcp.ResourceTemplate
+}
+
 // New constructs a Registry from config. It does not start upstreams yet — call
 // Start. callLog may be nil, in which case tool calls are not audited.
 // payloadLog is the opt-in payload debug log (Stage 10); pass
@@ -282,21 +476,34 @@ type relistState struct {
 func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool, version string) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
-		log:          logger,
-		callLog:      callLog,
-		payloadLog:   payloadLog,
-		autoRestart:  supervise,
-		version:      version,
-		conns:        map[string]Upstream{},
-		tools:        map[string]ToolDescriptor{},
-		toolRoute:    map[string]route{},
-		rawTools:     map[string][]mcp.Tool{},
-		subscribers:  map[int]chan struct{}{},
-		relistTimers: map[string]*time.Timer{},
-		relistStates: map[string]*relistState{},
-		supCancel:    map[string]context.CancelFunc{},
-		procCtx:      procCtx,
-		procCancel:   procCancel,
+		log:            logger,
+		callLog:        callLog,
+		payloadLog:     payloadLog,
+		autoRestart:    supervise,
+		version:        version,
+		conns:          map[string]Upstream{},
+		tools:          map[string]ToolDescriptor{},
+		toolRoute:      map[string]route{},
+		rawTools:       map[string][]mcp.Tool{},
+		prompts:        map[string]PromptDescriptor{},
+		promptRoute:    map[string]route{},
+		rawPrompts:     map[string][]mcp.Prompt{},
+		resources:      map[string]ResourceDescriptor{},
+		resourceRoute:  map[string]string{},
+		rawResources:   map[string][]mcp.Resource{},
+		rawTemplates:   map[string][]mcp.ResourceTemplate{},
+		handshakes:     map[string]handshakeMeta{},
+		subscribers:    map[int]chan struct{}{},
+		notifSubs:      map[int]chan mcp.Message{},
+		pendingElicits: map[string]pendingElicit{},
+		elicitSubs:     map[int]chan ElicitationRequest{},
+		relistTimers:   map[string]*time.Timer{},
+		relistStates:   map[string]*relistState{},
+		limiters:       map[string]*limiterEntry{},
+		sems:           map[string]*semEntry{},
+		supCancel:      map[string]context.CancelFunc{},
+		procCtx:        procCtx,
+		procCancel:     procCancel,
 	}
 	r.cfg.Store(cfg)
 	r.start = r.startUpstream
@@ -330,25 +537,34 @@ func (r *Registry) startUpstream(ctx context.Context, u config.Upstream) (Upstre
 // notification callback (Stage 7b) is handed to StartStdio itself, so it is in
 // place BEFORE the connection's reader goroutine starts — installing it after
 // the fact raced an upstream that notifies immediately on startup (found by
-// independent review). Only stdio upstreams push notifications; HTTP has no
-// long-lived reader (documented limitation), so startHTTP wires nothing.
+// independent review). startHTTP wires the same callback (Round 13): an HTTP
+// upstream pushes notifications over a long-lived GET SSE stream opened after
+// its handshake, so list_changed & co. arrive from both transports alike.
 func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream, error) {
 	env := make([]string, 0, len(u.Env))
 	for k, v := range u.Env {
 		env = append(env, k+"="+v)
 	}
 	name := u.Name
-	onNotify := func(method string) { r.onUpstreamNotification(name, method) }
-	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify)
+	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
+	// onElicit is stdio-only (Round 14): StartHTTP takes no such callback —
+	// an HTTP upstream has no channel for server-initiated REQUESTS in this
+	// round, deliberately out of scope.
+	onElicit := func(id, params json.RawMessage) { r.onUpstreamElicit(name, id, params) }
+	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onElicit)
 }
 
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
 // startStdio it does no network I/O here — the handshake runs in Initialize, so
 // StartHTTP never fails and a genuinely unreachable HTTP upstream is isolated at
 // the Initialize step in launch, exactly like a stdio upstream that fails its
-// handshake.
+// handshake. The notification callback mirrors startStdio's: it feeds the GET
+// SSE stream the connection opens after its handshake (Round 13) — best-effort,
+// an upstream that does not offer the stream simply pushes no notifications.
 func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
-	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version), nil
+	name := u.Name
+	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
+	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify), nil
 }
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,
@@ -385,6 +601,8 @@ func (r *Registry) Start(ctx context.Context) error {
 	type launchOutcome struct {
 		conn  Upstream
 		tools []mcp.Tool
+		aux   auxCatalog
+		meta  handshakeMeta
 		err   error
 	}
 	results := make([]launchOutcome, len(enabled))
@@ -392,8 +610,8 @@ func (r *Registry) Start(ctx context.Context) error {
 	for i, u := range enabled {
 		i, u := i, u
 		g.Go(func() error {
-			conn, tools, err := r.launch(gctx, u)
-			results[i] = launchOutcome{conn: conn, tools: tools, err: err}
+			conn, tools, aux, meta, err := r.launch(gctx, u)
+			results[i] = launchOutcome{conn: conn, tools: tools, aux: aux, meta: meta, err: err}
 			return nil // errors are isolated per-upstream, never propagated
 		})
 	}
@@ -417,7 +635,7 @@ func (r *Registry) Start(ctx context.Context) error {
 			r.recordFailure(u.Name, res.err.Error())
 			continue
 		}
-		n := r.merge(u.Name, res.conn, res.tools)
+		n := r.merge(u.Name, res.conn, res.tools, res.aux, res.meta)
 		r.recordSuccess(u.Name, n)
 		r.superviseUpstream(u, res.conn)
 	}
@@ -440,57 +658,110 @@ func (r *Registry) Start(ctx context.Context) error {
 }
 
 // launch starts one upstream and runs the full handshake sequence
-// (start → Initialize → ListTools), returning
-// the live connection and its tool catalog. It is the single reusable "bring an
-// upstream to a usable state" primitive shared by the first start (Start),
-// the auto-restart supervisor (Stage 7a) and hot-reload (Stage 7d). On any
-// failure it tears the connection back down and returns a single error whose
-// message names the failing phase — the caller decides whether to record it as
-// a start-time failure, retry it, or log it.
+// (start → Initialize → ListTools → best-effort ListPrompts/ListResources/
+// ListResourceTemplates), returning the live connection, its tool catalog, the
+// auxiliary catalogs (prompts/resources/templates) and the retained handshake
+// metadata (instructions/capabilities from the InitializeResult).
+// It is the single reusable "bring an upstream to a usable state" primitive
+// shared by the first start (Start), the auto-restart supervisor (Stage 7a)
+// and hot-reload (Stage 7d). On any failure it tears the connection back down
+// and returns a single error whose message names the failing phase — the
+// caller decides whether to record it as a start-time failure, retry it, or
+// log it.
 //
 // The child process is launched under r.procCtx (long-lived, see procCtx);
 // ctx bounds only the handshake RPCs so a slow upstream cannot block Start (or
 // a restart) indefinitely.
-func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []mcp.Tool, error) {
+func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []mcp.Tool, auxCatalog, handshakeMeta, error) {
 	conn, err := r.start(r.procCtx, u)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to start: %w", err)
+		return nil, nil, auxCatalog{}, handshakeMeta{}, fmt.Errorf("failed to start: %w", err)
 	}
 
-	// Upstream→registry notifications (Stage 7b) are wired inside startStdio —
-	// the callback rides into StartStdio itself, so it is set before the reader
-	// goroutine starts and a list_changed arriving immediately is not missed.
+	// Upstream→registry notifications (Stage 7b) are wired inside startStdio /
+	// startHTTP — the callback rides into StartStdio/StartHTTP itself, so it is
+	// set before any reader goroutine starts and a list_changed arriving
+	// immediately is not missed (HTTP's stream opens after the handshake,
+	// Round 13, with the callback already in place).
 
 	var info *mcp.InitializeResult
-	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
 		var err error
 		info, err = conn.Initialize(ctx)
 		return err
 	}); err != nil {
 		_ = conn.Close()
-		return nil, nil, fmt.Errorf("handshake failed: %w", err)
+		return nil, nil, auxCatalog{}, handshakeMeta{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	r.log.Info("upstream initialized", "upstream", u.Name, "server", info.ServerInfo.Name)
+	meta := handshakeMeta{instructions: info.Instructions, capabilities: info.Capabilities}
 
 	var tools []mcp.Tool
-	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
 		var err error
 		tools, err = conn.ListTools(ctx)
 		return err
 	}); err != nil {
 		_ = conn.Close()
-		return nil, nil, fmt.Errorf("tools/list failed: %w", err)
+		return nil, nil, auxCatalog{}, handshakeMeta{}, fmt.Errorf("tools/list failed: %w", err)
 	}
 
-	return conn, tools, nil
+	// Prompts (Round 4): fetched only when the upstream DECLARED the prompts
+	// capability in its initialize response — an upstream without it need not
+	// even recognize prompts/list, so probing blindly would provoke pointless
+	// method-not-found errors. Best-effort, unlike tools/list above: a failing
+	// prompts/list degrades this upstream to "no prompts" (Warn) instead of
+	// failing the whole launch — prompts are auxiliary next to the tool catalog
+	// the gateway exists for.
+	var aux auxCatalog
+	if hasCapability(info.Capabilities, "prompts") {
+		if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
+			var err error
+			aux.prompts, err = conn.ListPrompts(ctx)
+			return err
+		}); err != nil {
+			r.log.Warn("prompts/list failed, continuing without prompts", "upstream", u.Name, "err", err)
+			aux.prompts = nil
+		}
+	}
+
+	// Resources + templates (Round 5): same policy as prompts — fetched only
+	// when the upstream declared the resources capability, best-effort. A
+	// failing resources/list degrades this upstream to "no resources"; a
+	// failing templates/list only loses the templates (the plain resources
+	// already fetched stay — the two lists are independent per the spec, and
+	// ListResourceTemplates itself already maps method-not-found to empty for
+	// upstreams that never implemented the sub-method).
+	if hasCapability(info.Capabilities, "resources") {
+		if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
+			var err error
+			aux.resources, err = conn.ListResources(ctx)
+			return err
+		}); err != nil {
+			r.log.Warn("resources/list failed, continuing without resources", "upstream", u.Name, "err", err)
+			aux.resources = nil
+		}
+		if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
+			var err error
+			aux.templates, err = conn.ListResourceTemplates(ctx)
+			return err
+		}); err != nil {
+			r.log.Warn("resources/templates/list failed, continuing without templates", "upstream", u.Name, "err", err)
+			aux.templates = nil
+		}
+	}
+
+	return conn, tools, aux, meta, nil
 }
 
-// withCallTimeout runs fn under a child context bounded by the CURRENT
-// config's call timeout — the one ritual every upstream RPC the registry makes
-// shares (handshake, list, forwarded call). The timeout is re-read from the
-// live config on every use, so a reload takes effect immediately.
-func (r *Registry) withCallTimeout(parent context.Context, fn func(ctx context.Context) error) error {
-	ctx, cancel := context.WithTimeout(parent, r.config().EffectiveCallTimeout())
+// withCallTimeoutFor runs fn under a child context bounded by the CURRENT
+// config's call timeout for the named upstream — the one ritual every upstream
+// RPC the registry makes shares (handshake, list, forwarded call). The timeout
+// is re-read from the live config on every use, so a reload takes effect
+// immediately; the per-upstream call_timeout override (Round 6) falls back to
+// the global EffectiveCallTimeout when unset.
+func (r *Registry) withCallTimeoutFor(parent context.Context, upstream string, fn func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, r.config().EffectiveCallTimeoutFor(upstream))
 	defer cancel()
 	return fn(ctx)
 }
@@ -590,6 +861,14 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 			if err := conn.Close(); err != nil {
 				r.log.Debug("close crashed upstream", "upstream", u.Name, "err", err)
 			}
+			// Close waited for the stderr drain goroutine, so the tail is
+			// complete: surface the crashed process's last stderr lines in ONE
+			// Warn block — the post-mortem an operator otherwise only gets by
+			// re-running at debug level and reproducing the crash.
+			if tail, ok := conn.StderrTail(); ok && len(tail) > 0 {
+				r.log.Warn("stdio upstream stderr before exit",
+					"upstream", u.Name, "lines", len(tail), "stderr_tail", strings.Join(tail, "\n"))
+			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
 			newConn, newDone, ok := r.restart(u, conn, supCtx)
 			if !ok {
@@ -677,7 +956,7 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 		case <-timer.C:
 		}
 
-		conn, tools, err := r.launch(r.procCtx, u)
+		conn, tools, aux, meta, err := r.launch(r.procCtx, u)
 		if err != nil {
 			r.log.Warn("stdio upstream restart attempt failed",
 				"upstream", u.Name, "attempt", attempt, "err", err)
@@ -693,7 +972,7 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
 			return nil, nil, false
 		}
-		if !r.replaceUpstreamIfLive(u.Name, conn, tools, supCtx) {
+		if !r.replaceUpstreamIfLive(u.Name, conn, tools, aux, meta, supCtx) {
 			// A reload retired this upstream while we were launching: the fresh
 			// connection must not enter the catalog (that would resurrect an
 			// upstream the reload just removed/replaced). Close it and stop.
@@ -707,12 +986,29 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 	}
 }
 
-// onUpstreamNotification handles a notification pushed by a stdio upstream
-// (Stage 7b). It runs on that upstream's single reader goroutine, so it must
-// not block or re-enter the connection: for tools/list_changed it only (re)arms
-// a debounce timer whose expiry does the actual re-list on a fresh goroutine.
-// Other notification methods are ignored (resources are not aggregated yet).
-func (r *Registry) onUpstreamNotification(name, method string) {
+// onUpstreamNotification handles a notification pushed by an upstream — a
+// stdio child's stdout (Stage 7b, Round 2, Round 3) or an HTTP upstream's GET
+// SSE stream (Round 13). It runs on that upstream's single reader/stream
+// goroutine, so it must not block or re-enter the connection: for
+// tools/list_changed it only (re)arms a debounce timer whose expiry does the
+// actual re-list on a fresh goroutine; for notifications/progress it forwards
+// the params VERBATIM to the notification subscribers via a non-blocking send
+// (the progressToken was minted by the client, the gateway never rewrites it);
+// for notifications/message it forwards the same way, except the emitting
+// upstream's name is stamped into the params' optional `logger` field first
+// (see withLogger — without it the client cannot tell N multiplexed upstream
+// log streams apart). Other notification methods are ignored (prompt/resource
+// list_changed subscriptions are still TODO — see buildCapabilities in
+// transport).
+func (r *Registry) onUpstreamNotification(name, method string, params json.RawMessage) {
+	if method == mcp.NotifProgress {
+		r.forwardNotification(mcp.Message{Method: method, Params: params})
+		return
+	}
+	if method == mcp.NotifMessage {
+		r.forwardNotification(mcp.Message{Method: method, Params: withLogger(params, name)})
+		return
+	}
 	if method != mcp.NotifToolsListChanged {
 		return
 	}
@@ -812,7 +1108,7 @@ func (r *Registry) relistUpstream(name string) {
 	}
 
 	var tools []mcp.Tool
-	if err := r.withCallTimeout(r.procCtx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(r.procCtx, name, func(ctx context.Context) error {
 		var err error
 		tools, err = conn.ListTools(ctx)
 		return err
@@ -827,14 +1123,17 @@ func (r *Registry) relistUpstream(name string) {
 	r.notifyCatalogChanged()
 }
 
-// merge namespaces an upstream's tools and adds them to the aggregated catalog
-// and routing table under the registry lock. It returns the number of tools
-// actually projected into the catalog (post-filter, post-dedup).
-func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool) int {
+// merge namespaces an upstream's tools and prompts and adds them — plus its
+// resources and resource templates (Round 5) — to the aggregated catalog and
+// routing tables under the registry lock, recording the handshake metadata
+// launch retained alongside. It returns the number of tools actually projected
+// into the catalog (post-filter, post-dedup).
+func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := r.mergeLocked(name, conn, tools)
-	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n)
+	n := r.mergeLocked(name, conn, tools, aux, meta)
+	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n,
+		"prompts", len(aux.prompts), "resources", len(aux.resources), "resource_templates", len(aux.templates))
 	return n
 }
 
@@ -848,9 +1147,14 @@ type toolEntry struct {
 // filterAndRenameTools projects one upstream's raw tool list through its
 // configured filter (Stage 9): allow (when non-empty — intersection), then
 // deny (subtraction), then rename (client-facing name for survivors; tools
-// without a rename get the default namespaced "<upstream>__<original>").
-// It is pure — no registry state, no side effects — so the projection can be
-// re-run at any time against the stored raw list (filter-only reload).
+// without a rename get the default namespaced "<upstream>__<original>"), then
+// the token-optimization rules — strip annotations/outputSchema, override the
+// description (Describe, keyed by ORIGINAL name like Rename), truncate the
+// description to MaxDescription runes (never applied on top of a Describe
+// override: the override is the config author's final word).
+// It is pure — no registry state, no side effects (mcp.Tool is modified as a
+// copy, never the stored raw list) — so the projection can be re-run at any
+// time against the stored raw list (filter-only reload).
 func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter) []toolEntry {
 	allow := f.AllowSet()
 	deny := f.DenySet()
@@ -867,9 +1171,50 @@ func filterAndRenameTools(upstream string, tools []mcp.Tool, f config.ToolFilter
 		if !renamed {
 			name = upstream + NameSeparator + t.Name
 		}
+		if f.StripAnnotations {
+			t.Annotations = nil
+		}
+		if f.StripOutputSchema {
+			t.OutputSchema = nil
+		}
+		if desc := f.Describe[t.Name]; desc != "" {
+			t.Description = mustJSONString(desc)
+		} else if f.MaxDescription > 0 {
+			t.Description = truncateJSONString(t.Description, f.MaxDescription)
+		}
 		out = append(out, toolEntry{name: name, tool: t})
 	}
 	return out
+}
+
+// mustJSONString encodes a plain string as a JSON string literal.
+// json.Marshal of a string cannot fail, hence "must".
+func mustJSONString(s string) json.RawMessage {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err) // unreachable: a Go string always marshals
+	}
+	return b
+}
+
+// truncateJSONString truncates the string carried in a JSON string literal to
+// at most max runes (never bytes — a multi-byte UTF-8 sequence is not cut in
+// the middle), appending "…" when truncation happened. A raw value that is
+// absent, short enough, or not a JSON string (an upstream is free to send
+// anything — the gateway proxies verbatim) is returned unchanged.
+func truncateJSONString(raw json.RawMessage, max int) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return raw
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return raw
+	}
+	return mustJSONString(string(runes[:max]) + "…")
 }
 
 // filterFor looks up the CURRENT tool filter for an upstream by name from the
@@ -901,10 +1246,14 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 // It returns the number of entries actually added to the catalog by this call
 // (post-filter, post-dedup) — the count the client really sees, which callers
 // report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
-func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int {
+func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta) int {
 	r.cachedToolsValid = false
 	r.conns[name] = conn
 	r.rawTools[name] = tools
+	r.rawPrompts[name] = aux.prompts
+	r.rawResources[name] = aux.resources
+	r.rawTemplates[name] = aux.templates
+	r.handshakes[name] = meta
 	n := 0
 	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
 		if _, dup := r.tools[e.name]; dup {
@@ -915,7 +1264,79 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int
 		r.toolRoute[e.name] = route{upstream: name, original: e.tool.Name}
 		n++
 	}
+	// Prompts (Round 4): no filter/rename mechanism exists for prompts, so the
+	// client-facing name is always the plain "<upstream>__<original>". The
+	// namespacing makes cross-upstream collisions impossible for well-formed
+	// names; keep-first only guards runtime surprises (an upstream whose own
+	// name or prompt names smuggle the separator, or duplicate prompt names
+	// within one upstream) — same policy as tools above.
+	for _, p := range aux.prompts {
+		ns := name + NameSeparator + p.Name
+		if _, dup := r.prompts[ns]; dup {
+			r.log.Warn("duplicate client-facing prompt name skipped", "name", ns, "upstream", name)
+			continue
+		}
+		r.prompts[ns] = PromptDescriptor{Name: ns, Upstream: name, Prompt: p}
+		r.promptRoute[ns] = route{upstream: name, original: p.Name}
+	}
+	// Resources (Round 5): no namespacing at all — a URI is the upstream's own
+	// identifier and rewriting it would break every relative reference inside
+	// the resource contents. Cross-upstream URI collisions are therefore
+	// possible and resolved keep-first (config order, same policy as tools and
+	// prompts): the first upstream to claim a URI owns it, the loser is skipped
+	// with a Warn.
+	for _, res := range aux.resources {
+		if _, dup := r.resources[res.URI]; dup {
+			r.log.Warn("duplicate resource uri skipped", "uri", res.URI, "upstream", name)
+			continue
+		}
+		r.resources[res.URI] = ResourceDescriptor{URI: res.URI, Upstream: name, Resource: res}
+		r.resourceRoute[res.URI] = name
+	}
+	// Resource templates (Round 5): appended in merge order — Start/Reload
+	// merge upstreams sequentially in config order, so template matching
+	// (first match wins, see resolveResourceOwner) is deterministic. A
+	// template whose {var} pattern fails to compile is still listed to the
+	// client verbatim; it just never matches a read (re stays nil).
+	for _, tpl := range aux.templates {
+		re, err := templateRegexp(tpl.URITemplate)
+		if err != nil {
+			r.log.Warn("unusable resource uri template, listed but never matched",
+				"template", tpl.URITemplate, "upstream", name, "err", err)
+		}
+		r.resourceTemplates = append(r.resourceTemplates, ResourceTemplateDescriptor{
+			URITemplate: tpl.URITemplate, Upstream: name, Template: tpl, re: re,
+		})
+	}
 	return n
+}
+
+// templateRegexp translates an RFC 6570 level-1 URI template into an anchored
+// regexp: literal runs are quoted verbatim (dots, pluses and other regexp
+// metacharacters in the fixed part must match themselves), each "{var}" —
+// including operator forms like "{+var}", treated the same at this level —
+// matches one non-empty path segment ([^/]+). An unclosed "{" is not a
+// template expression and stays literal.
+func templateRegexp(tmpl string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	for {
+		open := strings.Index(tmpl, "{")
+		if open < 0 {
+			b.WriteString(regexp.QuoteMeta(tmpl))
+			break
+		}
+		end := strings.Index(tmpl[open:], "}")
+		if end < 0 {
+			b.WriteString(regexp.QuoteMeta(tmpl)) // unclosed brace: literal tail
+			break
+		}
+		b.WriteString(regexp.QuoteMeta(tmpl[:open]))
+		b.WriteString("[^/]+")
+		tmpl = tmpl[open+end+1:]
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
 }
 
 // dropUpstream removes an upstream and every catalog/routing entry it owns,
@@ -932,8 +1353,9 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool) int
 // formed.
 func (r *Registry) dropUpstream(name string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.dropLocked(name)
+	r.mu.Unlock()
+	r.dropPendingElicits(name)
 }
 
 // Gated catalog mutations. dropUpstreamIfCurrent, replaceUpstreamIfLive and
@@ -960,11 +1382,13 @@ func (r *Registry) dropUpstream(name string) {
 // give-up path — taking lifecycleMu here would deadlock shutdown.
 func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.conns[name] != conn {
+		r.mu.Unlock()
 		return false
 	}
 	r.dropLocked(name)
+	r.mu.Unlock()
+	r.dropPendingElicits(name)
 	return true
 }
 
@@ -974,21 +1398,66 @@ func (r *Registry) dropLocked(name string) {
 	r.cachedToolsValid = false
 	delete(r.conns, name)
 	delete(r.rawTools, name)
+	delete(r.rawPrompts, name)
+	delete(r.rawResources, name)
+	delete(r.rawTemplates, name)
+	delete(r.handshakes, name)
 	for ns, d := range r.tools {
 		if d.Upstream == name {
 			delete(r.tools, ns)
 			delete(r.toolRoute, ns)
 		}
 	}
+	for ns, d := range r.prompts {
+		if d.Upstream == name {
+			delete(r.prompts, ns)
+			delete(r.promptRoute, ns)
+		}
+	}
+	for uri, d := range r.resources {
+		if d.Upstream == name {
+			delete(r.resources, uri)
+			delete(r.resourceRoute, uri)
+		}
+	}
+	// Filter the template slice in place, preserving the merge order of the
+	// surviving upstreams' templates (matching stays deterministic).
+	kept := r.resourceTemplates[:0]
+	for _, d := range r.resourceTemplates {
+		if d.Upstream != name {
+			kept = append(kept, d)
+		}
+	}
+	r.resourceTemplates = kept
 }
 
 // installLocked replaces name's catalog entry with (conn, tools), assuming
 // r.mu is already held — the common tail of replaceUpstreamIfLive,
 // replaceUpstreamIfCurrent, and remergeUpstream, once each has decided under
 // its own gate that the write is safe to make.
-func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, logMsg string) {
+//
+// meta is the handshake metadata to record for the fresh entry; nil means
+// "this path ran no new handshake" (re-list, filter-only re-projection — the
+// connection is unchanged), so the currently recorded metadata is carried
+// over instead of being wiped by dropLocked. aux follows the same nil
+// convention: nil means "this path fetched no fresh prompts/resources/
+// templates" (a tools/list_changed re-list refreshes only tools; a filter
+// re-projection touches nothing upstream), so the currently recorded auxiliary
+// catalogs are carried over as a unit.
+func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, aux *auxCatalog, meta *handshakeMeta, logMsg string) {
+	if meta == nil {
+		m := r.handshakes[name] // zero value when absent — nothing to preserve
+		meta = &m
+	}
+	if aux == nil {
+		aux = &auxCatalog{ // nil slices when absent — nothing to preserve
+			prompts:   r.rawPrompts[name],
+			resources: r.rawResources[name],
+			templates: r.rawTemplates[name],
+		}
+	}
 	r.dropLocked(name)
-	n := r.mergeLocked(name, conn, tools)
+	n := r.mergeLocked(name, conn, tools, *aux, *meta)
 	r.log.Debug(logMsg, "upstream", name, "tools", n)
 }
 
@@ -1003,13 +1472,17 @@ func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, l
 // removed (the supervisor-vs-reload race found by independent review). Returns
 // false — leaving the catalog untouched — when supCtx was already cancelled;
 // the caller then owns closing the never-installed connection.
-func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, supCtx context.Context) bool {
+func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta, supCtx context.Context) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if supCtx.Err() != nil {
+		r.mu.Unlock()
 		return false
 	}
-	r.installLocked(name, conn, tools, "upstream catalog replaced")
+	r.installLocked(name, conn, tools, &aux, &meta, "upstream catalog replaced")
+	r.mu.Unlock()
+	// The dead predecessor's parked elicitations can never be answered through
+	// the fresh connection (its id space is new) — drop them (found by review).
+	r.dropPendingElicits(name)
 	return true
 }
 
@@ -1030,7 +1503,10 @@ func (r *Registry) replaceUpstreamIfCurrent(name string, oldConn Upstream, tools
 	if r.conns[name] != oldConn {
 		return false
 	}
-	r.installLocked(name, oldConn, tools, "upstream catalog refreshed after list_changed")
+	// nil meta/aux: a re-list runs no new handshake and refreshes only the
+	// tools — keep the recorded handshake metadata and the prompt/resource/
+	// template lists.
+	r.installLocked(name, oldConn, tools, nil, nil, "upstream catalog refreshed after list_changed")
 	return true
 }
 
@@ -1074,6 +1550,261 @@ func (r *Registry) notifyCatalogChanged() {
 	}
 }
 
+// notifSubBuffer is the per-subscriber buffer of the SubscribeNotifications
+// channel. Unlike the catalog-changed channel (buffer 1, coalescing — "did
+// anything change" is one bit), forwarded notifications each carry a distinct
+// payload, so a burst is buffered up to this depth and only then dropped
+// (progress updates are advisory; losing one under backpressure is harmless).
+const notifSubBuffer = 16
+
+// SubscribeNotifications registers interest in upstream notifications the
+// gateway forwards to its client — notifications/progress (Round 2, verbatim)
+// and notifications/message (Round 3, verbatim except the stamped `logger`
+// field, see withLogger) — and returns a channel of whole mcp.Message values (method +
+// params, no id) plus an unsubscribe function the caller MUST call when it
+// stops listening. Unlike Subscribe's coalescing one-bit signal, each message
+// matters individually, so the channel is buffered (notifSubBuffer); delivery
+// is NON-BLOCKING — a subscriber that stops draining loses messages (Debug-
+// logged), never stalls the upstream reader goroutine publishing them.
+func (r *Registry) SubscribeNotifications() (<-chan mcp.Message, func()) {
+	ch := make(chan mcp.Message, notifSubBuffer)
+	r.notifMu.Lock()
+	id := r.nextNotifID
+	r.nextNotifID++
+	r.notifSubs[id] = ch
+	r.notifMu.Unlock()
+
+	return ch, func() {
+		r.notifMu.Lock()
+		delete(r.notifSubs, id)
+		r.notifMu.Unlock()
+	}
+}
+
+// forwardNotification hands one upstream notification to every notification
+// subscriber. It runs on an upstream's single reader goroutine (via
+// onUpstreamNotification), so the send is strictly non-blocking: a subscriber
+// whose buffer is full has the message dropped — the reader must never stall
+// on a slow client transport.
+func (r *Registry) forwardNotification(msg mcp.Message) {
+	r.notifMu.Lock()
+	defer r.notifMu.Unlock()
+	for _, ch := range r.notifSubs {
+		select {
+		case ch <- msg:
+		default:
+			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
+		}
+	}
+}
+
+// pendingElicit records where the client's answer to one proxied
+// elicitation/create must be routed back (Round 14): which upstream asked, and
+// under what id in the UPSTREAM's own id space.
+type pendingElicit struct {
+	upstream   string
+	originalID json.RawMessage
+}
+
+// ElicitationRequest is one upstream-initiated elicitation/create the gateway
+// proxies to its client (Round 14). GatewayID is the gateway-minted id the
+// client-facing request must carry ("elicit-<n>" — see onUpstreamElicit for
+// why the upstream's own id never travels); Params is the upstream's params
+// object, verbatim.
+type ElicitationRequest struct {
+	GatewayID string
+	Params    json.RawMessage
+}
+
+// SetClientElicitationCapable records whether the gateway's client declared
+// the elicitation capability in its initialize handshake (Round 14). Called by
+// the stdio transport's dispatcher only — stdio serves exactly one client per
+// process, so the flag is global to the registry. The HTTP transport never
+// calls it; the flag then stays false and every upstream elicitation/create is
+// refused immediately instead of hanging (see onUpstreamElicit).
+func (r *Registry) SetClientElicitationCapable(ok bool) {
+	r.clientElicitationCapable.Store(ok)
+}
+
+// SubscribeElicitations registers interest in upstream-initiated
+// elicitation/create requests the gateway proxies to its client (Round 14) —
+// SubscribeNotifications' twin for the one upstream message that expects an
+// answer back (RouteElicitationResponse). Same delivery contract: buffered
+// channel (notifSubBuffer), strictly non-blocking send from the upstream's
+// reader goroutine, and an unsubscribe function the caller MUST call when it
+// stops listening.
+func (r *Registry) SubscribeElicitations() (<-chan ElicitationRequest, func()) {
+	ch := make(chan ElicitationRequest, notifSubBuffer)
+	r.elicitMu.Lock()
+	id := r.nextElicitSubID
+	r.nextElicitSubID++
+	r.elicitSubs[id] = ch
+	r.elicitMu.Unlock()
+
+	return ch, func() {
+		r.elicitMu.Lock()
+		delete(r.elicitSubs, id)
+		r.elicitMu.Unlock()
+	}
+}
+
+// onUpstreamElicit handles an elicitation/create REQUEST pushed by a stdio
+// upstream mid-tools/call (Round 14). Like onUpstreamNotification it runs on
+// that upstream's single reader goroutine, so it must not block or re-enter
+// the connection synchronously.
+//
+// When the gateway's client never declared the elicitation capability, the
+// upstream is answered immediately with a method-not-found error instead of
+// being left to hang until its own timeout — the gateway, in its client role
+// toward the upstream, honestly reports it cannot serve the method. Otherwise
+// the request is parked in pendingElicits under a freshly minted gateway id
+// and published to the subscribed transport (non-blocking, like
+// forwardNotification). A publish that reached NO subscriber (none registered,
+// or every buffer full) rolls the parked entry back and answers the upstream
+// with an error immediately: RouteElicitationResponse is the entry's only
+// other remover, so an undeliverable request would otherwise leak in
+// pendingElicits forever (found by review).
+func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMessage) {
+	if !r.clientElicitationCapable.Load() {
+		r.respondElicitError(name, originalID, mcp.CodeMethodNotFound,
+			"elicitation/create not supported: the gateway's client did not declare the elicitation capability")
+		return
+	}
+
+	gatewayID := fmt.Sprintf("elicit-%d", r.elicitID.Add(1))
+	req := ElicitationRequest{GatewayID: gatewayID, Params: params}
+	delivered := false
+	r.elicitMu.Lock()
+	r.pendingElicits[gatewayID] = pendingElicit{upstream: name, originalID: originalID}
+	for _, ch := range r.elicitSubs {
+		select {
+		case ch <- req:
+			delivered = true
+		default:
+			r.log.Debug("elicitation subscriber buffer full, dropping", "upstream", name, "id", gatewayID)
+		}
+	}
+	if !delivered {
+		delete(r.pendingElicits, gatewayID) // roll back: nobody will ever answer it
+	}
+	r.elicitMu.Unlock()
+	if !delivered {
+		r.respondElicitError(name, originalID, mcp.CodeInternalError,
+			"elicitation/create not delivered: no client transport accepted the request")
+		return
+	}
+	r.log.Debug("upstream elicitation proxied to client", "upstream", name, "id", gatewayID)
+}
+
+// respondElicitError answers an upstream's elicitation/create with a JSON-RPC
+// error under the upstream's OWN id — used when the request cannot reach the
+// client (incapable client, or no subscriber accepted the publish), so the
+// upstream gets an immediate honest answer instead of hanging until its own
+// timeout. The write runs off the caller's goroutine: a stdin write can block
+// on a stuck child, and the upstream reader publishing the callback must
+// never stall on it.
+func (r *Registry) respondElicitError(name string, originalID json.RawMessage, code int, text string) {
+	r.mu.RLock()
+	conn := r.conns[name]
+	r.mu.RUnlock()
+	if conn == nil {
+		return // the upstream vanished between its write and this callback
+	}
+	reply := mcp.NewError(originalID, code, text, nil)
+	go func() {
+		if err := conn.RespondUpstreamRequest(reply); err != nil {
+			r.log.Warn("refuse upstream elicitation failed", "upstream", name, "err", err)
+		}
+	}()
+}
+
+// dropPendingElicits discards every parked elicitation belonging to name —
+// called whenever name's connection is removed or replaced (reload removal,
+// restart give-up, a fresh connection installed after a crash): the answer
+// could no longer reach the process that asked, and RouteElicitationResponse
+// is otherwise the ONLY remover, so entries for a gone connection would
+// accumulate forever (found by review). Deliberately NOT part of dropLocked:
+// a same-connection re-merge (relistUpstream's drop-then-merge) must keep its
+// still-answerable pending elicitations.
+func (r *Registry) dropPendingElicits(name string) {
+	r.elicitMu.Lock()
+	for id, p := range r.pendingElicits {
+		if p.upstream == name {
+			delete(r.pendingElicits, id)
+		}
+	}
+	r.elicitMu.Unlock()
+}
+
+// RouteElicitationResponse routes the client's answer to a proxied
+// elicitation/create back to the upstream that asked (Round 14). gatewayID is
+// the gateway-minted id the transport decoded from the client's response;
+// msg is that response, whose ID is rewritten back to the upstream's original
+// before the write. It reports whether gatewayID matched a pending
+// elicitation — false means unknown or stale (a duplicate answer, a request
+// already consumed), which the caller treats like any other unexpected client
+// response: log and drop, never panic.
+func (r *Registry) RouteElicitationResponse(gatewayID string, msg *mcp.Message) bool {
+	r.elicitMu.Lock()
+	p, ok := r.pendingElicits[gatewayID]
+	if ok {
+		delete(r.pendingElicits, gatewayID)
+	}
+	r.elicitMu.Unlock()
+	if !ok {
+		return false
+	}
+
+	r.mu.RLock()
+	conn := r.conns[p.upstream]
+	r.mu.RUnlock()
+	if conn == nil {
+		// The upstream died or was retired while the human was answering: the
+		// answer has nowhere to go. Still consumed (true) — it DID match a real
+		// pending elicitation; it is just undeliverable now.
+		r.log.Warn("elicitation answer for a gone upstream, dropping", "upstream", p.upstream, "id", gatewayID)
+		return true
+	}
+	msg.ID = p.originalID
+	// Off the caller's goroutine (the client transport's Serve loop): a stdin
+	// write can block on a stuck child, and the loop must keep serving other
+	// clients' traffic regardless — same rule as onUpstreamElicit's refusal.
+	go func() {
+		if err := conn.RespondUpstreamRequest(msg); err != nil {
+			r.log.Warn("deliver elicitation answer failed", "upstream", p.upstream, "id", gatewayID, "err", err)
+		}
+	}()
+	return true
+}
+
+// withLogger stamps the emitting upstream's name into a notifications/message
+// params object before it is forwarded to the client (Round 3). The spec's
+// optional `logger` field is exactly this hook: the client sees ONE multiplexed
+// stream of log messages from N upstreams, and without the source name they
+// are indistinguishable — this is the single deliberate exception to the
+// "forward params verbatim" rule. A logger the upstream itself set is
+// preserved under the upstream's namespace ("<upstream>__<original>", the same
+// separator tool names use); every other field passes through untouched. An
+// unparseable or non-object params value is forwarded verbatim: enriching must
+// never break the message.
+func withLogger(params json.RawMessage, upstream string) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(params, &obj) != nil || obj == nil {
+		return params // absent, malformed, or JSON null: nothing to enrich
+	}
+	logger := upstream
+	var orig string
+	if raw, ok := obj["logger"]; ok && json.Unmarshal(raw, &orig) == nil && orig != "" {
+		logger = upstream + NameSeparator + orig
+	}
+	obj["logger"] = mustJSONString(logger)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return params // unreachable for a map of RawMessage; stay safe anyway
+	}
+	return out
+}
+
 // Reload applies a new configuration to the running gateway without a restart
 // (Stage 7d, triggered by SIGHUP). It diffs newCfg's enabled upstreams against
 // the currently live ones and:
@@ -1088,6 +1819,15 @@ func (r *Registry) notifyCatalogChanged() {
 //     only its projection did, so a deny-list edit takes effect on SIGHUP
 //     without any upstream downtime;
 //   - UNCHANGED: left running untouched.
+//
+// Call-limit changes (rate_limit / max_concurrent / max_result_bytes /
+// call_timeout, Round 6) never require a relaunch: SameLaunch deliberately
+// excludes them, so an upstream whose ONLY change is a limit lands in
+// UNCHANGED — the limits are re-read from the live config on every call
+// (Effective*For via r.config()), and the cached limiter/semaphore instances
+// are rebuilt lazily on the next call when their values differ (see
+// limiterFor/semFor in limits.go). The same applies to the global limit knobs:
+// swapping r.cfg below is all a reload needs to do for them.
 //
 // newCfg MUST already be validated (serve.go loads it via config.Load, which
 // validates) — Reload assumes it is well-formed. The plan is computed under the
@@ -1221,6 +1961,8 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		u       config.Upstream
 		conn    Upstream
 		tools   []mcp.Tool
+		aux     auxCatalog
+		meta    handshakeMeta
 		err     error
 		changed bool // true: a relaunched (changed) upstream, its old entry already dropped; false: a newly added one
 	}
@@ -1234,16 +1976,16 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 			// comment above). The relaunched catalog merges after g.Wait().
 			r.retireAndClose(u.Name)
 			r.dropUpstream(u.Name)
-			conn, tools, err := r.launch(ctx, u)
-			results[i] = launchResult{u: u, conn: conn, tools: tools, err: err, changed: true}
+			conn, tools, aux, meta, err := r.launch(ctx, u)
+			results[i] = launchResult{u: u, conn: conn, tools: tools, aux: aux, meta: meta, err: err, changed: true}
 			return nil
 		})
 	}
 	for j, u := range added {
 		idx, u := len(changed)+j, u
 		g.Go(func() error {
-			conn, tools, err := r.launch(ctx, u)
-			results[idx] = launchResult{u: u, conn: conn, tools: tools, err: err}
+			conn, tools, aux, meta, err := r.launch(ctx, u)
+			results[idx] = launchResult{u: u, conn: conn, tools: tools, aux: aux, meta: meta, err: err}
 			return nil
 		})
 	}
@@ -1265,11 +2007,11 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 		case res.changed:
 			// The old entry is long gone (dropped in the goroutine), so this is
 			// a plain merge into an empty name — same call as the added case.
-			r.merge(res.u.Name, res.conn, res.tools)
+			r.merge(res.u.Name, res.conn, res.tools, res.aux, res.meta)
 			r.superviseUpstream(res.u, res.conn)
 			r.log.Info("upstream reconfigured by reload", "upstream", res.u.Name, "tools", len(res.tools))
 		default:
-			r.merge(res.u.Name, res.conn, res.tools)
+			r.merge(res.u.Name, res.conn, res.tools, res.aux, res.meta)
 			r.superviseUpstream(res.u, res.conn)
 			r.log.Info("upstream added by reload", "upstream", res.u.Name, "tools", len(res.tools))
 		}
@@ -1300,7 +2042,10 @@ func (r *Registry) remergeUpstream(name string) {
 		return
 	}
 	tools := r.rawTools[name] // read BEFORE installLocked's drop, which deletes the entry
-	r.installLocked(name, conn, tools, "upstream catalog re-projected")
+	// nil meta/aux: a filter-only re-projection runs no new handshake and
+	// touches nothing upstream — keep the recorded metadata and the prompt/
+	// resource/template lists.
+	r.installLocked(name, conn, tools, nil, nil, "upstream catalog re-projected")
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
@@ -1356,6 +2101,337 @@ func (r *Registry) ToolCount() int {
 	return len(r.tools)
 }
 
+// Prompts returns the aggregated, namespaced prompt catalog, sorted by name
+// for deterministic output — Tools()'s prompts twin. Unlike Tools it builds a
+// fresh slice on every call, deliberately without a cachedTools-style cache:
+// prompt catalogs are typically tiny (units, not hundreds) and prompts/list is
+// far rarer than tools/list, so the cache's invalidation bookkeeping would
+// cost more in complexity than the copy costs in CPU. Revisit if either
+// assumption breaks.
+func (r *Registry) Prompts() []PromptDescriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]PromptDescriptor, 0, len(r.prompts))
+	for _, d := range r.prompts {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// GetPrompt routes a namespaced prompts/get to its owning upstream, rewriting
+// the name back to the upstream's original before forwarding — CallTool's
+// prompts twin, including the sanitized error contract: a routing/transport
+// failure is logged here with full detail and returned as a short message
+// naming only the prompt the client itself asked for (dispatch.go forwards
+// the text verbatim to the client). The returned *mcp.Message is the raw
+// upstream response (which may itself carry a JSON-RPC error). Like CallTool
+// it retries once on upstream.ErrConnClosedBeforeSend against a re-resolved
+// fresh connection (callWithConnRetry).
+func (r *Registry) GetPrompt(ctx context.Context, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
+	r.mu.RLock()
+	rt, ok := r.promptRoute[namespaced]
+	conn := r.conns[rt.upstream]
+	r.mu.RUnlock()
+
+	if !ok || conn == nil {
+		return nil, fmt.Errorf("unknown prompt %q", namespaced)
+	}
+
+	resolve := func() Upstream {
+		r.mu.RLock()
+		rt2, ok2 := r.promptRoute[namespaced]
+		conn2 := r.conns[rt2.upstream]
+		r.mu.RUnlock()
+		if !ok2 {
+			return nil
+		}
+		rt = rt2
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodPromptsGet, namespaced, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, rt.upstream, func(ctx context.Context) error {
+				var err error
+				resp, err = c.GetPrompt(ctx, rt.original, arguments)
+				return err
+			})
+			return resp, err
+		})
+	if err != nil {
+		r.log.Warn("prompt get failed", "prompt", namespaced, "upstream", rt.upstream, "err", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("get prompt %q timed out", namespaced)
+		}
+		return nil, fmt.Errorf("get prompt %q failed", namespaced)
+	}
+	return resp, nil
+}
+
+// Resources returns the aggregated resource catalog, sorted by URI for
+// deterministic output — Prompts()'s resources twin (Round 5), with the same
+// deliberate no-cache choice (see Prompts). URIs are the upstreams' own,
+// never namespaced.
+func (r *Registry) Resources() []ResourceDescriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]ResourceDescriptor, 0, len(r.resources))
+	for _, d := range r.resources {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].URI < out[j].URI })
+	return out
+}
+
+// ResourceTemplates returns the aggregated resource-template catalog in MERGE
+// order (config order at Start/Reload) — deliberately NOT sorted: this is the
+// exact order resolveResourceOwner matches templates in, and the list the
+// client sees should tell the truth about which template wins an overlap. The
+// slice is a copy; mutating it does not affect the registry.
+func (r *Registry) ResourceTemplates() []ResourceTemplateDescriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]ResourceTemplateDescriptor(nil), r.resourceTemplates...)
+}
+
+// resolveResourceOwner resolves which upstream owns a concrete resource URI:
+// the exact catalog entry when one exists, otherwise the FIRST resource
+// template (in merge order) whose pattern matches the URI. Shared by
+// ReadResource and Complete (ref/resource), so both route identically.
+// Assumes r.mu is NOT held.
+func (r *Registry) resolveResourceOwner(uri string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if owner, ok := r.resourceRoute[uri]; ok {
+		return owner, true
+	}
+	for _, d := range r.resourceTemplates {
+		if d.re != nil && d.re.MatchString(uri) {
+			return d.Upstream, true
+		}
+	}
+	return "", false
+}
+
+// ReadResource routes a resources/read to the upstream owning the URI —
+// GetPrompt's resources twin (Round 5), except nothing is rewritten: the URI
+// travels to the upstream exactly as the client sent it. Ownership is the
+// exact catalog entry or the first matching resource template (see
+// resolveResourceOwner). An unowned uri wraps ErrUnknownResource so the
+// dispatcher can answer Invalid params; transport failures follow the same
+// sanitized-error contract as CallTool/GetPrompt (full detail logged here,
+// only the client's own uri echoed back), including CallTool's one retry on
+// upstream.ErrConnClosedBeforeSend (callWithConnRetry).
+func (r *Registry) ReadResource(ctx context.Context, uri string) (*mcp.Message, error) {
+	owner, ok := r.resolveResourceOwner(uri)
+	r.mu.RLock()
+	conn := r.conns[owner]
+	r.mu.RUnlock()
+
+	if !ok || conn == nil {
+		return nil, fmt.Errorf("%w %q", ErrUnknownResource, uri)
+	}
+
+	resolve := func() Upstream {
+		owner2, ok2 := r.resolveResourceOwner(uri)
+		if !ok2 {
+			return nil
+		}
+		owner = owner2
+		r.mu.RLock()
+		conn2 := r.conns[owner]
+		r.mu.RUnlock()
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodResourceRead, uri, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
+				var err error
+				resp, err = c.ReadResource(ctx, uri)
+				return err
+			})
+			return resp, err
+		})
+	if err != nil {
+		r.log.Warn("resource read failed", "uri", uri, "upstream", owner, "err", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("read resource %q timed out", uri)
+		}
+		return nil, fmt.Errorf("read resource %q failed", uri)
+	}
+	return resp, nil
+}
+
+// Complete routes a completion/complete to the upstream owning the referenced
+// prompt or resource (Round 5). For a ref/prompt the client sends the
+// CLIENT-FACING namespaced prompt name (the only name it ever saw in
+// prompts/list), so — exactly like GetPrompt — the registry resolves the owner
+// via promptRoute and rewrites ref.name back to the upstream's original before
+// forwarding. For a ref/resource the URI is never namespaced: it resolves via
+// resolveResourceOwner (exact entry or template match) and is forwarded as-is.
+// Argument/context/_meta travel verbatim in both cases. A ref that resolves to
+// no upstream wraps ErrUnknownCompletionRef (dispatcher answers Invalid
+// params); transport failures follow the sanitized-error contract.
+func (r *Registry) Complete(ctx context.Context, params mcp.CompletionCompleteParams) (*mcp.Message, error) {
+	var owner, refDesc string
+	switch params.Ref.Type {
+	case mcp.CompletionRefPrompt:
+		refDesc = fmt.Sprintf("prompt %q", params.Ref.Name)
+		r.mu.RLock()
+		rt, ok := r.promptRoute[params.Ref.Name]
+		r.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrUnknownCompletionRef, refDesc)
+		}
+		owner = rt.upstream
+		params.Ref.Name = rt.original // the upstream knows only its own name
+	case mcp.CompletionRefResource:
+		refDesc = fmt.Sprintf("resource %q", params.Ref.URI)
+		var ok bool
+		owner, ok = r.resolveResourceOwner(params.Ref.URI)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrUnknownCompletionRef, refDesc)
+		}
+	default:
+		return nil, fmt.Errorf("%w: unsupported ref type %q", ErrUnknownCompletionRef, params.Ref.Type)
+	}
+
+	r.mu.RLock()
+	conn := r.conns[owner]
+	r.mu.RUnlock()
+	if conn == nil {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownCompletionRef, refDesc)
+	}
+
+	// The retry re-resolves by owner name only: for a ref/prompt the name was
+	// already rewritten to the upstream's original above, so re-running the
+	// route lookup is impossible — a fresh connection under the same upstream
+	// name is exactly what a reload/restart installs anyway.
+	resolve := func() Upstream {
+		r.mu.RLock()
+		conn2 := r.conns[owner]
+		r.mu.RUnlock()
+		return conn2
+	}
+	resp, err := r.callWithConnRetry(mcp.MethodCompletionComplete, refDesc, conn, resolve,
+		func(c Upstream, _ bool) (*mcp.Message, error) {
+			var resp *mcp.Message
+			err := r.withCallTimeoutFor(ctx, owner, func(ctx context.Context) error {
+				var err error
+				resp, err = c.Complete(ctx, mcp.MustParams(params))
+				return err
+			})
+			return resp, err
+		})
+	if err != nil {
+		r.log.Warn("completion failed", "ref", refDesc, "upstream", owner, "err", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("completion for %s timed out", refDesc)
+		}
+		return nil, fmt.Errorf("completion for %s failed", refDesc)
+	}
+	return resp, nil
+}
+
+// Instructions aggregates the live upstreams' initialize instructions into one
+// string for the gateway's own InitializeResult.Instructions: each non-empty
+// entry becomes a "## <upstream>" section, sections are sorted by upstream
+// name (deterministic regardless of map order) and joined by a blank line.
+// Empty when no upstream provided instructions.
+func (r *Registry) Instructions() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.handshakes))
+	for name, m := range r.handshakes {
+		if m.instructions != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	parts := make([]string, len(names))
+	for i, name := range names {
+		parts[i] = "## " + name + "\n" + r.handshakes[name].instructions
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// HasUpstreamCapability reports whether at least one live upstream declared
+// the named capability (e.g. "prompts", "resources", "logging") in its
+// initialize response. The check is deliberately shallow — the key exists in
+// the capabilities object and is not JSON null — because the gateway only
+// needs to know whether advertising the capability itself would be honest;
+// sub-flags (listChanged, subscribe) are the concern of the feature that
+// actually proxies the methods. Consumed by the transport's capability
+// builder from the next rounds on (prompts/resources/logging aggregation).
+func (r *Registry) HasUpstreamCapability(capability string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, m := range r.handshakes {
+		if hasCapability(m.capabilities, capability) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCapability reports whether ONE raw capabilities object declares the named
+// capability: the key exists and is not JSON null. Same deliberately shallow
+// check as HasUpstreamCapability (which loops over it); also used by launch to
+// decide whether an upstream may be asked for prompts/list at all.
+func hasCapability(capabilities json.RawMessage, capability string) bool {
+	var caps map[string]json.RawMessage
+	if json.Unmarshal(capabilities, &caps) != nil {
+		return false // absent or malformed capabilities object: declares nothing
+	}
+	v, ok := caps[capability]
+	return ok && string(v) != "null"
+}
+
+// SetLogLevel fans a client's logging/setLevel out to every live upstream that
+// declared the logging capability in its initialize response (Round 3). The
+// level string is forwarded verbatim — the gateway does not validate it against
+// the RFC 5424 set (see mcp.LoggingSetLevelParams); an upstream rejecting an
+// unknown level does so with its own JSON-RPC error, which lands here as a
+// per-upstream Warn. Per the spec the response to logging/setLevel is an empty
+// result, so a partial upstream failure is NOT surfaced to the client: the
+// gateway's job is to try every capable upstream, and the ones that accepted
+// the level are now honoring it. The returned error is therefore always nil
+// today; the error signature stays so the dispatcher need not change if a
+// future policy (e.g. "every single upstream refused") wants to surface one.
+//
+// The fan-out is parallel (same spirit as Start's bring-up): each SetLogLevel
+// is bounded by that upstream's call timeout, and one slow upstream must not
+// serialize the rest behind it.
+func (r *Registry) SetLogLevel(ctx context.Context, level string) error {
+	// Snapshot the logging-capable connections under the read lock; the RPCs
+	// run outside it (no I/O under r.mu).
+	r.mu.RLock()
+	targets := make(map[string]Upstream, len(r.conns))
+	for name, conn := range r.conns {
+		if hasCapability(r.handshakes[name].capabilities, "logging") {
+			targets[name] = conn
+		}
+	}
+	r.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for name, conn := range targets {
+		wg.Add(1)
+		go func(name string, conn Upstream) {
+			defer wg.Done()
+			if err := r.withCallTimeoutFor(ctx, name, func(ctx context.Context) error {
+				return conn.SetLogLevel(ctx, level)
+			}); err != nil {
+				r.log.Warn("logging/setLevel failed", "upstream", name, "level", level, "err", err)
+			}
+		}(name, conn)
+	}
+	wg.Wait()
+	return nil
+}
+
 // CallTool routes a namespaced tool call to its owning upstream, rewriting the
 // name back to the upstream's original before forwarding. It records an audit
 // entry (metadata only — never the arguments). The returned *mcp.Message is the
@@ -1369,7 +2445,7 @@ func (r *Registry) ToolCount() int {
 // upstream name or an internal transport error string here would leak the
 // gateway's topology/internals to whoever holds a valid auth_token (found by
 // code review — the previous message included both).
-func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
+func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	r.mu.RLock()
 	rt, ok := r.toolRoute[namespaced]
 	conn := r.conns[rt.upstream]
@@ -1379,36 +2455,26 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 		return nil, fmt.Errorf("unknown tool %q", namespaced)
 	}
 
-	resp, err := r.callUpstream(ctx, conn, rt, namespaced, arguments)
-	// The connection can be closed between the RUnlock above and the call — a
-	// concurrent Reload/auto-restart may already have installed a FRESH
-	// connection under the same name. ErrConnClosedBeforeSend guarantees the
-	// request was never written to the upstream, so ONE retry against the
-	// re-resolved connection is safe — but only if it actually resolved to a
-	// DIFFERENT connection (retrying the same dead conn is pointless). A plain
-	// late ErrConnClosed (failure AFTER the request was sent) is deliberately
-	// NOT retried: the upstream may have executed the (potentially
-	// non-idempotent) tool already, and double execution is worse than an
-	// honest error.
-	//
-	// The retry deliberately reuses the caller's ctx rather than granting
-	// itself fresh time — the client's deadline must bound the WHOLE call,
-	// retries included, or it stops meaning anything. In practice the retry
-	// still gets essentially the full budget: ErrConnClosedBeforeSend comes
-	// only from the pre-write closed-connection check (no I/O, ~zero time
-	// spent), and each attempt gets its own EffectiveCallTimeout inside
-	// callUpstream, capped by ctx.
-	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+	resolve := func() Upstream {
 		r.mu.RLock()
 		rt2, ok2 := r.toolRoute[namespaced]
 		conn2 := r.conns[rt2.upstream]
 		r.mu.RUnlock()
-		if ok2 && conn2 != nil && conn2 != conn {
-			r.log.Info("tool call hit a closed connection before send, retrying on the fresh one",
-				"tool", namespaced, "upstream", rt2.upstream)
-			resp, err = r.callUpstream(ctx, conn2, rt2, namespaced, arguments)
+		if !ok2 {
+			return nil
 		}
+		rt = rt2
+		return conn2
 	}
+	resp, err := r.callWithConnRetry(mcp.MethodToolsCall, namespaced, conn, resolve,
+		func(c Upstream, retry bool) (*mcp.Message, error) {
+			// The retry runs UNGUARDED: the first attempt already charged the
+			// rate-limit token and cycled the semaphore without sending a
+			// byte, so charging the guards again would bill one logical client
+			// call twice — at rps=1/burst=1 that stalls the retry a full
+			// refill interval for nothing (found by review).
+			return r.callUpstream(ctx, c, rt, namespaced, arguments, meta, !retry)
+		})
 	if err != nil {
 		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -1419,19 +2485,64 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments js
 	return resp, nil
 }
 
+// callWithConnRetry runs call against conn and, when it fails with
+// upstream.ErrConnClosedBeforeSend, re-resolves the connection (resolve) and
+// retries exactly ONCE against the fresh one — the shared retry policy of
+// CallTool, GetPrompt, ReadResource and Complete. method/target only label the
+// retry log line.
+//
+// The connection can be closed between the caller's route resolution and the
+// call — a concurrent Reload/auto-restart may already have installed a FRESH
+// connection under the same name. ErrConnClosedBeforeSend guarantees the
+// request was never written to the upstream, so ONE retry against the
+// re-resolved connection is safe — but only if resolve actually produced a
+// DIFFERENT live connection (retrying the same dead conn is pointless). A
+// plain late ErrConnClosed (failure AFTER the request was sent) is
+// deliberately NOT retried: the upstream may have executed the (potentially
+// non-idempotent) operation already, and double execution is worse than an
+// honest error.
+//
+// The retry deliberately reuses the attempt's original ctx rather than
+// granting itself fresh time — the client's deadline must bound the WHOLE
+// call, retries included, or it stops meaning anything. In practice the retry
+// still gets essentially the full budget: ErrConnClosedBeforeSend comes only
+// from the pre-write closed-connection check (no I/O, ~zero time spent), and
+// each attempt gets its own EffectiveCallTimeout, capped by ctx.
+//
+// call receives retry=true on the second attempt, so tools/call can skip the
+// rate-limit/concurrency guards the first attempt already charged (see
+// CallTool); the other methods have no guards and ignore the flag.
+func (r *Registry) callWithConnRetry(method, target string, conn Upstream,
+	resolve func() Upstream, call func(conn Upstream, retry bool) (*mcp.Message, error)) (*mcp.Message, error) {
+	resp, err := call(conn, false)
+	if err != nil && errors.Is(err, upstream.ErrConnClosedBeforeSend) {
+		if conn2 := resolve(); conn2 != nil && conn2 != conn {
+			r.log.Info("call hit a closed connection before send, retrying on the fresh one",
+				"method", method, "target", target)
+			resp, err = call(conn2, true)
+		}
+	}
+	return resp, err
+}
+
 // callUpstream performs ONE forwarding attempt against a resolved connection,
-// with its own timeout, audit record and (opt-in) payload record — each attempt
-// CallTool makes is audited separately, the failed first try and the retried
-// second one alike; nothing is hidden from the call journal.
-func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments json.RawMessage) (*mcp.Message, error) {
+// with audit record and (opt-in) payload record — each attempt CallTool makes
+// is audited separately, the failed first try and the retried second one
+// alike, a guard rejection the same as a transport failure; nothing is hidden
+// from the call journal. The recorded duration includes any time spent
+// queueing on the guards: that is the latency the client actually
+// experienced. guarded selects whether the attempt passes the rate-limit/
+// concurrency guards (guardedCall) or skips them (timedCall) — false only for
+// CallTool's ErrConnClosedBeforeSend retry, whose first attempt already
+// charged them (see limits.go).
+func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments, meta json.RawMessage, guarded bool) (*mcp.Message, error) {
 	start := time.Now()
-	var resp *mcp.Message
-	err := r.withCallTimeout(ctx, func(ctx context.Context) error {
-		var err error
-		resp, err = conn.CallTool(ctx, rt.original, arguments)
-		return err
-	})
-	r.audit(rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
+	call := r.guardedCall
+	if !guarded {
+		call = r.timedCall
+	}
+	resp, err := call(ctx, conn, rt, arguments, meta)
+	r.audit(ctx, rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
 	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
 	return resp, err
 }
@@ -1451,7 +2562,11 @@ func callOutcome(resp *mcp.Message, err error) (ok bool, errMsg string) {
 }
 
 // audit writes one CallRecord. Arguments are never logged (may hold secrets).
-func (r *Registry) audit(up, method, tool string, start time.Time, resp *mcp.Message, err error) {
+// The calling client's identity ("name/version" from its initialize, if the
+// transport attached one via WithClient) is read from ctx — empty when the
+// transport could not identify the client (see the HTTP limitation in
+// transport.handlePost).
+func (r *Registry) audit(ctx context.Context, up, method, tool string, start time.Time, resp *mcp.Message, err error) {
 	if r.callLog == nil {
 		return
 	}
@@ -1461,6 +2576,7 @@ func (r *Registry) audit(up, method, tool string, start time.Time, resp *mcp.Mes
 		Upstream: up,
 		Method:   method,
 		Tool:     tool,
+		Client:   ClientFromContext(ctx),
 		Duration: time.Since(start),
 		OK:       ok,
 		Err:      errMsg, // transport error or upstream error message; no arguments

@@ -38,6 +38,7 @@ func (p *pagingTransport) notify(context.Context, string, json.RawMessage) error
 func (p *pagingTransport) Name() string                                          { return "paging" }
 func (p *pagingTransport) Close() error                                          { return nil }
 func (p *pagingTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (p *pagingTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestListToolsFollowsPagination guards the paginate refactor: a well-behaved
 // multi-page catalog is still aggregated across all pages, in order.
@@ -60,6 +61,72 @@ func TestListToolsFollowsPagination(t *testing.T) {
 	}
 }
 
+// TestListPromptsFollowsPagination is TestListToolsFollowsPagination's Round 4
+// twin: a multi-page prompt catalog is aggregated across all pages, in order.
+func TestListPromptsFollowsPagination(t *testing.T) {
+	tr := &pagingTransport{itemsKey: "prompts", pages: 3}
+	c := &Conn{transport: tr}
+
+	prompts, err := c.ListPrompts(context.Background())
+	if err != nil {
+		t.Fatalf("ListPrompts: %v", err)
+	}
+	if len(prompts) != 3 {
+		t.Fatalf("got %d prompts, want 3 (one per page)", len(prompts))
+	}
+	if prompts[0].Name != "item-1" || prompts[2].Name != "item-3" {
+		t.Errorf("pages aggregated out of order: %+v", prompts)
+	}
+	if tr.calls != 3 {
+		t.Errorf("made %d calls, want 3", tr.calls)
+	}
+}
+
+// TestListPromptsErrorStaysFatal pins the deliberate asymmetry with
+// ListResources: prompts/list is only ever called for an upstream that
+// DECLARED the prompts capability, so even method-not-found is a hard error
+// here (the registry, not this layer, decides to degrade it to "no prompts").
+func TestListPromptsErrorStaysFatal(t *testing.T) {
+	c := &Conn{transport: &errorTransport{code: mcp.CodeMethodNotFound}}
+	if _, err := c.ListPrompts(context.Background()); err == nil {
+		t.Fatal("prompts/list method-not-found must stay a hard error")
+	}
+}
+
+// TestGetPromptWireParams pins the wire contract of GetPrompt: params carry
+// the (already original, un-namespaced) name and the caller's arguments byte
+// for byte; absent arguments stay absent — nothing invented.
+func TestGetPromptWireParams(t *testing.T) {
+	tr := &captureTransport{}
+	c := &Conn{transport: tr}
+
+	args := json.RawMessage(`{"style":"formal","n":[1,2]}`)
+	if _, err := c.GetPrompt(context.Background(), "greet", args); err != nil {
+		t.Fatalf("GetPrompt with arguments: %v", err)
+	}
+	var withArgs map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &withArgs); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if got := string(withArgs["name"]); got != `"greet"` {
+		t.Errorf("sent name = %s, want \"greet\"", got)
+	}
+	if got := string(withArgs["arguments"]); got != string(args) {
+		t.Errorf("sent arguments = %s, want the caller's bytes %s", got, args)
+	}
+
+	if _, err := c.GetPrompt(context.Background(), "greet", nil); err != nil {
+		t.Fatalf("GetPrompt without arguments: %v", err)
+	}
+	var noArgs map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &noArgs); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if _, present := noArgs["arguments"]; present {
+		t.Errorf("params carry an invented arguments key: %s", tr.params)
+	}
+}
+
 // TestListPaginationBounded pins the page cap: an upstream that ALWAYS returns
 // a non-empty nextCursor must produce an error after maxPaginationPages pages
 // — not spin the loop forever (previously only a caller-side ctx timeout, if
@@ -72,6 +139,7 @@ func TestListPaginationBounded(t *testing.T) {
 	}{
 		{"tools", "tools", func(c *Conn) error { _, err := c.ListTools(context.Background()); return err }},
 		{"resources", "resources", func(c *Conn) error { _, err := c.ListResources(context.Background()); return err }},
+		{"prompts", "prompts", func(c *Conn) error { _, err := c.ListPrompts(context.Background()); return err }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -102,11 +170,13 @@ func (e *errorTransport) notify(context.Context, string, json.RawMessage) error 
 func (e *errorTransport) Name() string                                          { return "erroring" }
 func (e *errorTransport) Close() error                                          { return nil }
 func (e *errorTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (e *errorTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
 // TestListResourcesMethodNotFoundIsEmptyCatalog guards the one asymmetry the
-// paginate refactor had to preserve: resources/list answered with
-// method-not-found (upstream has no resources capability) is an EMPTY catalog,
-// not an error — while for tools/list the same answer stays fatal.
+// paginate refactor had to preserve: resources/list (and, since Round 5,
+// resources/templates/list) answered with method-not-found (upstream has no
+// resources capability / no templates sub-method) is an EMPTY catalog, not an
+// error — while for tools/list the same answer stays fatal.
 func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 	c := &Conn{transport: &errorTransport{code: mcp.CodeMethodNotFound}}
 
@@ -118,13 +188,75 @@ func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 		t.Fatalf("want empty catalog, got %+v", res)
 	}
 
+	tpls, err := c.ListResourceTemplates(context.Background())
+	if err != nil {
+		t.Fatalf("templates method-not-found must mean empty catalog, got error: %v", err)
+	}
+	if len(tpls) != 0 {
+		t.Fatalf("want empty template catalog, got %+v", tpls)
+	}
+
 	if _, err := c.ListTools(context.Background()); err == nil {
 		t.Fatal("tools/list method-not-found must stay a hard error")
 	}
 
-	// Any OTHER error code stays fatal for resources too.
+	// Any OTHER error code stays fatal for resources and templates too.
 	c = &Conn{transport: &errorTransport{code: mcp.CodeInternalError}}
 	if _, err := c.ListResources(context.Background()); err == nil {
 		t.Fatal("resources/list internal error must stay a hard error")
+	}
+	if _, err := c.ListResourceTemplates(context.Background()); err == nil {
+		t.Fatal("resources/templates/list internal error must stay a hard error")
+	}
+}
+
+// captureTransport records the raw params of the last call it received and
+// answers with an empty successful result — the wire-level probe for what
+// CallTool actually sends.
+type captureTransport struct {
+	params json.RawMessage
+}
+
+func (c *captureTransport) call(_ context.Context, _ string, params json.RawMessage) (*mcp.Message, error) {
+	c.params = params
+	return mcp.NewResult(mcp.IntID(1), json.RawMessage(`{}`)), nil
+}
+
+func (c *captureTransport) notify(context.Context, string, json.RawMessage) error { return nil }
+func (c *captureTransport) Name() string                                          { return "capture" }
+func (c *captureTransport) Close() error                                          { return nil }
+func (c *captureTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (c *captureTransport) StderrTail() ([]string, bool)                          { return nil, false }
+
+// TestCallToolWireParamsCarryMetaExactly pins the wire contract of the `_meta`
+// passthrough: the params CallTool sends carry the client's `_meta` object
+// byte for byte (compact JSON in, identical bytes out), and when the caller
+// supplies none the params contain NO `_meta` key at all — the upstream must
+// see exactly what the client sent, nothing invented.
+func TestCallToolWireParamsCarryMetaExactly(t *testing.T) {
+	tr := &captureTransport{}
+	c := &Conn{transport: tr}
+
+	meta := json.RawMessage(`{"progressToken":42,"vendor":{"k":[1,2]}}`)
+	if _, err := c.CallTool(context.Background(), "fetch", json.RawMessage(`{"q":"x"}`), meta); err != nil {
+		t.Fatalf("CallTool with meta: %v", err)
+	}
+	var withMeta map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &withMeta); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if got := string(withMeta["_meta"]); got != string(meta) {
+		t.Errorf("sent _meta = %s, want the client's bytes %s", got, meta)
+	}
+
+	if _, err := c.CallTool(context.Background(), "fetch", json.RawMessage(`{"q":"x"}`), nil); err != nil {
+		t.Fatalf("CallTool without meta: %v", err)
+	}
+	var noMeta map[string]json.RawMessage
+	if err := json.Unmarshal(tr.params, &noMeta); err != nil {
+		t.Fatalf("decode sent params: %v", err)
+	}
+	if _, present := noMeta["_meta"]; present {
+		t.Errorf("params carry an invented _meta key: %s", tr.params)
 	}
 }

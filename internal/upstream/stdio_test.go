@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -51,7 +52,7 @@ func TestStdioConnHandshakeAndCatalog(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "github", bin, nil,
-		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"}, "0.0.0-test", nil)
+		[]string{"FAKE_NAME=github", "FAKE_TOOLS=search,create_issue"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -80,7 +81,7 @@ func TestStdioConnCallToolEcho(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "web", bin, nil,
-		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=fetch", "FAKE_ECHO=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestStdioConnCallToolEcho(t *testing.T) {
 	}
 
 	args := json.RawMessage(`{"url":"https://example.com"}`)
-	resp, err := conn.CallTool(ctx, "fetch", args)
+	resp, err := conn.CallTool(ctx, "fetch", args, nil)
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
@@ -112,7 +113,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "fs", bin, nil,
-		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=t", "FAKE_ECHO=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			args := json.RawMessage(`{"seq":` + itoa(i) + `}`)
-			out, err := conn.CallTool(ctx, "t", args)
+			out, err := conn.CallTool(ctx, "t", args, nil)
 			results <- res{i, out, err}
 		}(i)
 	}
@@ -157,7 +158,7 @@ func TestStdioConnConcurrentCallsDemux(t *testing.T) {
 
 func TestStdioConnMissingCommand(t *testing.T) {
 	ctx := context.Background()
-	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil, "0.0.0-test", nil)
+	_, err := upstream.StartStdio(ctx, quietLogger(), "x", "definitely-not-a-real-binary-xyz", nil, nil, "0.0.0-test", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for missing command")
 	}
@@ -168,7 +169,7 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 	// not hang.
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestStdioConnCloseWakesPendingCall(t *testing.T) {
 	// A subsequent call must fail promptly.
 	done := make(chan error, 1)
 	go func() {
-		_, err := conn.CallTool(ctx, "t", nil)
+		_, err := conn.CallTool(ctx, "t", nil, nil)
 		done <- err
 	}()
 	select {
@@ -212,7 +213,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 	conn, err := upstream.StartStdio(ctx, logger, "z", bin, nil, []string{
 		"FAKE_TOOLS=t",
 		"FAKE_STDERR_LINES=" + strconv.Itoa(lines),
-	}, "0.0.0-test", nil)
+	}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestStdioConnCloseWaitsForStderrDrain(t *testing.T) {
 func TestStdioConnCloseIsSafeForConcurrentCallers(t *testing.T) {
 	bin := buildFakeServer(t)
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "z", bin, nil, []string{"FAKE_TOOLS=t"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -286,7 +287,7 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 	notified := make(chan string, 4)
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "eager", bin, nil,
 		[]string{"FAKE_TOOLS=t", "FAKE_NOTIFY_ON_START=1"}, "0.0.0-test",
-		func(method string) { notified <- method })
+		func(method string, _ json.RawMessage) { notified <- method }, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -299,6 +300,69 @@ func TestStdioNotifyOnStartNoRace(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("notification callback was not invoked for the startup list_changed")
+	}
+}
+
+// TestStdioCallCancellationNotifiesUpstream (Round 2): when a call's ctx is
+// cancelled AFTER the request reached the upstream, the transport must send a
+// best-effort notifications/cancelled carrying the UPSTREAM-SIDE id the call
+// minted itself — never any client-side id (the gateway's id spaces are fully
+// separated). FAKE_ASYNC_CALLS keeps the fake server's read loop consuming
+// stdin while the delayed call is pending, so it can record the cancellation
+// (FAKE_CANCEL_FILE) the moment it arrives instead of after the delay.
+func TestStdioCallCancellationNotifiesUpstream(t *testing.T) {
+	bin := buildFakeServer(t)
+	cancelFile := filepath.Join(t.TempDir(), "cancelled.jsonl")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "slow", bin, nil,
+		[]string{
+			"FAKE_TOOLS=t",
+			"FAKE_CALL_DELAY=30s",
+			"FAKE_ASYNC_CALLS=1",
+			"FAKE_CANCEL_FILE=" + cancelFile,
+		}, "0.0.0-test", nil, nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Initialize(ctx); err != nil { // upstream-side id 1
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	callCtx, callCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer callCancel()
+	_, err = conn.CallTool(callCtx, "t", nil, nil) // upstream-side id 2
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool err = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The cancelled-notify is fire-and-forget on its own goroutine — poll for
+	// the fake server's record of it.
+	deadline := time.Now().Add(5 * time.Second)
+	var line string
+	for {
+		data, _ := os.ReadFile(cancelFile)
+		if line = strings.TrimSpace(string(data)); line != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("upstream never received notifications/cancelled after ctx cancellation")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal([]byte(line), &p); err != nil {
+		t.Fatalf("decode recorded cancelled params %q: %v", line, err)
+	}
+	// Initialize minted id 1, the call minted id 2 — the notification must
+	// carry exactly the call's own upstream-side id.
+	if string(p.RequestID) != "2" {
+		t.Errorf("cancelled requestId = %s, want the upstream-side call id 2", p.RequestID)
 	}
 }
 
@@ -315,7 +379,7 @@ func TestCloseDoesNotHangOnGrandchildHoldingPipes(t *testing.T) {
 	requireTool(t, "sh")
 	ctx := context.Background()
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "wrap", "sh",
-		[]string{"-c", "sleep 30 & exec cat"}, nil, "0.0.0-test", nil)
+		[]string{"-c", "sleep 30 & exec cat"}, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -344,7 +408,7 @@ func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
 	// sleep is launched DIRECTLY (no sh wrapper) so the cleanup's cancel can
 	// kill it as the immediate child and Close returns without grace periods.
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "stuck", "sleep",
-		[]string{"30"}, nil, "0.0.0-test", nil)
+		[]string{"30"}, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -359,7 +423,7 @@ func TestCallUnblocksOnContextWhenStdinBlocked(t *testing.T) {
 	defer callCancel()
 
 	start := time.Now()
-	_, err = conn.CallTool(callCtx, "t", big)
+	_, err = conn.CallTool(callCtx, "t", big, nil)
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CallTool err=%v, want context.DeadlineExceeded", err)
@@ -383,7 +447,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 	defer cancel()
 
 	conn, err := upstream.StartStdio(ctx, quietLogger(), "hybrid", bin, nil,
-		[]string{"FAKE_TOOLS=t", "FAKE_HYBRID_CALL=1"}, "0.0.0-test", nil)
+		[]string{"FAKE_TOOLS=t", "FAKE_HYBRID_CALL=1"}, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -394,7 +458,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 
 	callCtx, callCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer callCancel()
-	resp, err := conn.CallTool(callCtx, "t", nil)
+	resp, err := conn.CallTool(callCtx, "t", nil, nil)
 	if err == nil {
 		t.Fatalf("CallTool delivered the malformed hybrid as a valid response: %+v", resp)
 	}
@@ -411,7 +475,7 @@ func TestStdioConnHybridResponseNotDelivered(t *testing.T) {
 func TestCallOnClosedConnReturnsBeforeSendSentinel(t *testing.T) {
 	requireTool(t, "cat")
 	ctx := context.Background()
-	conn, err := upstream.StartStdio(ctx, quietLogger(), "c", "cat", nil, nil, "0.0.0-test", nil)
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "c", "cat", nil, nil, "0.0.0-test", nil, nil)
 	if err != nil {
 		t.Fatalf("StartStdio: %v", err)
 	}
@@ -419,7 +483,7 @@ func TestCallOnClosedConnReturnsBeforeSendSentinel(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	_, err = conn.CallTool(ctx, "t", nil)
+	_, err = conn.CallTool(ctx, "t", nil, nil)
 	if !errors.Is(err, upstream.ErrConnClosedBeforeSend) {
 		t.Errorf("err=%v, want errors.Is(err, ErrConnClosedBeforeSend)", err)
 	}
@@ -458,4 +522,42 @@ func itoa(i int) string {
 		b = append([]byte{'-'}, b...)
 	}
 	return string(b)
+}
+
+// TestStderrTailCapturedWithDebugOff: the stderr ring must fill REGARDLESS of
+// log level — that is its whole point (the crash tail must exist in production,
+// where debug logging is off). The fake server writes its stderr lines as
+// stdin closes; Close waits for the drain, so afterwards StderrTail must hold
+// them even though the logger here is at the default (info) level.
+func TestStderrTailCapturedWithDebugOff(t *testing.T) {
+	bin := buildFakeServer(t)
+	ctx := context.Background()
+
+	conn, err := upstream.StartStdio(ctx, quietLogger(), "tailed", bin, nil, []string{
+		"FAKE_TOOLS=t",
+		"FAKE_STDERR_LINES=3",
+	}, "0.0.0-test", nil, nil)
+	if err != nil {
+		t.Fatalf("StartStdio: %v", err)
+	}
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tail, ok := conn.StderrTail()
+	if !ok {
+		t.Fatal("StderrTail ok = false for a stdio connection; want true")
+	}
+	want := []string{"shutdown line 0", "shutdown line 1", "shutdown line 2"}
+	if len(tail) != len(want) {
+		t.Fatalf("StderrTail returned %d lines %q, want %d", len(tail), tail, len(want))
+	}
+	for i, w := range want {
+		if tail[i] != w {
+			t.Errorf("tail[%d] = %q, want %q", i, tail[i], w)
+		}
+	}
 }

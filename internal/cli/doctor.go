@@ -18,7 +18,10 @@ import (
 // auto-restarts anything: a flapping upstream must be REPORTED as it is, not
 // resurrected mid-diagnosis (Stage 8).
 func newDoctorCmd(version string) *cobra.Command {
-	var configPath *string
+	var (
+		configPath *string
+		envFile    *string
+	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check every enabled upstream once and report OK/FAIL per upstream",
@@ -27,14 +30,20 @@ func newDoctorCmd(version string) *cobra.Command {
 			"failure reason. No auto-restart, no call logging: one pass, then exit. The exit\n" +
 			"code is non-zero if any upstream failed, so it is scriptable (CI, cron).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runDoctor(cmd, *configPath, version)
+			return runDoctor(cmd, *configPath, *envFile, version)
 		},
 	}
 	configPath = addConfigFlag(cmd)
+	envFile = addEnvFileFlag(cmd)
 	return cmd
 }
 
-func runDoctor(cmd *cobra.Command, configPath, version string) error {
+func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
+	// The env file must land in the environment BEFORE config.Load expands the
+	// ${VAR} references in the config.
+	if err := applyEnvFile(envFile); err != nil {
+		return err
+	}
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err

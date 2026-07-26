@@ -43,9 +43,10 @@ func New(level string, w io.Writer) *slog.Logger {
 // gateway. This is the shape that Phase 2's log viewer consumes.
 type CallRecord struct {
 	Time     time.Time     `json:"time"`
-	Upstream string        `json:"upstream"` // which upstream served the call
-	Method   string        `json:"method"`   // JSON-RPC method, e.g. "tools/call"
-	Tool     string        `json:"tool"`     // tool/resource name, if applicable
+	Upstream string        `json:"upstream"`         // which upstream served the call
+	Method   string        `json:"method"`           // JSON-RPC method, e.g. "tools/call"
+	Tool     string        `json:"tool"`             // tool/resource name, if applicable
+	Client   string        `json:"client,omitempty"` // calling client, "name/version" from its initialize; empty when unidentified
 	Duration time.Duration `json:"duration_ns"`
 	OK       bool          `json:"ok"`
 	Err      string        `json:"error,omitempty"` // sanitized error, no secrets

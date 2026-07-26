@@ -32,6 +32,43 @@ log_level: info             # debug | info | warn | error
 # debug_payload_log: ./logs/payloads.jsonl
 call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 
+# Call limits (Round 6) — all optional, all hot-reloadable via SIGHUP without
+# restarting any upstream process.
+#
+# rate_limit: a token bucket applied to forwarded tools/call requests, PER
+# upstream (the global block is a default each upstream's own bucket is built
+# from — not one shared budget). rps = tokens refilled per second; burst = how
+# many calls may fire back-to-back (0 is treated as 1). Waiting for a token
+# respects the client's own deadline/cancellation.
+# rate_limit:
+#   rps: 5
+#   burst: 2
+#
+# max_result_bytes: opt-in truncation of oversized TEXTUAL tool results before
+# they reach the client (token protection). Text content blocks are cut to
+# bring the result close to this many bytes and a
+# "[truncated by mcp-gate: ...]" marker is appended; results without text
+# content (images, unknown shapes) pass through unchanged. 0 = unlimited (the
+# default).
+# max_result_bytes: 65536
+
+# Catalog presentation (Round 8) — both optional, hot-reloadable via SIGHUP.
+#
+# catalog_mode: "normal" (or omitted) exposes every namespaced upstream tool in
+# tools/list, as always. "lazy" enables progressive tool disclosure: the client
+# sees exactly THREE gateway meta-tools — gate_search_tools(query),
+# gate_describe(name), gate_call(name, arguments) — and discovers/invokes the
+# real catalog through them on demand, keeping the client's tool list (and its
+# token cost) tiny however many upstreams are aggregated. Direct calls to
+# namespaced tool names keep working in lazy mode.
+# catalog_mode: lazy
+#
+# page_size: opt-in pagination of tools/list — pages of at most this many tools
+# linked by an opaque nextCursor (MCP pagination). 0 / omitted = the whole
+# catalog in one response. PRECEDENCE: ignored when catalog_mode is "lazy" (a
+# fixed list of three meta-tools never paginates).
+# page_size: 50
+
 # Auto-restart policy for stdio upstreams whose child process dies while the
 # gateway runs (a single GLOBAL policy — every upstream restart replays the exact
 # config it was first launched with). HTTP upstreams have no process to restart.
@@ -66,11 +103,39 @@ upstreams:
     # the default "<upstream>__<tool>". Client-facing names must be unique
     # across the whole config. Editable at runtime via SIGHUP without
     # restarting the upstream process.
+    #
+    # Token optimization (opt-in): strip_annotations / strip_output_schema drop
+    # those heavyweight catalog fields; max_description truncates descriptions
+    # to N characters (runes) with a trailing "…" (0 = unlimited); describe
+    # replaces a tool's description wholesale (keyed by ORIGINAL name, like
+    # rename) and is never re-truncated by max_description.
     # tools:
     #   allow: ["search_repositories", "get_issue", "create_issue"]
     #   deny: ["create_issue"]
     #   rename:
     #     search_repositories: "gh_search"
+    #   strip_annotations: true
+    #   strip_output_schema: true
+    #   max_description: 200
+    #   describe:
+    #     get_issue: "Fetch one GitHub issue by number."
+    #
+    # Per-upstream call limits (Round 6) — each overrides its global
+    # counterpart for THIS upstream only; all hot-reloadable via SIGHUP with no
+    # process restart:
+    #   rate_limit — overrides the global bucket parameters (rps: 0 disables
+    #     rate limiting for this upstream even when a global limit is set);
+    #   max_concurrent — cap on simultaneous in-flight tools/call requests to
+    #     this upstream (no global counterpart; 0/omitted = unlimited);
+    #   max_result_bytes — overrides the global cap (an explicit 0 disables it
+    #     for this upstream);
+    #   call_timeout — overrides the global call_timeout for this upstream.
+    # rate_limit:
+    #   rps: 1
+    #   burst: 1
+    # max_concurrent: 4
+    # max_result_bytes: 32768
+    # call_timeout: 120s
 
   # http upstream (Phase 2): an already-running MCP server reached over
   # Streamable HTTP. Set `url` instead of `command` (exactly one of the two).

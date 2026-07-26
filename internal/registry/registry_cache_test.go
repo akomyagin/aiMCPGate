@@ -48,7 +48,7 @@ func TestToolsCacheInvalidatedOnCatalogMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	r.merge("b", b, tools)
+	r.merge("b", b, tools, auxCatalog{}, handshakeMeta{})
 	if got := catalog(); got != "a__x,b__y" {
 		t.Fatalf("catalog after merge = %q, want %q (stale cache?)", got, "a__x,b__y")
 	}

@@ -7,7 +7,33 @@
 //
 //	FAKE_NAME        server name reported in serverInfo/initialize (default "fake")
 //	FAKE_TOOLS       comma-separated tool names to advertise in tools/list
-//	FAKE_ECHO        if "1", tools/call echoes back the received arguments as text
+//	FAKE_ECHO        if "1", tools/call echoes back the received arguments as
+//	                 text; a received `_meta` object is appended as
+//	                 "|_meta=<raw>" so tests can assert the gateway proxied it
+//	FAKE_PROMPTS     comma-separated prompt names to advertise in prompts/list.
+//	                 When non-empty the initialize result also declares the
+//	                 "prompts" capability, and prompts/get answers with a
+//	                 deterministic message that echoes the requested name and
+//	                 raw arguments — so gateway tests can assert both the
+//	                 namespace→original rewrite and verbatim argument passing
+//	                 (Round 4). When empty, no capability is declared and the
+//	                 prompts/* methods fall through to method-not-found.
+//	FAKE_RESOURCES   comma-separated resource URIs to advertise in
+//	                 resources/list. resources/read echoes the requested uri and
+//	                 this server's name back in the contents (Round 5).
+//	FAKE_RESOURCE_TEMPLATES  comma-separated uriTemplates to advertise in
+//	                 resources/templates/list. Either of FAKE_RESOURCES /
+//	                 FAKE_RESOURCE_TEMPLATES being non-empty makes initialize
+//	                 declare the "resources" capability; with both empty the
+//	                 resources/* methods fall through to method-not-found.
+//	FAKE_COMPLETIONS if "1", initialize declares the "completions" capability
+//	                 and completion/complete answers with a single completion
+//	                 value echoing the RAW received params — so gateway tests
+//	                 can assert the ref/prompt name rewrite and verbatim
+//	                 argument forwarding (Round 5).
+//	FAKE_INSTRUCTIONS  if non-empty, reported as `instructions` in the
+//	                 initialize result — used to test the gateway's
+//	                 instructions aggregation
 //	FAKE_CALL_DELAY  Go duration (e.g. "2s") to sleep before answering tools/call;
 //	                 used to exercise the gateway's call-timeout path. Handshake
 //	                 and tools/list are never delayed by it (see FAKE_INIT_DELAY).
@@ -31,6 +57,10 @@
 //	                   many tools/call requests — simulates a stdio upstream that
 //	                   crashes mid-run, exercising the registry's auto-restart
 //	                   supervisor (Stage 7a).
+//	FAKE_CRASH_STDERR  if non-empty, this text is written to stderr as one line
+//	                   right before the FAKE_EXIT_AFTER crash-exit — the "dying
+//	                   words" the gateway's stderr ring buffer must capture and
+//	                   the supervisor must surface in its crash log.
 //	FAKE_TOOLS_FILE  path to a file whose first line, if present, OVERRIDES
 //	                   FAKE_TOOLS for tools/list; re-read on every tools/list so a
 //	                   test can change the advertised catalog at runtime. When the
@@ -52,6 +82,53 @@
 //	                   reading any request — reproduces an upstream that
 //	                   notifies the instant it is launched, the window of the
 //	                   onNotify data race found by independent review.
+//	FAKE_PROGRESS    if "1", every tools/call that carries a `_meta.progressToken`
+//	                   emits one notifications/progress (echoing that token
+//	                   verbatim) BEFORE the call's response — used to test the
+//	                   gateway's upstream→client progress forwarding (Round 2).
+//	FAKE_PROGRESS_FILE  path to a file the server polls (like FAKE_NOTIFY_FILE);
+//	                   when it appears non-empty the server emits one
+//	                   notifications/progress with a fixed token, then truncates
+//	                   the file — used to fire a progress push at a test-chosen
+//	                   moment, e.g. before the client's initialize (Round 2).
+//	FAKE_CANCEL_FILE  path to a file the server APPENDS each received
+//	                   notifications/cancelled's params to (one JSON line) —
+//	                   used to assert the gateway forwarded a cancellation with
+//	                   its own upstream-side request id (Round 2).
+//	FAKE_LOGGING     if "1", the initialize result declares the "logging"
+//	                   capability and logging/setLevel is answered with an empty
+//	                   result; without it the method falls through to
+//	                   method-not-found (Round 3).
+//	FAKE_LOG_FILE    path to a file the server polls (like FAKE_PROGRESS_FILE);
+//	                   when it appears non-empty the server emits one
+//	                   notifications/message with fixed level/data params (and
+//	                   NO logger field — so gateway tests can assert the gateway
+//	                   stamped the upstream name in), then truncates the file so
+//	                   each "touch" fires exactly once (Round 3 test hook).
+//	FAKE_SETLEVEL_FILE  path the server APPENDS each received logging/setLevel's
+//	                   level to (one line per call), REGARDLESS of FAKE_LOGGING —
+//	                   so a test can prove the gateway never sent setLevel to an
+//	                   upstream that declared no logging capability (the file
+//	                   stays absent/empty), and with WHICH level it reached a
+//	                   capable one (Round 3).
+//	FAKE_ELICIT      if "1", every tools/call FIRST sends an elicitation/create
+//	                   REQUEST to its client (id "fake-elicit-<n>", fixed
+//	                   message/requestedSchema params) and waits for the
+//	                   response before answering the call; the tool result text
+//	                   then carries "|elicited=<raw result>" (or
+//	                   "|elicit-error=<code> <message>" when the client/gateway
+//	                   answered with a JSON-RPC error, or "|elicit-timeout"
+//	                   after 10s of silence) — used to test the gateway's
+//	                   upstream→client elicitation proxying (Round 14). Each
+//	                   such call runs on its own goroutine so the main loop
+//	                   keeps reading stdin for the response.
+//	FAKE_ASYNC_CALLS  if "1", each tools/call is answered on its OWN goroutine
+//	                   (FAKE_CALL_DELAY sleeps there), so the main read loop
+//	                   keeps consuming stdin meanwhile — required by the
+//	                   cancellation tests, where a notifications/cancelled must
+//	                   be read WHILE a delayed call is still pending. Not
+//	                   combined with FAKE_EXIT_AFTER/FAKE_HYBRID_CALL (the sync
+//	                   path keeps those).
 //
 // It intentionally has zero third-party deps so `go run` / `go build` of it is
 // hermetic.
@@ -89,6 +166,20 @@ func main() {
 		tools = strings.Split(raw, ",")
 	}
 	echo := os.Getenv("FAKE_ECHO") == "1"
+	var prompts []string
+	if raw := os.Getenv("FAKE_PROMPTS"); raw != "" {
+		prompts = strings.Split(raw, ",")
+	}
+	var resources []string
+	if raw := os.Getenv("FAKE_RESOURCES"); raw != "" {
+		resources = strings.Split(raw, ",")
+	}
+	var templates []string
+	if raw := os.Getenv("FAKE_RESOURCE_TEMPLATES"); raw != "" {
+		templates = strings.Split(raw, ",")
+	}
+	hasResources := len(resources) > 0 || len(templates) > 0
+	completions := os.Getenv("FAKE_COMPLETIONS") == "1"
 	var callDelay time.Duration
 	if raw := os.Getenv("FAKE_CALL_DELAY"); raw != "" {
 		callDelay, _ = time.ParseDuration(raw)
@@ -105,6 +196,14 @@ func main() {
 	hybridCall := os.Getenv("FAKE_HYBRID_CALL") == "1"
 	toolsFile := os.Getenv("FAKE_TOOLS_FILE")
 	notifyFile := os.Getenv("FAKE_NOTIFY_FILE")
+	progress := os.Getenv("FAKE_PROGRESS") == "1"
+	progressFile := os.Getenv("FAKE_PROGRESS_FILE")
+	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
+	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
+	elicit := os.Getenv("FAKE_ELICIT") == "1"
+	logging := os.Getenv("FAKE_LOGGING") == "1"
+	logFile := os.Getenv("FAKE_LOG_FILE")
+	setLevelFile := os.Getenv("FAKE_SETLEVEL_FILE")
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -151,6 +250,51 @@ func main() {
 		}()
 	}
 
+	// progress poller: when progressFile becomes non-empty, emit one
+	// notifications/progress with a fixed token and truncate the file so each
+	// "touch" fires exactly once (Round 2 test hook, same shape as notifyFile).
+	if progressFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Millisecond)
+				data, err := os.ReadFile(progressFile)
+				if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+					continue
+				}
+				_ = os.WriteFile(progressFile, nil, 0o600)
+				write(message{Method: "notifications/progress",
+					Params: json.RawMessage(`{"progressToken":"fake-token","progress":1}`)})
+			}
+		}()
+	}
+
+	// log-message poller: when logFile becomes non-empty, emit one
+	// notifications/message and truncate the file so each "touch" fires exactly
+	// once (Round 3 test hook, same shape as progressFile). Deliberately no
+	// `logger` field in the params: the gateway is expected to stamp the
+	// upstream name in, and tests assert exactly that.
+	if logFile != "" {
+		go func() {
+			for {
+				time.Sleep(20 * time.Millisecond)
+				data, err := os.ReadFile(logFile)
+				if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+					continue
+				}
+				_ = os.WriteFile(logFile, nil, 0o600)
+				write(message{Method: "notifications/message",
+					Params: json.RawMessage(`{"level":"info","data":"fake log line"}`)})
+			}
+		}()
+	}
+
+	// elicitation plumbing (FAKE_ELICIT): each elicit-enabled tools/call runs
+	// on its own goroutine, registers a waiter for its "fake-elicit-<n>" id and
+	// blocks on it; the main read loop routes RESPONSES (no method) here.
+	var elicitMu sync.Mutex
+	elicitWaiters := map[string]chan message{}
+	elicitSeq := 0
+
 	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -161,14 +305,48 @@ func main() {
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			continue
 		}
+		if req.Method == "" && (req.Result != nil || req.Error != nil) {
+			// A response to a server-initiated request (elicitation/create):
+			// hand it to the waiting tools/call goroutine by id. An unknown id
+			// is silently dropped, like a real server would.
+			elicitMu.Lock()
+			ch, ok := elicitWaiters[string(req.ID)]
+			if ok {
+				delete(elicitWaiters, string(req.ID))
+			}
+			elicitMu.Unlock()
+			if ok {
+				ch <- req
+			}
+			continue
+		}
 		switch req.Method {
 		case "initialize":
 			if initDelay > 0 {
 				time.Sleep(initDelay)
 			}
+			capList := []string{`"tools":{}`}
+			if len(prompts) > 0 {
+				capList = append(capList, `"prompts":{}`)
+			}
+			if logging {
+				capList = append(capList, `"logging":{}`)
+			}
+			if hasResources {
+				capList = append(capList, `"resources":{}`)
+			}
+			if completions {
+				capList = append(capList, `"completions":{}`)
+			}
+			caps := "{" + strings.Join(capList, ",") + "}"
 			result := fmt.Sprintf(
-				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":%q,"version":"1.0.0"}}`,
-				name)
+				`{"protocolVersion":"2025-06-18","capabilities":%s,"serverInfo":{"name":%q,"version":"1.0.0"}`,
+				caps, name)
+			if instr := os.Getenv("FAKE_INSTRUCTIONS"); instr != "" {
+				b, _ := json.Marshal(instr)
+				result += `,"instructions":` + string(b)
+			}
+			result += "}"
 			write(message{ID: req.ID, Result: json.RawMessage(result)})
 		case "notifications/initialized":
 			// no response
@@ -178,8 +356,140 @@ func main() {
 			}
 			write(message{ID: req.ID, Result: json.RawMessage(toolsListResult(currentTools(toolsFile, tools)))})
 		case "resources/list":
-			write(message{ID: req.ID, Result: json.RawMessage(`{"resources":[]}`)})
+			if !hasResources {
+				// No FAKE_RESOURCES: behave like a server without the resources
+				// capability — the method is simply unknown (mirrors prompts).
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(resourcesListResult(resources))})
+		case "resources/templates/list":
+			if !hasResources {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/templates/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(templatesListResult(templates))})
+		case "resources/read":
+			if !hasResources {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: resources/read"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(resourceReadResult(name, req.Params))})
+		case "completion/complete":
+			if !completions {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: completion/complete"}})
+				continue
+			}
+			// Echo the received params back inside the completion values, so
+			// gateway tests can assert the ref rewrite (prompt name → original)
+			// and verbatim argument forwarding.
+			b, _ := json.Marshal(string(req.Params))
+			write(message{ID: req.ID, Result: json.RawMessage(
+				fmt.Sprintf(`{"completion":{"values":[%s],"hasMore":false}}`, b))})
+		case "notifications/cancelled":
+			// Record the cancellation so a test can assert the gateway sent it
+			// (and with WHICH requestId). Append, don't truncate: a test may
+			// expect several.
+			if cancelFile != "" {
+				f, err := os.OpenFile(cancelFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintf(f, "%s\n", req.Params)
+					f.Close()
+				}
+			}
+		case "logging/setLevel":
+			// Record the received level FIRST, capability or not: a test proves
+			// the gateway respected the capability gate by this file staying
+			// empty for an upstream that never declared logging.
+			if setLevelFile != "" {
+				var p struct {
+					Level string `json:"level"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				f, err := os.OpenFile(setLevelFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintln(f, p.Level)
+					f.Close()
+				}
+			}
+			if !logging {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: logging/setLevel"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(`{}`)})
+		case "prompts/list":
+			if len(prompts) == 0 {
+				// No FAKE_PROMPTS: behave like a server without the prompts
+				// capability — the method is simply unknown.
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: prompts/list"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(promptsListResult(prompts))})
+		case "prompts/get":
+			if len(prompts) == 0 {
+				write(message{ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: prompts/get"}})
+				continue
+			}
+			write(message{ID: req.ID, Result: json.RawMessage(promptGetResult(req.Params))})
 		case "tools/call":
+			if progress {
+				// Echo the client's progressToken back in a progress
+				// notification BEFORE the response, per the MCP progress
+				// utility. Emitted only when the request carried a token.
+				var p struct {
+					Meta struct {
+						ProgressToken json.RawMessage `json:"progressToken"`
+					} `json:"_meta"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				if len(p.Meta.ProgressToken) > 0 {
+					write(message{Method: "notifications/progress",
+						Params: json.RawMessage(fmt.Sprintf(
+							`{"progressToken":%s,"progress":1,"total":2}`, p.Meta.ProgressToken))})
+				}
+			}
+			if elicit {
+				// Ask the client for input mid-call and only then answer, per
+				// the MCP elicitation flow (Round 14 test hook). On a goroutine:
+				// the main loop must keep reading stdin to see the response.
+				elicitSeq++
+				elicitID, _ := json.Marshal(fmt.Sprintf("fake-elicit-%d", elicitSeq))
+				ch := make(chan message, 1)
+				elicitMu.Lock()
+				elicitWaiters[string(elicitID)] = ch
+				elicitMu.Unlock()
+				req := req
+				go func() {
+					write(message{ID: elicitID, Method: "elicitation/create",
+						Params: json.RawMessage(`{"message":"need input","requestedSchema":{"type":"object","properties":{"answer":{"type":"string"}}}}`)})
+					var suffix string
+					select {
+					case resp := <-ch:
+						if resp.Error != nil {
+							suffix = fmt.Sprintf("|elicit-error=%d %s", resp.Error.Code, resp.Error.Message)
+						} else {
+							suffix = "|elicited=" + string(resp.Result)
+						}
+					case <-time.After(10 * time.Second):
+						suffix = "|elicit-timeout"
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, suffix))})
+				}()
+				continue
+			}
+			if asyncCalls {
+				// Answer on a goroutine so the read loop keeps consuming stdin
+				// (e.g. a notifications/cancelled arriving mid-delay). write is
+				// mutex-guarded, so concurrent replies cannot interleave bytes.
+				req := req
+				go func() {
+					if callDelay > 0 {
+						time.Sleep(callDelay)
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, ""))})
+				}()
+				continue
+			}
 			if callDelay > 0 {
 				time.Sleep(callDelay)
 			}
@@ -187,15 +497,20 @@ func main() {
 				// Malformed on purpose: method AND result together, echoing the
 				// request id — the exact shape the gateway's reader must refuse
 				// to deliver as a valid response.
-				write(message{ID: req.ID, Method: "tools/call", Result: json.RawMessage(callResult(req.Params, echo))})
+				write(message{ID: req.ID, Method: "tools/call", Result: json.RawMessage(callResult(req.Params, echo, ""))})
 				continue
 			}
-			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo))})
+			write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, ""))})
 			callCount++
 			if exitAfter > 0 && callCount >= exitAfter {
 				// Simulate a crash right after answering: flush is inside write,
 				// so the reply is already on the wire. os.Exit skips deferred
-				// flushes, but there is nothing left to flush.
+				// flushes, but there is nothing left to flush. Dying words to
+				// stderr first, when asked — the crash post-mortem the gateway's
+				// stderr ring must capture.
+				if msg := os.Getenv("FAKE_CRASH_STDERR"); msg != "" {
+					fmt.Fprintln(os.Stderr, msg)
+				}
 				os.Exit(1)
 			}
 		default:
@@ -247,16 +562,95 @@ func toolsListResult(tools []string) string {
 	return b.String()
 }
 
-func callResult(params json.RawMessage, echo bool) string {
+func resourcesListResult(uris []string) string {
+	var b strings.Builder
+	b.WriteString(`{"resources":[`)
+	for i, uri := range uris {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"uri":%q,"name":"res %s","description":"fake resource %s"}`, uri, uri, uri)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+func templatesListResult(templates []string) string {
+	var b strings.Builder
+	b.WriteString(`{"resourceTemplates":[`)
+	for i, tmpl := range templates {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"uriTemplate":%q,"name":"tpl %s"}`, tmpl, tmpl)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// resourceReadResult echoes the requested uri and the serving server's name
+// back in the contents, so gateway tests can assert both the verbatim uri
+// forwarding and WHICH upstream a read was routed to.
+func resourceReadResult(server string, params json.RawMessage) string {
+	var p struct {
+		URI string `json:"uri"`
+	}
+	_ = json.Unmarshal(params, &p)
+	text, _ := json.Marshal("read " + p.URI + " on " + server)
+	uri, _ := json.Marshal(p.URI)
+	return fmt.Sprintf(`{"contents":[{"uri":%s,"text":%s}]}`, uri, text)
+}
+
+func promptsListResult(prompts []string) string {
+	var b strings.Builder
+	b.WriteString(`{"prompts":[`)
+	for i, name := range prompts {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":%q,"description":"fake prompt %s","arguments":[{"name":"text","required":false}]}`, name, name)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// promptGetResult echoes the requested prompt name and raw arguments back in
+// the message text, so gateway tests can assert the namespace→original name
+// rewrite and verbatim argument forwarding.
+func promptGetResult(params json.RawMessage) string {
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+	}
+	_ = json.Unmarshal(params, &p)
+	text := "prompt " + p.Name
+	if len(p.Arguments) > 0 {
+		text += "|args=" + string(p.Arguments)
+	}
+	b, _ := json.Marshal(text)
+	return fmt.Sprintf(`{"description":"fake prompt %s","messages":[{"role":"user","content":{"type":"text","text":%s}}]}`, p.Name, b)
+}
+
+// callResult builds a tools/call result. suffix, when non-empty, is appended
+// to the text verbatim — the FAKE_ELICIT hook uses it to surface what the
+// elicitation round-trip returned.
+func callResult(params json.RawMessage, echo bool, suffix string) string {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Meta      json.RawMessage `json:"_meta"`
 	}
 	_ = json.Unmarshal(params, &p)
 	text := "called " + p.Name
 	if echo && len(p.Arguments) > 0 {
 		text = string(p.Arguments)
 	}
+	if echo && len(p.Meta) > 0 {
+		// Surface the received _meta so gateway tests can assert it was
+		// proxied through (and, by its absence, that none was invented).
+		text += "|_meta=" + string(p.Meta)
+	}
+	text += suffix
 	b, _ := json.Marshal(text)
 	return fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":false}`, b)
 }
