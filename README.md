@@ -159,7 +159,10 @@ applies the minimum change: newly added upstreams are launched, removed (or
 where only the tool filter changed (`allow`/`deny`/`rename`, or the catalog
 projection rules `strip_annotations`/`strip_output_schema`/`max_description`/
 `describe`) are re-projected
-without any restart. Unchanged upstreams keep running untouched. A bad edit
+without any restart. Call limits (`rate_limit`, `max_concurrent`,
+`max_result_bytes`, `call_timeout` — global or per-upstream) are also applied
+live: they never require a relaunch, the next call simply uses the new values.
+Unchanged upstreams keep running untouched. A bad edit
 (invalid YAML, failed validation) is logged and ignored — the currently running
 config stays live, so a typo never takes the gateway down.
 
@@ -195,6 +198,10 @@ transport: stdio            # stdio (Phase 1) | http (Phase 2)
 listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default
 # auth_token: ${AIMCPGATE_TOKEN}  # required if you widen listen_addr past loopback
 log_file: ./logs/calls.jsonl
+# Optional global call limits (each can be overridden per upstream):
+# rate_limit: { rps: 5, burst: 2 }  # token bucket per upstream for tools/call
+# max_result_bytes: 65536           # truncate oversized textual results (0 = off)
+# call_timeout: 30s                 # bounds one upstream request
 upstreams:
   - name: filesystem        # stdio upstream
     command: npx
@@ -205,6 +212,11 @@ upstreams:
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}   # from the environment, not hardcoded
     enabled: true
+    # Optional per-upstream call limits (override the globals for this upstream):
+    # rate_limit: { rps: 1, burst: 1 }  # rps: 0 disables the global limit here
+    # max_concurrent: 4                 # cap on simultaneous in-flight calls
+    # max_result_bytes: 32768           # 0 disables the global cap here
+    # call_timeout: 120s                # this upstream is slow — give it longer
   - name: remote            # http upstream (Phase 2)
     url: https://mcp.example.com/mcp
     headers:

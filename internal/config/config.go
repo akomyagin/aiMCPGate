@@ -84,6 +84,57 @@ type Upstream struct {
 	// aggregated catalog (Stage 9). The zero value passes every tool through
 	// under the default "<upstream>__<tool>" name.
 	Tools ToolFilter `yaml:"tools"`
+
+	// Call-limit knobs (Round 6). These are deliberately NOT part of SameLaunch:
+	// changing a limit never requires relaunching the upstream process — the
+	// registry re-reads them from the live config on every call, so a SIGHUP
+	// reload takes effect on the next tools/call without any upstream downtime.
+
+	// RateLimit overrides the global rate_limit for THIS upstream's forwarded
+	// tools/call requests. nil inherits the global setting; an explicit block
+	// with rps: 0 disables rate limiting for this upstream even when a global
+	// limit is set (see EffectiveRateLimitFor).
+	RateLimit *RateLimit `yaml:"rate_limit"`
+	// MaxConcurrent caps how many tools/call requests may be in flight against
+	// this upstream at once (a semaphore in the registry). 0 = unlimited.
+	// Per-upstream only — there is no global default: the sensible cap depends
+	// entirely on the individual upstream's nature.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// MaxResultBytes overrides the global max_result_bytes for this upstream.
+	// A pointer so "unset" (nil → inherit the global value) is distinguishable
+	// from an explicit 0 (= unlimited, overriding a global limit).
+	MaxResultBytes *int `yaml:"max_result_bytes"`
+	// CallTimeout overrides the global call_timeout for requests to THIS
+	// upstream (handshake, list, forwarded call). 0 = inherit the global
+	// EffectiveCallTimeout (see EffectiveCallTimeoutFor).
+	CallTimeout time.Duration `yaml:"call_timeout"`
+}
+
+// RateLimit is a token-bucket limit on forwarded tools/call requests
+// (golang.org/x/time/rate): RPS tokens are refilled per second, Burst is the
+// bucket size (how many calls may fire back-to-back before the refill rate
+// kicks in). A Burst of 0 is treated as 1 by EffectiveRateLimitFor — a bucket
+// that can never hold a token would block every call forever. RPS of 0 (or an
+// entirely absent block) means no rate limiting.
+type RateLimit struct {
+	RPS   float64 `yaml:"rps"`
+	Burst int     `yaml:"burst"`
+}
+
+// validate rejects a nonsensical rate limit; nil (unset) is fine. where names
+// the config location for the error message ("rate_limit" or
+// "upstream %q: rate_limit").
+func (rl *RateLimit) validate(where string) error {
+	if rl == nil {
+		return nil
+	}
+	if rl.RPS < 0 {
+		return fmt.Errorf("%s.rps must not be negative (0 disables the limit)", where)
+	}
+	if rl.Burst < 0 {
+		return fmt.Errorf("%s.burst must not be negative (0 means 1)", where)
+	}
+	return nil
 }
 
 // ToolFilter selects and renames the tools one upstream exposes to the client.
@@ -131,7 +182,11 @@ type ToolFilter struct {
 // hot-reload (Stage 7d) to tell an unchanged upstream (leave running) from a
 // changed one (Close + relaunch). Name is assumed equal by the caller (it is the
 // match key); Enabled is intentionally NOT compared here — enable/disable is
-// handled as add/remove by the reload diff, not as a "changed launch".
+// handled as add/remove by the reload diff, not as a "changed launch". The
+// call-limit fields (RateLimit/MaxConcurrent/MaxResultBytes/CallTimeout, Round
+// 6) are intentionally NOT compared either: they never affect how the process
+// is launched, and the registry re-reads them from the live config on every
+// call, so a reload that only tweaks a limit must leave the upstream running.
 func (u Upstream) SameLaunch(other Upstream) bool {
 	if u.ResolveKind() != other.ResolveKind() ||
 		u.Command != other.Command ||
@@ -234,8 +289,21 @@ type Config struct {
 	SkillFile string `yaml:"skill_file"`
 
 	// CallTimeout bounds a single upstream request (handshake, list, or call).
-	// Zero selects DefaultCallTimeout.
+	// Zero selects DefaultCallTimeout. Individual upstreams may override it via
+	// their own call_timeout (EffectiveCallTimeoutFor).
 	CallTimeout time.Duration `yaml:"call_timeout"`
+
+	// RateLimit, when set, applies a token-bucket limit to forwarded tools/call
+	// requests, per upstream (each upstream gets its own bucket with these
+	// parameters — the global value is a default, not a shared budget). nil =
+	// no rate limiting. Individual upstreams may override or disable it via
+	// their own rate_limit block (EffectiveRateLimitFor).
+	RateLimit *RateLimit `yaml:"rate_limit"`
+	// MaxResultBytes, when > 0, truncates oversized textual tool results to
+	// roughly this many bytes before returning them to the client (opt-in token
+	// protection). 0 = unlimited (the default). Individual upstreams may
+	// override it via their own max_result_bytes (EffectiveMaxResultBytesFor).
+	MaxResultBytes int `yaml:"max_result_bytes"`
 
 	// Restart is the GLOBAL policy for automatically restarting a stdio upstream
 	// whose child process dies while the gateway is running (Stage 7a). It is a
@@ -303,6 +371,73 @@ func (c *Config) EffectiveCallTimeout() time.Duration {
 		return DefaultCallTimeout
 	}
 	return c.CallTimeout
+}
+
+// upstreamByName returns the upstream config entry with the given name, or nil
+// when the config has no such upstream. Same linear-scan lookup pattern as the
+// registry's filterFor: units-to-tens of upstreams, not a hot path worth an
+// index.
+func (c *Config) upstreamByName(name string) *Upstream {
+	for i := range c.Upstreams {
+		if c.Upstreams[i].Name == name {
+			return &c.Upstreams[i]
+		}
+	}
+	return nil
+}
+
+// EffectiveRateLimitFor resolves the rate limit that applies to the named
+// upstream: its own rate_limit block when set, otherwise the global one.
+// ok=false means no rate limiting applies (neither level configured it, the
+// winning block has rps <= 0, or the upstream is unknown and there is no
+// global limit — an unknown upstream inherits the global default, consistent
+// with per-upstream lookups elsewhere treating "absent from config" as "no
+// overrides"). A Burst of 0 in the winning block is normalized to 1 (a bucket
+// that can never hold a token would block forever).
+func (c *Config) EffectiveRateLimitFor(name string) (rps float64, burst int, ok bool) {
+	rl := c.RateLimit
+	if u := c.upstreamByName(name); u != nil && u.RateLimit != nil {
+		rl = u.RateLimit
+	}
+	if rl == nil || rl.RPS <= 0 {
+		return 0, 0, false
+	}
+	burst = rl.Burst
+	if burst < 1 {
+		burst = 1
+	}
+	return rl.RPS, burst, true
+}
+
+// EffectiveMaxConcurrentFor returns the named upstream's max_concurrent cap,
+// or 0 (unlimited) when unset or the upstream is unknown. Per-upstream only —
+// there is no global default (see the Upstream field comment).
+func (c *Config) EffectiveMaxConcurrentFor(name string) int {
+	if u := c.upstreamByName(name); u != nil && u.MaxConcurrent > 0 {
+		return u.MaxConcurrent
+	}
+	return 0
+}
+
+// EffectiveMaxResultBytesFor resolves the result-size cap for the named
+// upstream: its own max_result_bytes when set (an explicit 0 disables the
+// global cap for this upstream), otherwise the global MaxResultBytes.
+// 0 = unlimited.
+func (c *Config) EffectiveMaxResultBytesFor(name string) int {
+	if u := c.upstreamByName(name); u != nil && u.MaxResultBytes != nil {
+		return *u.MaxResultBytes
+	}
+	return c.MaxResultBytes
+}
+
+// EffectiveCallTimeoutFor resolves the request timeout for the named upstream:
+// its own call_timeout when > 0, otherwise the global EffectiveCallTimeout
+// (which itself falls back to DefaultCallTimeout).
+func (c *Config) EffectiveCallTimeoutFor(name string) time.Duration {
+	if u := c.upstreamByName(name); u != nil && u.CallTimeout > 0 {
+		return u.CallTimeout
+	}
+	return c.EffectiveCallTimeout()
 }
 
 // EffectiveListenAddr returns ListenAddr or DefaultListenAddr if unset.
@@ -474,6 +609,16 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.RateLimit.validate("rate_limit"); err != nil {
+		return err
+	}
+	if c.MaxResultBytes < 0 {
+		return fmt.Errorf("max_result_bytes must not be negative (0 means unlimited)")
+	}
+	if c.CallTimeout < 0 {
+		return fmt.Errorf("call_timeout must not be negative (0 selects the default)")
+	}
+
 	// The opt-in payload debug log must never share a file with the audit log:
 	// payloads carry raw arguments/results (possibly secrets), which the audit
 	// log is required to stay free of (SKILL §6). Reject the overlap outright.
@@ -513,6 +658,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 		if err := validateToolFilter(u, clientNames); err != nil {
+			return err
+		}
+		if err := validateUpstreamLimits(u); err != nil {
 			return err
 		}
 	}
@@ -635,6 +783,25 @@ func (p RestartPolicy) validate() error {
 	}
 	if p.MaxAttempts < 0 {
 		return fmt.Errorf("restart.max_attempts must not be negative (0 means unlimited)")
+	}
+	return nil
+}
+
+// validateUpstreamLimits rejects actively-wrong per-upstream call-limit values
+// (Round 6). Unset fields are fine: 0 / nil mean "unlimited" or "inherit the
+// global default" (see the field comments and the Effective*For helpers).
+func validateUpstreamLimits(u Upstream) error {
+	if err := u.RateLimit.validate(fmt.Sprintf("upstream %q: rate_limit", u.Name)); err != nil {
+		return err
+	}
+	if u.MaxConcurrent < 0 {
+		return fmt.Errorf("upstream %q: max_concurrent must not be negative (0 means unlimited)", u.Name)
+	}
+	if u.MaxResultBytes != nil && *u.MaxResultBytes < 0 {
+		return fmt.Errorf("upstream %q: max_result_bytes must not be negative (0 means unlimited)", u.Name)
+	}
+	if u.CallTimeout < 0 {
+		return fmt.Errorf("upstream %q: call_timeout must not be negative (0 inherits the global call_timeout)", u.Name)
 	}
 	return nil
 }

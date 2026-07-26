@@ -7,6 +7,8 @@ require (
 	golang.org/x/sync v0.10.0
 )
 
+require golang.org/x/time v0.12.0
+
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.3.1

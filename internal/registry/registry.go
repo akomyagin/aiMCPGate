@@ -247,6 +247,20 @@ type Registry struct {
 	// a single ordered handoff.
 	relistWG sync.WaitGroup
 
+	// limiterMu guards limiters and sems, the per-upstream call-limit state
+	// (Round 6): token-bucket rate limiters and concurrency semaphores, created
+	// lazily on the first guarded call to each upstream. Deliberately its OWN
+	// mutex, not r.mu — the limiters have no relationship with the catalog's
+	// critical section, and coupling them would make every rate-limited call
+	// contend with catalog reads/writes. Each entry remembers the config values
+	// it was built from; when a reload changes them, the next call detects the
+	// mismatch under this mutex and swaps in a fresh limiter/semaphore (an old
+	// semaphore still held by in-flight calls simply drains as they finish —
+	// the new one starts life with zero permits held).
+	limiterMu sync.Mutex
+	limiters  map[string]*limiterEntry
+	sems      map[string]*semEntry
+
 	// supMu guards supCancel, one context.CancelFunc per supervised stdio
 	// upstream (Stage 7d). Each supervisor runs under its own context derived
 	// from procCtx; cancelling an upstream's entry tells its supervisor to exit
@@ -315,6 +329,8 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		subscribers:  map[int]chan struct{}{},
 		relistTimers: map[string]*time.Timer{},
 		relistStates: map[string]*relistState{},
+		limiters:     map[string]*limiterEntry{},
+		sems:         map[string]*semEntry{},
 		supCancel:    map[string]context.CancelFunc{},
 		procCtx:      procCtx,
 		procCancel:   procCancel,
@@ -485,7 +501,7 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	// goroutine starts and a list_changed arriving immediately is not missed.
 
 	var info *mcp.InitializeResult
-	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
 		var err error
 		info, err = conn.Initialize(ctx)
 		return err
@@ -497,7 +513,7 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	meta := handshakeMeta{instructions: info.Instructions, capabilities: info.Capabilities}
 
 	var tools []mcp.Tool
-	if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
 		var err error
 		tools, err = conn.ListTools(ctx)
 		return err
@@ -509,12 +525,14 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	return conn, tools, meta, nil
 }
 
-// withCallTimeout runs fn under a child context bounded by the CURRENT
-// config's call timeout — the one ritual every upstream RPC the registry makes
-// shares (handshake, list, forwarded call). The timeout is re-read from the
-// live config on every use, so a reload takes effect immediately.
-func (r *Registry) withCallTimeout(parent context.Context, fn func(ctx context.Context) error) error {
-	ctx, cancel := context.WithTimeout(parent, r.config().EffectiveCallTimeout())
+// withCallTimeoutFor runs fn under a child context bounded by the CURRENT
+// config's call timeout for the named upstream — the one ritual every upstream
+// RPC the registry makes shares (handshake, list, forwarded call). The timeout
+// is re-read from the live config on every use, so a reload takes effect
+// immediately; the per-upstream call_timeout override (Round 6) falls back to
+// the global EffectiveCallTimeout when unset.
+func (r *Registry) withCallTimeoutFor(parent context.Context, upstream string, fn func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, r.config().EffectiveCallTimeoutFor(upstream))
 	defer cancel()
 	return fn(ctx)
 }
@@ -836,7 +854,7 @@ func (r *Registry) relistUpstream(name string) {
 	}
 
 	var tools []mcp.Tool
-	if err := r.withCallTimeout(r.procCtx, func(ctx context.Context) error {
+	if err := r.withCallTimeoutFor(r.procCtx, name, func(ctx context.Context) error {
 		var err error
 		tools, err = conn.ListTools(ctx)
 		return err
@@ -1171,6 +1189,15 @@ func (r *Registry) notifyCatalogChanged() {
 //     only its projection did, so a deny-list edit takes effect on SIGHUP
 //     without any upstream downtime;
 //   - UNCHANGED: left running untouched.
+//
+// Call-limit changes (rate_limit / max_concurrent / max_result_bytes /
+// call_timeout, Round 6) never require a relaunch: SameLaunch deliberately
+// excludes them, so an upstream whose ONLY change is a limit lands in
+// UNCHANGED — the limits are re-read from the live config on every call
+// (Effective*For via r.config()), and the cached limiter/semaphore instances
+// are rebuilt lazily on the next call when their values differ (see
+// limiterFor/semFor in limits.go). The same applies to the global limit knobs:
+// swapping r.cfg below is all a reload needs to do for them.
 //
 // newCfg MUST already be validated (serve.go loads it via config.Load, which
 // validates) — Reload assumes it is well-formed. The plan is computed under the
@@ -1550,17 +1577,16 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, m
 }
 
 // callUpstream performs ONE forwarding attempt against a resolved connection,
-// with its own timeout, audit record and (opt-in) payload record — each attempt
-// CallTool makes is audited separately, the failed first try and the retried
-// second one alike; nothing is hidden from the call journal.
+// with its own guards (rate limit, concurrency cap, per-upstream timeout,
+// result truncation — see guardedCall in limits.go), audit record and (opt-in)
+// payload record — each attempt CallTool makes is audited separately, the
+// failed first try and the retried second one alike, a guard rejection the
+// same as a transport failure; nothing is hidden from the call journal. The
+// recorded duration includes any time spent queueing on the guards: that is
+// the latency the client actually experienced.
 func (r *Registry) callUpstream(ctx context.Context, conn Upstream, rt route, namespaced string, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	start := time.Now()
-	var resp *mcp.Message
-	err := r.withCallTimeout(ctx, func(ctx context.Context) error {
-		var err error
-		resp, err = conn.CallTool(ctx, rt.original, arguments, meta)
-		return err
-	})
+	resp, err := r.guardedCall(ctx, conn, rt, arguments, meta)
 	r.audit(ctx, rt.upstream, mcp.MethodToolsCall, namespaced, start, resp, err)
 	r.recordPayload(rt.upstream, namespaced, arguments, resp, err)
 	return resp, err
