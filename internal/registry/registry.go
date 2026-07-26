@@ -578,7 +578,7 @@ func (r *Registry) launch(ctx context.Context, u config.Upstream) (Upstream, []m
 	// the gateway exists for.
 	var prompts []mcp.Prompt
 	if hasCapability(info.Capabilities, "prompts") {
-		if err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+		if err := r.withCallTimeoutFor(ctx, u.Name, func(ctx context.Context) error {
 			var err error
 			prompts, err = conn.ListPrompts(ctx)
 			return err
@@ -1662,7 +1662,7 @@ func (r *Registry) GetPrompt(ctx context.Context, namespaced string, arguments j
 	}
 
 	var resp *mcp.Message
-	err := r.withCallTimeout(ctx, func(ctx context.Context) error {
+	err := r.withCallTimeoutFor(ctx, rt.upstream, func(ctx context.Context) error {
 		var err error
 		resp, err = conn.GetPrompt(ctx, rt.original, arguments)
 		return err
