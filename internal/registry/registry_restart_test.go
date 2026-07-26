@@ -398,7 +398,7 @@ func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
 		t.Fatalf("connB.ListTools: %v", err)
 	}
 	r.mu.Lock()
-	r.installLocked("up", connB, toolsB, nil, "test: fresh conn installed")
+	r.installLocked("up", connB, toolsB, nil, nil, "test: fresh conn installed")
 	r.mu.Unlock()
 	if !hasTool(r, "up__b") {
 		t.Fatal("precondition: up__b not in catalog after installing the fresh conn")

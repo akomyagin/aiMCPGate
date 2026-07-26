@@ -194,6 +194,43 @@ func (c *Conn) ListResources(ctx context.Context) ([]mcp.Resource, error) {
 	return resources, nil
 }
 
+// ListPrompts fetches the upstream's prompt catalog, following pagination via
+// nextCursor until exhausted (bounded — see maxPaginationPages). Unlike
+// ListResources there is no method-not-found-as-empty branch: the registry
+// calls this only for upstreams that DECLARED the prompts capability in their
+// initialize response, so a prompts/list error here is a real failure for the
+// caller to judge, never "this upstream simply has no prompts".
+func (c *Conn) ListPrompts(ctx context.Context) ([]mcp.Prompt, error) {
+	prompts, rpcErr, err := paginate(ctx, c, mcp.MethodPromptsList,
+		func(cursor string) json.RawMessage {
+			return mcp.MustParams(mcp.PromptsListParams{Cursor: cursor})
+		},
+		func(result json.RawMessage) ([]mcp.Prompt, string, error) {
+			var res mcp.PromptsListResult
+			if err := json.Unmarshal(result, &res); err != nil {
+				return nil, "", err
+			}
+			return res.Prompts, res.NextCursor, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	if rpcErr != nil {
+		return nil, fmt.Errorf("upstream %q: prompts/list error: %w", c.Name(), rpcErr)
+	}
+	return prompts, nil
+}
+
+// GetPrompt forwards a prompts/get to the upstream. name is the ORIGINAL
+// (un-namespaced) prompt name expected by the upstream — the
+// namespace→original rewrite happens in the Registry, symmetric with CallTool.
+// The response is returned verbatim (*mcp.Message): the gateway never parses
+// the prompt's description/messages.
+func (c *Conn) GetPrompt(ctx context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+	params := mcp.MustParams(mcp.PromptsGetParams{Name: name, Arguments: arguments})
+	return c.transport.call(ctx, mcp.MethodPromptsGet, params)
+}
+
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL
 // (un-namespaced) tool name expected by the upstream. meta is the client's
 // optional `_meta` object (progressToken etc.), forwarded verbatim — nil when

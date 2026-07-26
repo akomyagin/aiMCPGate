@@ -32,7 +32,11 @@ func (fakeUpstreamBase) Initialize(context.Context) (*mcp.InitializeResult, erro
 }
 func (fakeUpstreamBase) ListTools(context.Context) ([]mcp.Tool, error)         { return nil, nil }
 func (fakeUpstreamBase) ListResources(context.Context) ([]mcp.Resource, error) { return nil, nil }
+func (fakeUpstreamBase) ListPrompts(context.Context) ([]mcp.Prompt, error)     { return nil, nil }
 func (fakeUpstreamBase) CallTool(context.Context, string, json.RawMessage, json.RawMessage) (*mcp.Message, error) {
+	return nil, nil
+}
+func (fakeUpstreamBase) GetPrompt(context.Context, string, json.RawMessage) (*mcp.Message, error) {
 	return nil, nil
 }
 func (fakeUpstreamBase) Close() error                  { return nil }
@@ -55,6 +59,14 @@ type fakeUpstream struct {
 	lastArgs     json.RawMessage
 	lastMeta     json.RawMessage
 	lastNamed    string
+
+	// Prompts (Round 4). The registry only calls ListPrompts when caps above
+	// declares "prompts" — a fake advertising prompts must therefore also set
+	// caps accordingly.
+	prompts        []string // advertised in prompts/list
+	promptsErr     error    // if set, ListPrompts fails
+	lastPromptName string
+	lastPromptArgs json.RawMessage
 }
 
 func (f *fakeUpstream) Name() string { return f.name }
@@ -80,6 +92,25 @@ func (f *fakeUpstream) ListTools(context.Context) ([]mcp.Tool, error) {
 		out = append(out, mcp.Tool{Name: t, Description: json.RawMessage(`"desc ` + t + `"`), InputSchema: json.RawMessage(`{"type":"object"}`)})
 	}
 	return out, nil
+}
+
+func (f *fakeUpstream) ListPrompts(context.Context) ([]mcp.Prompt, error) {
+	if f.promptsErr != nil {
+		return nil, f.promptsErr
+	}
+	out := make([]mcp.Prompt, 0, len(f.prompts))
+	for _, p := range f.prompts {
+		out = append(out, mcp.Prompt{Name: p, Description: json.RawMessage(`"prompt ` + p + `"`)})
+	}
+	return out, nil
+}
+
+func (f *fakeUpstream) GetPrompt(_ context.Context, name string, arguments json.RawMessage) (*mcp.Message, error) {
+	f.lastPromptName = name
+	f.lastPromptArgs = arguments
+	id := mcp.IntID(f.nextID.Add(1))
+	result := json.RawMessage(`{"messages":[{"role":"user","content":{"type":"text","text":"prompt ` + name + `"}}]}`)
+	return mcp.NewResult(id, result), nil
 }
 
 func (f *fakeUpstream) CallTool(_ context.Context, name string, arguments, meta json.RawMessage) (*mcp.Message, error) {

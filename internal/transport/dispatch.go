@@ -11,12 +11,18 @@ import (
 
 // buildCapabilities assembles the gateway's own capability object, advertised
 // to the client on initialize. Resources are not aggregated in the MVP (see
-// handleResourcesList), so only the tools capability is declared today — but
-// the object is built structurally (map → json.Marshal) rather than as a
-// string literal, so upcoming rounds can add CONDITIONAL capabilities
-// (prompts/resources/logging — advertised only when
-// reg.HasUpstreamCapability(...) says at least one upstream backs them)
+// handleResourcesList), so no resources capability is declared — the object is
+// built structurally (map → json.Marshal) rather than as a string literal, so
+// further rounds can keep adding CONDITIONAL capabilities (resources/logging)
 // without rebuilding this function.
+//
+// prompts (Round 4) is CONDITIONAL: declared only when at least one live
+// upstream declared it in its own initialize — advertising it against zero
+// prompt-capable upstreams would be dishonest. listChanged is honestly false:
+// this round does not subscribe to upstream notifications/prompts/list_changed
+// (such a notification is currently dropped as unknown, which is fine), so the
+// gateway cannot promise to emit its own. TODO(post-MVP): wire prompt
+// list_changed the way tools' is wired (Stage 7b/7c).
 //
 // listChanged is TRANSPORT-DEPENDENT (Stage 7c). Since Stage 7 the aggregated
 // catalog is dynamic (auto-restart, upstream list_changed, reload), so the
@@ -28,9 +34,13 @@ import (
 // see the updated catalog on their next tools/list. Building the GET SSE channel
 // is deferred future work.
 func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage {
-	_ = reg // consulted from the next rounds on (HasUpstreamCapability for prompts/resources/logging)
 	caps := map[string]any{
 		"tools": map[string]any{"listChanged": listChanged},
+	}
+	// nil reg: classification-only tests build a dispatcher without a registry;
+	// a gateway with no registry aggregates nothing, so no extra capabilities.
+	if reg != nil && reg.HasUpstreamCapability("prompts") {
+		caps["prompts"] = map[string]any{"listChanged": false}
 	}
 	b, err := json.Marshal(caps)
 	if err != nil {
@@ -46,7 +56,8 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 //
 // It exists so the stdio and HTTP transports share exactly one implementation
 // of the MCP method handling (initialize / tools/list / tools/call /
-// resources/*). Each transport is left with only its own framing/plumbing
+// prompts/* / resources/*). Each transport is left with only its own
+// framing/plumbing
 // (reading requests, writing replies, SSE vs newline); the protocol logic lives
 // here once. It holds no per-connection state, so a single dispatcher is safe to
 // share across concurrent HTTP requests.
@@ -120,6 +131,10 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 		return d.handleToolsList(msg)
 	case mcp.MethodToolsCall:
 		return d.handleToolsCall(ctx, msg)
+	case mcp.MethodPromptsList:
+		return d.handlePromptsList(msg)
+	case mcp.MethodPromptsGet:
+		return d.handlePromptsGet(ctx, msg)
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
@@ -217,6 +232,46 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 	// resp is the upstream's raw response. Its own ID is the gateway's
 	// upstream-side id and MUST NOT leak to the client; re-wrap the payload under
 	// the client's id, forwarding the upstream's result or error verbatim.
+	if resp.Error != nil {
+		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(req.ID, resp.Result)
+}
+
+// handlePromptsList returns the aggregated, namespaced prompt catalog —
+// handleToolsList's prompts twin (Round 4). Each prompt's description/arguments
+// are carried through verbatim. Pagination is not needed: the registry already
+// merged every upstream's full paginated prompt list on launch.
+func (d *dispatcher) handlePromptsList(req *mcp.Message) *mcp.Message {
+	descs := d.reg.Prompts()
+	prompts := make([]mcp.Prompt, 0, len(descs))
+	for _, dd := range descs {
+		p := dd.Prompt
+		p.Name = dd.Name // client-facing namespaced name, not the upstream original
+		prompts = append(prompts, p)
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(mcp.PromptsListResult{Prompts: prompts}))
+}
+
+// handlePromptsGet proxies a prompts/get through the registry, which resolves
+// the owning upstream and rewrites the name back to the upstream's original —
+// handleToolsCall's prompts twin (Round 4). The upstream's raw result/error is
+// forwarded to the client verbatim under the CLIENT's id; a routing/transport
+// failure surfaces as a JSON-RPC error whose text the registry already
+// sanitized (only the prompt name the client itself supplied).
+func (d *dispatcher) handlePromptsGet(ctx context.Context, req *mcp.Message) *mcp.Message {
+	var params mcp.PromptsGetParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid prompts/get params: "+err.Error(), nil)
+	}
+	if params.Name == "" {
+		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "prompts/get missing prompt name", nil)
+	}
+
+	resp, err := d.reg.GetPrompt(ctx, params.Name, params.Arguments)
+	if err != nil {
+		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+	}
 	if resp.Error != nil {
 		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)
 	}
