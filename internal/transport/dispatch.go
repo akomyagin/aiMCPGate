@@ -2,8 +2,10 @@ package transport
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
@@ -227,9 +229,22 @@ func clientString(params json.RawMessage) string {
 
 // handleToolsList returns the aggregated, namespaced catalog. Each tool's
 // schema (description/inputSchema/...) is carried through verbatim so the client
-// sees the exact contract each upstream advertises. Pagination is not needed:
-// the registry already merged every upstream's full paginated catalog on Start.
+// sees the exact contract each upstream advertises. The registry already merged
+// every upstream's full paginated catalog on Start; the OUTGOING list is served
+// whole by default, or in pages when page_size is set (Round 8).
+//
+// Both Round 8 knobs are read from the LIVE config on every request (the
+// registry holds it atomically), so a SIGHUP reload flips catalog_mode /
+// page_size without restarting anything.
 func (d *dispatcher) handleToolsList(req *mcp.Message) *mcp.Message {
+	cfg := d.reg.ConfigSnapshot()
+	// Lazy catalog mode (Round 8): the client sees exactly the three gateway
+	// meta-tools instead of the aggregated catalog (lazy.go). page_size is
+	// deliberately IGNORED here — documented precedence (config.Config
+	// .CatalogMode): a fixed list of three never paginates.
+	if cfg.LazyCatalog() {
+		return mcp.NewResult(req.ID, mcp.MustParams(mcp.ToolsListResult{Tools: lazyCatalogTools()}))
+	}
 	descs := d.reg.Tools()
 	tools := make([]mcp.Tool, 0, len(descs))
 	for _, dd := range descs {
@@ -237,7 +252,44 @@ func (d *dispatcher) handleToolsList(req *mcp.Message) *mcp.Message {
 		t.Name = dd.Name // client-facing namespaced name, not the upstream original
 		tools = append(tools, t)
 	}
+	if cfg.PageSize > 0 {
+		return paginatedToolsList(req, tools, cfg.PageSize)
+	}
+	// page_size unset: the whole catalog in one response, any cursor ignored —
+	// the pre-Round 8 behaviour, unchanged.
 	return mcp.NewResult(req.ID, mcp.MustParams(mcp.ToolsListResult{Tools: tools}))
+}
+
+// paginatedToolsList serves one page of the (name-sorted) catalog. The cursor
+// is opaque to the client: base64 of the LAST tool name on the previous page.
+// It is name-based, not index-based, on purpose — Registry.Tools() is sorted
+// by name, so when the catalog mutates BETWEEN pages (upstream restart,
+// reload, list_changed) the next page simply resumes at the first name
+// lexicographically AFTER the cursor: no duplicates and no skips of tools
+// that existed on both sides of the mutation, whereas a positional cursor
+// would silently shift. Per MCP, an unparseable cursor is answered with
+// -32602 Invalid params.
+func paginatedToolsList(req *mcp.Message, tools []mcp.Tool, pageSize int) *mcp.Message {
+	var params mcp.ToolsListParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid tools/list params: "+err.Error(), nil)
+		}
+	}
+	start := 0
+	if params.Cursor != "" {
+		last, err := base64.StdEncoding.DecodeString(params.Cursor)
+		if err != nil {
+			return mcp.NewError(req.ID, mcp.CodeInvalidParams, "invalid tools/list cursor", nil)
+		}
+		start = sort.Search(len(tools), func(i int) bool { return tools[i].Name > string(last) })
+	}
+	end := min(start+pageSize, len(tools))
+	res := mcp.ToolsListResult{Tools: tools[start:end]}
+	if end < len(tools) {
+		res.NextCursor = base64.StdEncoding.EncodeToString([]byte(tools[end-1].Name))
+	}
+	return mcp.NewResult(req.ID, mcp.MustParams(res))
 }
 
 // dispatchToolsCall wraps handleToolsCall with the Round 2 cancellation
@@ -314,6 +366,22 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 	}
 	if params.Name == "" {
 		return mcp.NewError(req.ID, mcp.CodeInvalidParams, "tools/call missing tool name", nil)
+	}
+
+	// Lazy catalog mode (Round 8): the three gateway meta-tools are handled
+	// HERE, before Registry.CallTool ever sees the name — this ordering IS the
+	// reserved-name policy: even if some upstream tool ended up namespaced as
+	// gate_search_tools / gate_describe / gate_call, in lazy mode the
+	// gateway's meta-tool wins at the dispatcher, before routing (the shadowed
+	// upstream tool stays reachable through gate_call, which routes any name
+	// through the normal registry path). In normal mode the names are not
+	// special and route as usual. Any OTHER name falls through below, so a
+	// client that already knows a namespaced name may still call it directly
+	// even in lazy mode.
+	if d.reg.ConfigSnapshot().LazyCatalog() {
+		if reply, handled := d.handleLazyCall(ctx, req, params); handled {
+			return reply
+		}
 	}
 
 	// params.Meta (the client's `_meta`, e.g. progressToken) rides along
