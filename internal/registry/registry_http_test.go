@@ -58,7 +58,7 @@ func TestRegistryAggregatesHTTPUpstream(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "remote", URL: srv.URL, Enabled: true}, // kind inferred http from url
+		{Name: "remote", URL: srv.URL, Enabled: boolPtr(true)}, // kind inferred http from url
 	}}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 
@@ -118,7 +118,7 @@ func TestRegistryDoesNotDeclareElicitationToHTTPUpstream(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "remote", URL: srv.URL, Enabled: true},
+		{Name: "remote", URL: srv.URL, Enabled: boolPtr(true)},
 	}}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	// What the stdio client-facing transport does before Start — the very
@@ -221,7 +221,7 @@ func TestRegistryHTTPUpstreamRelistsOnSSEListChanged(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "remote", URL: srv.URL, Enabled: true},
+		{Name: "remote", URL: srv.URL, Enabled: boolPtr(true)},
 	}}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 

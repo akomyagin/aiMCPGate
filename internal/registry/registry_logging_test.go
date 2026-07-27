@@ -23,9 +23,9 @@ import (
 // the shared fakeUpstream).
 func TestSetLogLevelFansOutToLoggingCapableOnly(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "loggy", Enabled: true},
-		{Name: "chatty", Enabled: true},
-		{Name: "bare", Enabled: true},
+		{Name: "loggy", Enabled: boolPtr(true)},
+		{Name: "chatty", Enabled: boolPtr(true)},
+		{Name: "bare", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"loggy":  {name: "loggy", tools: []string{"a"}, caps: json.RawMessage(`{"tools":{},"logging":{}}`)},
@@ -57,8 +57,8 @@ func TestSetLogLevelFansOutToLoggingCapableOnly(t *testing.T) {
 // level and the client-facing result is success (nil).
 func TestSetLogLevelPartialFailureIsNotFatal(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "ok", Enabled: true},
-		{Name: "broken", Enabled: true},
+		{Name: "ok", Enabled: boolPtr(true)},
+		{Name: "broken", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"ok":     {name: "ok", tools: []string{"a"}, caps: json.RawMessage(`{"logging":{}}`)},

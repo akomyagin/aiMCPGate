@@ -622,7 +622,7 @@ func (r *Registry) Start(ctx context.Context) error {
 	// collision is always the upstream listed first in the config.
 	var enabled []config.Upstream
 	for _, u := range r.config().Upstreams {
-		if u.Enabled {
+		if u.IsEnabled() {
 			enabled = append(enabled, u)
 		}
 	}
@@ -1948,7 +1948,7 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 	// keep-first — and "first" must deterministically mean "first in the
 	// config", not whichever map key (or goroutine) came up first.
 	for _, nu := range newCfg.Upstreams {
-		if !nu.Enabled {
+		if !nu.IsEnabled() {
 			continue
 		}
 		name := nu.Name
@@ -2132,7 +2132,7 @@ func (r *Registry) retireAndClose(name string) {
 func enabledByName(cfg *config.Config) map[string]config.Upstream {
 	m := make(map[string]config.Upstream, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
-		if u.Enabled {
+		if u.IsEnabled() {
 			m[u.Name] = u
 		}
 	}

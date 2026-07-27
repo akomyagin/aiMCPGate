@@ -242,8 +242,8 @@ func newTestRegistryWithPayload(t *testing.T, cfg *config.Config, callLog loggin
 
 func TestRegistryAggregatesAndNamespaces(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "github", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "github", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"github": {name: "github", tools: []string{"search", "create_issue"}},
@@ -285,8 +285,8 @@ func TestRegistryAggregatesAndNamespaces(t *testing.T) {
 
 func TestRegistryRoutesCallToOwner(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "github", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "github", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	gh := &fakeUpstream{name: "github", tools: []string{"search"}}
 	web := &fakeUpstream{name: "web", tools: []string{"search"}}
@@ -317,7 +317,7 @@ func TestRegistryRoutesCallToOwner(t *testing.T) {
 }
 
 func TestRegistryUnknownToolErrors(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "github", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "github", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"github": {name: "github", tools: []string{"search"}},
 	})
@@ -340,7 +340,7 @@ func TestRegistryUnknownToolErrors(t *testing.T) {
 // ever gets back the tool name it itself supplied, matched exactly — proving
 // nothing beyond that survives.
 func TestRegistryCallToolFailureSanitized(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: boolPtr(true)}}}
 	internal := errors.New("dial tcp 10.0.0.5:9443: connect: connection refused")
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"secretname": {name: "secretname", tools: []string{"search"}, callErr: internal},
@@ -364,7 +364,7 @@ func TestRegistryCallToolFailureSanitized(t *testing.T) {
 // a timeout is reported as a timeout (useful, non-sensitive signal for the
 // caller), still with nothing beyond the client-supplied tool name.
 func TestRegistryCallToolTimeoutSanitized(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "secretname", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"secretname": {name: "secretname", tools: []string{"search"}, callErr: context.DeadlineExceeded},
 	})
@@ -383,12 +383,59 @@ func TestRegistryCallToolTimeoutSanitized(t *testing.T) {
 	}
 }
 
+// TestRegistryStartHonoursEnabledDefault is the registry-side half of the
+// `enabled:` default (config.Upstream.IsEnabled): an upstream whose config
+// omits the key must be launched exactly like one that spells `enabled: true`,
+// and only an EXPLICIT `enabled: false` is skipped. Asserted on both the
+// aggregated catalog and StartReport — the latter is what `mcp-gate doctor`
+// prints, and the silent-drop bug this fixes was invisible in both.
+func TestRegistryStartHonoursEnabledDefault(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "omitted"}, // no `enabled:` key at all → must come up
+		{Name: "off", Enabled: boolPtr(false)},
+		{Name: "on", Enabled: boolPtr(true)},
+	}}
+	fakes := map[string]*fakeUpstream{
+		"omitted": {name: "omitted", tools: []string{"a"}},
+		"off":     {name: "off", tools: []string{"b"}},
+		"on":      {name: "on", tools: []string{"c"}},
+	}
+	r := newTestRegistry(t, cfg, nil, fakes)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	var got []string
+	for _, d := range r.Tools() {
+		got = append(got, d.Name)
+	}
+	want := []string{"omitted__a", "on__c"} // Tools() is sorted by name
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("catalog = %v, want %v (absent enabled key = enabled, explicit false = skipped)", got, want)
+	}
+
+	inReport := map[string]bool{}
+	for _, st := range r.StartReport() {
+		inReport[st.Name] = true
+	}
+	if !inReport["omitted"] {
+		t.Error("upstream with no enabled key missing from StartReport: doctor would print an OK table without it")
+	}
+	if !inReport["on"] {
+		t.Error("upstream with enabled:true missing from StartReport")
+	}
+	if inReport["off"] {
+		t.Error("upstream with explicit enabled:false must not appear in StartReport")
+	}
+}
+
 // A failing upstream must be isolated: the gateway keeps the healthy one.
 func TestRegistryIsolatesFailedUpstream(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "ok", Enabled: true},
-		{Name: "broken", Enabled: true},
-		{Name: "disabled", Enabled: false},
+		{Name: "ok", Enabled: boolPtr(true)},
+		{Name: "broken", Enabled: boolPtr(true)},
+		{Name: "disabled", Enabled: boolPtr(false)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"ok":       {name: "ok", tools: []string{"a"}},
@@ -412,8 +459,8 @@ func TestRegistryIsolatesFailedUpstream(t *testing.T) {
 // leaving the gateway serving an empty catalog forever.
 func TestRegistryStartErrorsWhenAllUpstreamsFail(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "broken1", Enabled: true},
-		{Name: "broken2", Enabled: true},
+		{Name: "broken1", Enabled: boolPtr(true)},
+		{Name: "broken2", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"broken1": {name: "broken1", initErr: errors.New("boom1")},
@@ -440,7 +487,7 @@ func TestRegistryStartErrorsWhenAllUpstreamsFail(t *testing.T) {
 // succeed with an empty catalog.
 func TestRegistryStartErrorsWithNoEnabledUpstreams(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "disabled", Enabled: false},
+		{Name: "disabled", Enabled: boolPtr(false)},
 	}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"disabled": {name: "disabled", tools: []string{"x"}},
@@ -458,7 +505,7 @@ func TestRegistryStartErrorsWithNoEnabledUpstreams(t *testing.T) {
 // The call log must record metadata but never the arguments (which may hold
 // secrets like tokens).
 func TestRegistryCallLogHasNoSecrets(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var buf bytes.Buffer
 	callLog := logging.NewCallLogWriter(&buf)
 
@@ -495,7 +542,7 @@ func TestRegistryCallLogHasNoSecrets(t *testing.T) {
 // secret-looking top-level fields masked to "***" (SKILL §6) while every other
 // field passes through verbatim.
 func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var auditBuf, payloadBuf bytes.Buffer
 	callLog := logging.NewCallLogWriter(&auditBuf)
 	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
@@ -553,7 +600,7 @@ func TestRegistryPayloadLogRecordsArgsAndResult(t *testing.T) {
 // arguments — the Stage 10 invariant that a disabled payload log leaves the
 // existing metadata-only guarantee intact (SKILL §6).
 func TestRegistryDefaultPayloadLogOff(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var auditBuf bytes.Buffer
 	callLog := logging.NewCallLogWriter(&auditBuf)
 
@@ -592,7 +639,7 @@ func TestRegistryDefaultPayloadLogOff(t *testing.T) {
 // explicit OK field such a record would be indistinguishable from a clean
 // success. OK is written without omitempty precisely so false survives.
 func TestRegistryPayloadLogMarksErrorResponseNotOK(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var auditBuf, payloadBuf bytes.Buffer
 	callLog := logging.NewCallLogWriter(&auditBuf)
 	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
@@ -636,7 +683,7 @@ func TestRegistryPayloadLogMarksErrorResponseNotOK(t *testing.T) {
 // payload log must capture it verbatim in ErrorData — the payload log exists
 // for full debugging visibility, so dropping error.data would defeat its point.
 func TestRegistryPayloadLogRecordsErrorData(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var payloadBuf bytes.Buffer
 	payloadLog := logging.NewPayloadLogWriter(&payloadBuf)
 
@@ -718,8 +765,8 @@ func TestStartParallelMergeOrderDeterministic(t *testing.T) {
 		listed:       secondListed,
 	}
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "first", Enabled: true},
-		{Name: "second", Enabled: true, Tools: config.ToolFilter{Rename: map[string]string{"z": "first__t"}}},
+		{Name: "first", Enabled: boolPtr(true)},
+		{Name: "second", Enabled: boolPtr(true), Tools: config.ToolFilter{Rename: map[string]string{"z": "first__t"}}},
 	}}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
@@ -780,7 +827,7 @@ func (s *swapConnOnCallUpstream) CallTool(context.Context, string, json.RawMessa
 // reached the upstream, so CallTool must re-resolve and retry ONCE against the
 // fresh connection — and both attempts must be audited.
 func TestCallToolRetriesOnceOnConnClosedBeforeSend(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var buf bytes.Buffer
 	callLog := logging.NewCallLogWriter(&buf)
 
@@ -832,7 +879,7 @@ func TestCallToolRetriesOnceOnConnClosedBeforeSend(t *testing.T) {
 // non-idempotent tool twice, so CallTool must return the error immediately even
 // though a fresh connection is already available under the same name.
 func TestCallToolNoRetryOnLateConnClosed(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	live := &fakeUpstream{name: "web", tools: []string{"fetch"}}
 	dead := &swapConnOnCallUpstream{
 		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
@@ -860,7 +907,7 @@ func TestCallToolNoRetryOnLateConnClosed(t *testing.T) {
 // nothing sensible to retry against — CallTool must return the error after
 // exactly one attempt instead of hammering the corpse.
 func TestCallToolNoRetryOnSameConn(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	dead := &swapConnOnCallUpstream{
 		fakeUpstream: &fakeUpstream{name: "web", tools: []string{"fetch"}},
 		repl:         nil, // no swap: the dead conn stays current
@@ -891,7 +938,7 @@ func TestCallToolNoRetryOnSameConn(t *testing.T) {
 func TestCallToolRetryDoesNotDoubleChargeRateLimit(t *testing.T) {
 	cfg := &config.Config{
 		RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1},
-		Upstreams: []config.Upstream{{Name: "web", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}},
 	}
 	live := &fakeUpstream{name: "web", tools: []string{"fetch"}}
 	dead := &swapConnOnCallUpstream{
@@ -977,7 +1024,7 @@ func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
 	}
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
-		Upstreams: []config.Upstream{{Name: "dyn", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "dyn", Enabled: boolPtr(true)}},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) { return up, nil }
@@ -1038,8 +1085,8 @@ func TestRelistOverlappingNotificationsSerialized(t *testing.T) {
 // still route every response correctly (id spaces are per-upstream, not global).
 func TestRegistrySeparatesIDSpaces(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "a", Enabled: true},
-		{Name: "b", Enabled: true},
+		{Name: "a", Enabled: boolPtr(true)},
+		{Name: "b", Enabled: boolPtr(true)},
 	}}
 	fa := &fakeUpstream{name: "a", tools: []string{"t"}}
 	fb := &fakeUpstream{name: "b", tools: []string{"t"}}
@@ -1072,7 +1119,7 @@ func TestRegistrySeparatesIDSpaces(t *testing.T) {
 // and, symmetrically, a call WITHOUT `_meta` must deliver none (nil), so the
 // gateway never invents one (transparent-proxy contract, MCP_NOTES §1).
 func TestCallToolForwardsMetaVerbatim(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	web := &fakeUpstream{name: "web", tools: []string{"fetch"}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{"web": web})
 	if err := r.Start(context.Background()); err != nil {
@@ -1103,9 +1150,9 @@ func TestCallToolForwardsMetaVerbatim(t *testing.T) {
 // lose the recorded instructions.
 func TestInstructionsAggregatesSortedNonEmpty(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "zeta", Enabled: true},
-		{Name: "alpha", Enabled: true},
-		{Name: "mid", Enabled: true},
+		{Name: "zeta", Enabled: boolPtr(true)},
+		{Name: "alpha", Enabled: boolPtr(true)},
+		{Name: "mid", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"zeta":  {name: "zeta", tools: []string{"z"}, instructions: "Use zeta wisely."},
@@ -1139,7 +1186,7 @@ func TestInstructionsAggregatesSortedNonEmpty(t *testing.T) {
 // TestInstructionsEmptyWhenNoUpstreamProvidesAny: no instructions anywhere
 // yields the empty string (so InitializeResult.Instructions is omitted).
 func TestInstructionsEmptyWhenNoUpstreamProvidesAny(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"web": {name: "web", tools: []string{"fetch"}},
 	})
@@ -1157,8 +1204,8 @@ func TestInstructionsEmptyWhenNoUpstreamProvidesAny(t *testing.T) {
 // absent keys, null values and malformed/missing capabilities do not.
 func TestHasUpstreamCapability(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "rich", Enabled: true},
-		{Name: "bare", Enabled: true},
+		{Name: "rich", Enabled: boolPtr(true)},
+		{Name: "bare", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"rich": {name: "rich", tools: []string{"r"},
@@ -1193,7 +1240,7 @@ func TestHasUpstreamCapability(t *testing.T) {
 // initialize) is audited with CallRecord.Client; a context without one yields
 // a record with the client field omitted entirely.
 func TestAuditRecordsClientFromContext(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "web", Enabled: boolPtr(true)}}}
 	var buf bytes.Buffer
 	r := newTestRegistry(t, cfg, logging.NewCallLogWriter(&buf), map[string]*fakeUpstream{
 		"web": {name: "web", tools: []string{"fetch"}},

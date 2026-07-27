@@ -14,7 +14,7 @@ import (
 // the mergeLocked/dropLocked paths installLocked is also built from)
 // invalidates it, so the next read reflects the new state.
 func TestToolsCacheInvalidatedOnCatalogMutation(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "a", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"a": {name: "a", tools: []string{"x"}},
 	})

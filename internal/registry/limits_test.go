@@ -33,7 +33,7 @@ func startedRegistry(t *testing.T, cfg *config.Config, fakes map[string]*fakeUps
 func TestRateLimitDelaysSecondCall(t *testing.T) {
 	cfg := &config.Config{
 		RateLimit: &config.RateLimit{RPS: 5, Burst: 1},
-		Upstreams: []config.Upstream{{Name: "a", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
 	}
 	fake := &fakeUpstream{name: "a", tools: []string{"t"}}
 	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
@@ -58,7 +58,7 @@ func TestRateLimitDelaysSecondCall(t *testing.T) {
 func TestRateLimitRespectsContextDeadline(t *testing.T) {
 	cfg := &config.Config{
 		RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1}, // next token in ~17 minutes
-		Upstreams: []config.Upstream{{Name: "a", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
 	}
 	fake := &fakeUpstream{name: "a", tools: []string{"t"}}
 	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
@@ -116,7 +116,7 @@ func (f *concurrencyFake) peakConcurrency() int {
 
 func TestMaxConcurrentCapsParallelCalls(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "a", Enabled: true, MaxConcurrent: 1},
+		{Name: "a", Enabled: boolPtr(true), MaxConcurrent: 1},
 	}}
 	fake := &concurrencyFake{}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -150,7 +150,7 @@ func TestPerUpstreamCallTimeoutOverridesGlobal(t *testing.T) {
 	cfg := &config.Config{
 		CallTimeout: 30 * time.Second,
 		Upstreams: []config.Upstream{
-			{Name: "a", Enabled: true, CallTimeout: 50 * time.Millisecond},
+			{Name: "a", Enabled: boolPtr(true), CallTimeout: 50 * time.Millisecond},
 		},
 	}
 	fake := &hangingFake{}
@@ -194,7 +194,7 @@ func (f *hangingFake) CallTool(ctx context.Context, _ string, _, _ json.RawMessa
 // a change, and are dropped when the limit is removed.
 func TestLimiterRebuiltOnConfigChange(t *testing.T) {
 	mk := func(rps float64, burst, conc int) *config.Config {
-		u := config.Upstream{Name: "a", Enabled: true, MaxConcurrent: conc}
+		u := config.Upstream{Name: "a", Enabled: boolPtr(true), MaxConcurrent: conc}
 		if rps > 0 {
 			u.RateLimit = &config.RateLimit{RPS: rps, Burst: burst}
 		}
@@ -406,7 +406,7 @@ func TestCallToolTruncatesOversizedResult(t *testing.T) {
 	t.Run("global limit", func(t *testing.T) {
 		cfg := &config.Config{
 			MaxResultBytes: 300,
-			Upstreams:      []config.Upstream{{Name: "a", Enabled: true}},
+			Upstreams:      []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
 		}
 		fake := &fakeUpstream{name: "a", tools: []string{"t"}, callResp: mcp.NewResult(mcp.IntID(1), big)}
 		r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
@@ -427,7 +427,7 @@ func TestCallToolTruncatesOversizedResult(t *testing.T) {
 		cfg := &config.Config{
 			MaxResultBytes: 100000, // global would not truncate at all
 			Upstreams: []config.Upstream{
-				{Name: "a", Enabled: true, MaxResultBytes: intPtr(300)},
+				{Name: "a", Enabled: boolPtr(true), MaxResultBytes: intPtr(300)},
 			},
 		}
 		fake := &fakeUpstream{name: "a", tools: []string{"t"}, callResp: mcp.NewResult(mcp.IntID(1), big)}
@@ -446,7 +446,7 @@ func TestCallToolTruncatesOversizedResult(t *testing.T) {
 		cfg := &config.Config{
 			MaxResultBytes: 300,
 			Upstreams: []config.Upstream{
-				{Name: "a", Enabled: true, MaxResultBytes: intPtr(0)},
+				{Name: "a", Enabled: boolPtr(true), MaxResultBytes: intPtr(0)},
 			},
 		}
 		fake := &fakeUpstream{name: "a", tools: []string{"t"}, callResp: mcp.NewResult(mcp.IntID(1), big)}
@@ -470,7 +470,7 @@ func TestPerUpstreamRateLimitOverridesGlobal(t *testing.T) {
 	cfg := &config.Config{
 		RateLimit: &config.RateLimit{RPS: 1000, Burst: 1000}, // global: effectively unlimited
 		Upstreams: []config.Upstream{
-			{Name: "a", Enabled: true, RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1}},
+			{Name: "a", Enabled: boolPtr(true), RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1}},
 		},
 	}
 	fake := &fakeUpstream{name: "a", tools: []string{"t"}}

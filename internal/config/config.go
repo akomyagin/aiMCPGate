@@ -89,8 +89,18 @@ type Upstream struct {
 	// These are never logged (SKILL §6).
 	Headers map[string]string `yaml:"headers"`
 
-	// Enabled allows disabling an upstream without removing its config.
-	Enabled bool `yaml:"enabled"`
+	// Enabled allows disabling an upstream without removing its config. A
+	// pointer so an ABSENT key means enabled (nil → true in IsEnabled) while an
+	// explicit `enabled: false` is honoured — a plain bool could not tell
+	// "unset" from "false", and its zero value made a hand-written upstream that
+	// simply forgot the key vanish silently: no log line, no doctor row, no
+	// tools. Same shape and reasoning as RestartPolicy.Enabled below. Never read
+	// this field directly — go through IsEnabled.
+	//
+	// Note the cost of the pointer: YAML decodes a valueless `enabled:` (and
+	// `enabled: null` / `enabled: ~`) to nil, i.e. ENABLED — commenting out the
+	// value no longer disables an upstream, only an explicit `false` does.
+	Enabled *bool `yaml:"enabled"`
 
 	// Tools narrows and renames what this upstream contributes to the
 	// aggregated catalog (Stage 9). The zero value passes every tool through
@@ -193,9 +203,9 @@ type ToolFilter struct {
 // transport and every field that affects how the upstream is reached. Used by
 // hot-reload (Stage 7d) to tell an unchanged upstream (leave running) from a
 // changed one (Close + relaunch). Name is assumed equal by the caller (it is the
-// match key); Enabled is intentionally NOT compared here — enable/disable is
-// handled as add/remove by the reload diff, not as a "changed launch". The
-// call-limit fields (RateLimit/MaxConcurrent/MaxResultBytes/CallTimeout, Round
+// match key); Enabled is intentionally NOT compared here (in any of its three
+// states — absent, true, false) — enable/disable is handled as add/remove by
+// the reload diff, not as a "changed launch". The call-limit fields (RateLimit/MaxConcurrent/MaxResultBytes/CallTimeout, Round
 // 6) are intentionally NOT compared either: they never affect how the process
 // is launched, and the registry re-reads them from the live config on every
 // call, so a reload that only tweaks a limit must leave the upstream running.
@@ -248,6 +258,18 @@ func (f ToolFilter) DenySet() map[string]bool {
 		deny[d] = true
 	}
 	return deny
+}
+
+// IsEnabled reports whether this upstream should be brought up: an absent
+// `enabled:` key (nil) means ENABLED, an explicit `enabled: false` disables it.
+// The ONE place that default lives — every reader (Registry.Start's launch
+// filter, the reload diff and enabledByName) goes through this method, so the
+// three of them cannot drift apart on what "enabled" means.
+func (u Upstream) IsEnabled() bool {
+	if u.Enabled == nil {
+		return true
+	}
+	return *u.Enabled
 }
 
 // ResolveKind returns the effective kind: the explicit Kind if set, otherwise

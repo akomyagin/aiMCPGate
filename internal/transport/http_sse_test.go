@@ -63,7 +63,7 @@ func notifyingUpstreamCfg(t *testing.T) (cfg *config.Config, toolsFile, notifyFi
 	cfg = &config.Config{
 		Transport: config.TransportHTTP,
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":        "web",
 				"FAKE_TOOLS":       "fetch",
 				"FAKE_TOOLS_FILE":  toolsFile,
@@ -212,7 +212,7 @@ func TestHTTPSSEForwardsProgressDuringToolsCall(t *testing.T) {
 	cfg := &config.Config{
 		Transport: config.TransportHTTP,
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":     "web",
 				"FAKE_TOOLS":    "fetch",
 				"FAKE_ECHO":     "1",
@@ -264,7 +264,7 @@ func TestHTTPSSEAuthAndOriginEnforced(t *testing.T) {
 		Transport: config.TransportHTTP,
 		AuthToken: token,
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":  "web",
 				"FAKE_TOOLS": "fetch",
 			}},
@@ -396,7 +396,7 @@ func TestHTTPSSEGracefulShutdownClosesStream(t *testing.T) {
 		Transport:  config.TransportHTTP,
 		ListenAddr: "127.0.0.1:0", // ephemeral port, learned via onListen
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":  "web",
 				"FAKE_TOOLS": "fetch",
 			}},

@@ -19,16 +19,16 @@ func limitsTestConfig() *Config {
 		RateLimit:      &RateLimit{RPS: 5, Burst: 2},
 		MaxResultBytes: 1000,
 		Upstreams: []Upstream{
-			{Name: "plain", Command: "echo", Enabled: true},
+			{Name: "plain", Command: "echo", Enabled: boolPtr(true)},
 			{
-				Name: "tuned", Command: "echo", Enabled: true,
+				Name: "tuned", Command: "echo", Enabled: boolPtr(true),
 				RateLimit:      &RateLimit{RPS: 1, Burst: 7},
 				MaxConcurrent:  3,
 				MaxResultBytes: intPtr(50),
 				CallTimeout:    2 * time.Second,
 			},
 			{
-				Name: "off", Command: "echo", Enabled: true,
+				Name: "off", Command: "echo", Enabled: boolPtr(true),
 				RateLimit:      &RateLimit{RPS: 0}, // explicit rps: 0 disables the global limit
 				MaxResultBytes: intPtr(0),          // explicit 0 disables the global cap
 			},
@@ -84,7 +84,7 @@ func TestEffectiveLimitsFor(t *testing.T) {
 // resolution: no config anywhere, burst normalization, global-only.
 func TestEffectiveRateLimitDefaults(t *testing.T) {
 	// Nothing configured: no limit for anyone.
-	cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: true}}}
+	cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: boolPtr(true)}}}
 	if _, _, ok := cfg.EffectiveRateLimitFor("a"); ok {
 		t.Error("no rate_limit configured, want ok=false")
 	}
@@ -99,7 +99,7 @@ func TestEffectiveRateLimitDefaults(t *testing.T) {
 
 func TestEffectiveCallTimeoutForFallsBackToDefault(t *testing.T) {
 	// Neither global nor per-upstream set: the built-in default applies.
-	cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: true}}}
+	cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: boolPtr(true)}}}
 	if got := cfg.EffectiveCallTimeoutFor("a"); got != DefaultCallTimeout {
 		t.Errorf("EffectiveCallTimeoutFor = %v, want DefaultCallTimeout %v", got, DefaultCallTimeout)
 	}
@@ -125,7 +125,7 @@ func TestValidateRejectsBadLimits(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: true}}}
+			cfg := &Config{Transport: TransportStdio, Upstreams: []Upstream{{Name: "a", Command: "echo", Enabled: boolPtr(true)}}}
 			tc.mutate(cfg)
 			err := cfg.Validate()
 			if err == nil {
@@ -142,7 +142,7 @@ func TestValidateRejectsBadLimits(t *testing.T) {
 // edit that only changes call limits must NOT count as a launch change (no
 // relaunch of the upstream process) — the registry re-reads limits live.
 func TestSameLaunchIgnoresLimitFields(t *testing.T) {
-	a := Upstream{Name: "a", Command: "echo", Args: []string{"x"}, Enabled: true}
+	a := Upstream{Name: "a", Command: "echo", Args: []string{"x"}, Enabled: boolPtr(true)}
 	b := a
 	b.RateLimit = &RateLimit{RPS: 1, Burst: 1}
 	b.MaxConcurrent = 4

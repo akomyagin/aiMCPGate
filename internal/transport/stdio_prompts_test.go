@@ -21,12 +21,12 @@ func startPromptServer(t *testing.T) (*fakeClient, context.CancelFunc, <-chan er
 	t.Helper()
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "docs", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":    "docs",
 			"FAKE_TOOLS":   "search",
 			"FAKE_PROMPTS": "summarize,review",
 		}},
-		{Name: "bare", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "bare", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "bare",
 			"FAKE_TOOLS": "fetch",
 		}},

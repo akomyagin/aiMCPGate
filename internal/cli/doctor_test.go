@@ -143,6 +143,38 @@ upstreams:
 	}
 }
 
+// TestDoctorUpstreamWithoutEnabledKey is the end-to-end shape of the bug the
+// *bool Enabled fixes: a config an operator hand-wrote and never spelled
+// `enabled: true` in. It used to yield an empty table and "no upstream is
+// enabled" with the entry silently dropped; now it must be checked like any
+// other upstream and report OK.
+func TestDoctorUpstreamWithoutEnabledKey(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: implicit
+    command: `+bin+`
+    env:
+      FAKE_TOOLS: "ping"
+`)
+
+	root := Build("test")
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"doctor", "-c", cfgPath})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("doctor must succeed for an upstream that omits `enabled:`: %v\noutput:\n%s", err, out.String())
+	}
+	row := doctorRow(t, out.String(), "implicit")
+	if !strings.Contains(row, "OK") {
+		t.Errorf("implicit row = %q, want OK", row)
+	}
+}
+
 // TestPrintDoctorReportSanitizesReason (regression, found by code review): the
 // failure reason comes from an arbitrary err.Error() — possibly text relayed
 // verbatim from the upstream — so it can contain tabs and newlines. Raw, a tab

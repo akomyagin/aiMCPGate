@@ -37,8 +37,8 @@ func resourceCatalog(r *Registry) map[string]string {
 // nothing fresh) must carry both over instead of losing them.
 func TestRegistryAggregatesResources(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "files", Enabled: true},
-		{Name: "bare", Enabled: true},
+		{Name: "files", Enabled: boolPtr(true)},
+		{Name: "bare", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"files": {name: "files", tools: []string{"read"}, caps: resourcesCaps,
@@ -92,8 +92,8 @@ func TestRegistryAggregatesResources(t *testing.T) {
 // order), the loser skipped — and resources/read must reach the winner.
 func TestRegistryResourceURICollisionKeepFirst(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "alpha", Enabled: true},
-		{Name: "beta", Enabled: true},
+		{Name: "alpha", Enabled: boolPtr(true)},
+		{Name: "beta", Enabled: boolPtr(true)},
 	}}
 	alpha := &fakeUpstream{name: "alpha", tools: []string{"a"}, caps: resourcesCaps, resources: []string{"file:///shared.txt"}}
 	beta := &fakeUpstream{name: "beta", tools: []string{"b"}, caps: resourcesCaps, resources: []string{"file:///shared.txt"}}
@@ -128,8 +128,8 @@ func TestRegistryResourceURICollisionKeepFirst(t *testing.T) {
 // touched.
 func TestRegistryReadResourceRoutesByURI(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	docs := &fakeUpstream{name: "docs", tools: []string{"a"}, caps: resourcesCaps, resources: []string{"file:///docs/readme.md"}}
 	web := &fakeUpstream{name: "web", tools: []string{"b"}, caps: resourcesCaps, resources: []string{"https://example.com/page"}}
@@ -161,7 +161,7 @@ func TestRegistryReadResourceRoutesByURI(t *testing.T) {
 // wrapping ErrUnknownResource (the dispatcher's Invalid-params signal), naming
 // only the uri the client itself asked for.
 func TestRegistryReadResourceUnknownErrors(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "docs", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "docs", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"docs": {name: "docs", tools: []string{"a"}, caps: resourcesCaps, resources: []string{"file:///a.txt"}},
 	})
@@ -224,8 +224,8 @@ func TestTemplateRegexp(t *testing.T) {
 // uri untouched. A uri matching nothing stays unknown.
 func TestRegistryReadResourceTemplateMatch(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "logs", Enabled: true},
-		{Name: "catchall", Enabled: true},
+		{Name: "logs", Enabled: boolPtr(true)},
+		{Name: "catchall", Enabled: boolPtr(true)},
 	}}
 	logs := &fakeUpstream{name: "logs", tools: []string{"a"}, caps: resourcesCaps,
 		templates: []string{"file:///logs/{name}.log"}}
@@ -272,8 +272,8 @@ func TestRegistryReadResourceTemplateMatch(t *testing.T) {
 // argument/context verbatim.
 func TestRegistryCompleteRefPrompt(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	docs := &fakeUpstream{name: "docs", tools: []string{"a"}, caps: promptsCaps, prompts: []string{"greet"}}
 	web := &fakeUpstream{name: "web", tools: []string{"b"}, caps: promptsCaps, prompts: []string{"greet"}}
@@ -321,7 +321,7 @@ func TestRegistryCompleteRefPrompt(t *testing.T) {
 // wrap ErrUnknownCompletionRef.
 func TestRegistryCompleteRefResource(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "files", Enabled: true},
+		{Name: "files", Enabled: boolPtr(true)},
 	}}
 	files := &fakeUpstream{name: "files", tools: []string{"a"}, caps: resourcesCaps,
 		resources: []string{"file:///a.txt"},
@@ -391,7 +391,7 @@ func TestRegistryCompleteRefResource(t *testing.T) {
 // matches its own pattern. Guarded by a test so a future "smarter" matcher
 // does not silently break template-variable completion.
 func TestRegistryCompleteRefResourceTemplateURI(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "files", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "files", Enabled: boolPtr(true)}}}
 	files := &fakeUpstream{name: "files", tools: []string{"a"}, caps: resourcesCaps,
 		templates: []string{"file:///logs/{name}.log"}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{"files": files})
@@ -429,7 +429,7 @@ func (p *panicListResourcesUpstream) ListResourceTemplates(context.Context) ([]m
 // declares no "resources" capability must never receive resources/list or
 // resources/templates/list at all.
 func TestRegistryNoListResourcesWithoutCapability(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "bare", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "bare", Enabled: boolPtr(true)}}}
 	bare := &panicListResourcesUpstream{
 		fakeUpstream: &fakeUpstream{name: "bare", tools: []string{"a"}, caps: json.RawMessage(`{"tools":{}}`)},
 	}
@@ -450,7 +450,7 @@ func TestRegistryNoListResourcesWithoutCapability(t *testing.T) {
 // degraded — its tools still come up, Start does not fail. A templates-only
 // failure keeps the plain resources.
 func TestRegistryListResourcesErrorDoesNotFailLaunch(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "flaky", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "flaky", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"flaky": {name: "flaky", tools: []string{"a"}, caps: resourcesCaps,
 			resources: []string{"file:///x"}, resourcesErr: errors.New("resources exploded")},
@@ -466,7 +466,7 @@ func TestRegistryListResourcesErrorDoesNotFailLaunch(t *testing.T) {
 		t.Errorf("resource catalog = %+v, want empty after a failed resources/list", got)
 	}
 
-	cfg2 := &config.Config{Upstreams: []config.Upstream{{Name: "half", Enabled: true}}}
+	cfg2 := &config.Config{Upstreams: []config.Upstream{{Name: "half", Enabled: boolPtr(true)}}}
 	r2 := newTestRegistry(t, cfg2, nil, map[string]*fakeUpstream{
 		"half": {name: "half", tools: []string{"b"}, caps: resourcesCaps,
 			resources: []string{"file:///y"}, templates: []string{"file:///{z}"},
@@ -490,8 +490,8 @@ func TestRegistryListResourcesErrorDoesNotFailLaunch(t *testing.T) {
 // cleanly afterwards.
 func TestRegistryDropUpstreamClearsResources(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"docs": {name: "docs", tools: []string{"a"}, caps: resourcesCaps,

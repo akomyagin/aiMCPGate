@@ -221,8 +221,15 @@ binary** (e.g. if `mcp-gate` is installed at `/etc/gate/`, it looks for
 `/etc/gate/config.yaml` — regardless of the working directory it was launched
 from). If that file doesn't exist and `--config` wasn't passed either, it
 errors explicitly instead of starting an empty gateway. Relative paths inside
-the config (`log_file`, `skill_file`) resolve against the **config file's own
-directory**, not the current working directory.
+the config (`log_file`, `skill_file`, `debug_payload_log`) resolve against the
+**config file's own directory**, not the current working directory.
+
+An upstream is **enabled by default**: omit `enabled:` entirely and it is
+launched like any other. To keep one out of the gateway without deleting its
+config, disable it explicitly with **`enabled: false`** — it then appears
+neither in `tools/list` nor in `mcp-gate doctor`'s table. Careful: a valueless
+`enabled:` (or `enabled: null`) reads as *omitted*, so commenting the value out
+leaves the upstream running — only the literal `false` disables it.
 
 > Note: the "next to the binary" lookup uses the path of the running executable.
 > Under `go run ./cmd ...` that executable is a throwaway build in a temp

@@ -17,7 +17,7 @@ func elicitTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	bin := buildFakeServer(t)
 	return &config.Config{Upstreams: []config.Upstream{
-		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":   "web",
 			"FAKE_TOOLS":  "ask",
 			"FAKE_ELICIT": "1",
