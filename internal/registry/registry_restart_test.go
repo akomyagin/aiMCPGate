@@ -104,6 +104,70 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 	}
 }
 
+// TestSupervisorRestartKeepsElicitationDeclaration pins the property the
+// elicitationProxySupported field comment claims but nothing else held: the
+// flag is re-read by startStdio on EVERY launch, so the handshake of a
+// supervisor-relaunched upstream declares elicitation exactly like the first
+// one did. A "one-shot" flag (consumed by the first launch) would pass every
+// other test and silently kill elicitation for the rest of the process's life
+// after the first crash — the FAKE_CAPS_FILE record of BOTH handshakes is
+// what catches it.
+func TestSupervisorRestartKeepsElicitationDeclaration(t *testing.T) {
+	bin := buildFakeServer(t)
+	capsFile := filepath.Join(t.TempDir(), "caps")
+	cfg := &config.Config{
+		Restart: config.RestartPolicy{
+			Enabled:        boolPtr(true),
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			MaxAttempts:    5,
+		},
+		Upstreams: []config.Upstream{
+			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+				"FAKE_TOOLS":      "ping",
+				"FAKE_ECHO":       "1",
+				"FAKE_EXIT_AFTER": "1",
+				"FAKE_CAPS_FILE":  capsFile,
+			}},
+		},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	// What the stdio client-facing transport does before Start (stdioServer.Serve).
+	r.SetElicitationProxySupported(true)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+
+	// Crash the upstream (it exits after answering one call), then poll the
+	// caps file for the relaunched process's handshake line. The catalog
+	// entry never disappears during a crash-restart, so waitForTool would
+	// return before the relaunch — the caps file itself is the only
+	// observable that synchronizes with the second handshake.
+	if _, err := r.CallTool(context.Background(), "crasher__ping", []byte(`{}`), nil); err != nil {
+		t.Fatalf("first CallTool: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var lines []string
+	for {
+		data, _ := os.ReadFile(capsFile)
+		lines = strings.Fields(string(data)) // one JSON object per line, no spaces inside
+		if len(lines) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("caps file has %d handshake line(s) after %s, want 2 (initial + restart):\n%s",
+				len(lines), 5*time.Second, strings.Join(lines, "\n"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, `"elicitation"`) {
+			t.Errorf("handshake %d did not declare elicitation (flag consumed instead of re-read?): %s", i+1, line)
+		}
+	}
+}
+
 // countZombieChildren scans /proc for zombie (state Z) processes whose parent
 // is the CURRENT test process — i.e. a stdio-upstream child this test spawned
 // that exited but was never reaped via wait() (cmd.Wait, which only runs

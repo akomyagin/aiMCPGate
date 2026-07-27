@@ -228,6 +228,49 @@ func (c *captureTransport) Close() error                                        
 func (c *captureTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
 func (c *captureTransport) StderrTail() ([]string, bool)                          { return nil, false }
 
+// TestInitializeWireCapabilities pins what Initialize DECLARES to the upstream
+// as the gateway's client capabilities. A Conn told to declare elicitation
+// (what the registry does for a stdio upstream when the client-facing
+// transport can proxy the request) must send the key in params.capabilities —
+// an upstream honouring the spec's "only use negotiated capabilities" MUST
+// otherwise never send elicitation/create. A Conn told nothing — the zero
+// value every non-declaring path builds (HTTP upstreams, doctor/call/catalog)
+// — must send exactly {}, byte-identical to the pre-declaration handshake.
+func TestInitializeWireCapabilities(t *testing.T) {
+	tr := &captureTransport{}
+	c := &Conn{transport: tr}
+	c.DeclareClientCapabilities("elicitation")
+	if _, err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize (declared): %v", err)
+	}
+	var declared struct {
+		Capabilities map[string]json.RawMessage `json:"capabilities"`
+	}
+	if err := json.Unmarshal(tr.params, &declared); err != nil {
+		t.Fatalf("decode sent initialize params: %v", err)
+	}
+	if v, ok := declared.Capabilities["elicitation"]; !ok {
+		t.Errorf("declared conn sent capabilities without the elicitation key: %s", tr.params)
+	} else if string(v) != "{}" {
+		t.Errorf("elicitation capability = %s, want the spec's empty object {}", v)
+	}
+
+	tr = &captureTransport{}
+	c = &Conn{transport: tr}
+	if _, err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize (undeclared): %v", err)
+	}
+	var undeclared struct {
+		Capabilities json.RawMessage `json:"capabilities"`
+	}
+	if err := json.Unmarshal(tr.params, &undeclared); err != nil {
+		t.Fatalf("decode sent initialize params: %v", err)
+	}
+	if string(undeclared.Capabilities) != "{}" {
+		t.Errorf("undeclared conn sent capabilities %s, want exactly {}", undeclared.Capabilities)
+	}
+}
+
 // TestCallToolWireParamsCarryMetaExactly pins the wire contract of the `_meta`
 // passthrough: the params CallTool sends carry the client's `_meta` object
 // byte for byte (compact JSON in, identical bytes out), and when the caller

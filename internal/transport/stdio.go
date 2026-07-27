@@ -52,6 +52,30 @@ func newStdioServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger
 // client messages until the client's stream ends (EOF) or ctx is cancelled.
 // The registry is torn down on return so upstream child processes exit cleanly.
 func (s *stdioServer) Serve(ctx context.Context) error {
+	// stdio can proxy an upstream's elicitation/create to its client and route
+	// the answer back (Round 14) — tell the registry BEFORE the upstream
+	// handshakes fan out, so it declares the matching client capability to
+	// stdio upstreams in initialize. Capabilities are exchanged exactly once,
+	// in the handshake; a declaration after Start could never catch up. The
+	// HTTP transport (no gateway→client request channel) and the CLI paths
+	// (no MCP client at all) never make this call and keep declaring nothing.
+	s.reg.SetElicitationProxySupported(true)
+
+	// Subscribe to upstream-initiated elicitation/create requests (Round 14)
+	// BEFORE Start, for the same reason the flag above is set before it: once
+	// the handshakes fan out, a stdio upstream that saw the declared capability
+	// may ask at any moment, and the registry's "publish reached no subscriber"
+	// fallback must stay unreachable by construction — not merely shadowed by
+	// the client-capability gate happening to fire first (found by review). An
+	// upstream needing human input mid-tools/call publishes here; the loop
+	// below pushes the request to the client under the gateway-minted id, and
+	// the client's answer is routed back in the frames branch
+	// (RouteElicitationResponse). Unsubscribing after Close (this defer runs
+	// last) is harmless: it only deletes a map entry under the registry's own
+	// mutex.
+	elicitReqs, unsubscribeElicits := s.reg.SubscribeElicitations()
+	defer unsubscribeElicits()
+
 	if err := s.reg.Start(ctx); err != nil {
 		return err
 	}
@@ -73,14 +97,6 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	// client over the same pipe, gated on initialized like list_changed.
 	upstreamNotifs, unsubscribeNotifs := s.reg.SubscribeNotifications()
 	defer unsubscribeNotifs()
-
-	// Subscribe to upstream-initiated elicitation/create requests (Round 14):
-	// an upstream needing human input mid-tools/call publishes here; the loop
-	// pushes the request to the client under the gateway-minted id, and the
-	// client's answer is routed back in the frames branch below
-	// (RouteElicitationResponse).
-	elicitReqs, unsubscribeElicits := s.reg.SubscribeElicitations()
-	defer unsubscribeElicits()
 
 	// mcp.Reader.Read blocks and is not context-aware, so run it in its own
 	// goroutine and feed decoded frames over a channel. This lets Serve select

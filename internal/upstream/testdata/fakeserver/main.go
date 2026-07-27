@@ -115,13 +115,32 @@
 //	                   REQUEST to its client (id "fake-elicit-<n>", fixed
 //	                   message/requestedSchema params) and waits for the
 //	                   response before answering the call; the tool result text
-//	                   then carries "|elicited=<raw result>" (or
-//	                   "|elicit-error=<code> <message>" when the client/gateway
-//	                   answered with a JSON-RPC error, or "|elicit-timeout"
-//	                   after 10s of silence) — used to test the gateway's
-//	                   upstream→client elicitation proxying (Round 14). Each
-//	                   such call runs on its own goroutine so the main loop
-//	                   keeps reading stdin for the response.
+//	                   then carries "|elicited=<raw result>" (any ElicitResult,
+//	                   decline and cancel included — a spec-abiding tool keeps
+//	                   working without the extra input) or "|elicit-timeout"
+//	                   after 10s of silence. A JSON-RPC ERROR response instead
+//	                   FAILS the call (isError:true, text "elicit-error=<code>
+//	                   <message>") — the way real server SDKs surface it, an
+//	                   exception inside the tool — so a gateway that answers an
+//	                   unservable elicitation with an error instead of the
+//	                   spec's decline result shows up as a broken call, exactly
+//	                   like it would against a real upstream. Used to test the
+//	                   gateway's upstream→client elicitation proxying
+//	                   (Round 14). Each such call runs on its own goroutine so
+//	                   the main loop keeps reading stdin for the response. The
+//	                   hook RESPECTS
+//	                   capability negotiation, like a spec-abiding server MUST:
+//	                   when the client's initialize did not declare the
+//	                   elicitation capability, no request is sent and the call
+//	                   answers immediately with the distinct "|elicit-skipped"
+//	                   marker — distinguishable from a plain success, so a test
+//	                   can tell "honoured the negotiation" from "hook broke".
+//	FAKE_CAPS_FILE   path the server APPENDS the raw `capabilities` object of
+//	                   each received initialize to (one JSON line) — a direct
+//	                   record of what the gateway DECLARED in its handshake,
+//	                   for both the positive assertion (elicitation present)
+//	                   and the negative one (absent), without relying on the
+//	                   side effects above.
 //	FAKE_ASYNC_CALLS  if "1", each tools/call is answered on its OWN goroutine
 //	                   (FAKE_CALL_DELAY sleeps there), so the main read loop
 //	                   keeps consuming stdin meanwhile — required by the
@@ -201,6 +220,7 @@ func main() {
 	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
 	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
 	elicit := os.Getenv("FAKE_ELICIT") == "1"
+	capsFile := os.Getenv("FAKE_CAPS_FILE")
 	logging := os.Getenv("FAKE_LOGGING") == "1"
 	logFile := os.Getenv("FAKE_LOG_FILE")
 	setLevelFile := os.Getenv("FAKE_SETLEVEL_FILE")
@@ -295,6 +315,13 @@ func main() {
 	elicitWaiters := map[string]chan message{}
 	elicitSeq := 0
 
+	// clientElicits records whether the client's LAST initialize declared the
+	// elicitation capability — the FAKE_ELICIT hook consults it, because a
+	// spec-abiding server MUST only use negotiated capabilities. Written and
+	// read on the main loop only (the elicit goroutines are spawned after the
+	// gate), so no lock is needed.
+	clientElicits := false
+
 	callCount := 0
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -324,6 +351,19 @@ func main() {
 		case "initialize":
 			if initDelay > 0 {
 				time.Sleep(initDelay)
+			}
+			// Sniff the CLIENT's declared capabilities (tolerantly — malformed
+			// or absent input means "declared nothing", never an error: the
+			// stand must stay lenient to any input) and optionally record the
+			// raw object for direct test assertions (FAKE_CAPS_FILE).
+			rawCaps := clientCapabilities(req.Params)
+			clientElicits = capabilityDeclared(rawCaps, "elicitation")
+			if capsFile != "" {
+				f, err := os.OpenFile(capsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintf(f, "%s\n", rawCaps)
+					f.Close()
+				}
 			}
 			capList := []string{`"tools":{}`}
 			if len(prompts) > 0 {
@@ -448,6 +488,16 @@ func main() {
 							`{"progressToken":%s,"progress":1,"total":2}`, p.Meta.ProgressToken))})
 				}
 			}
+			if elicit && !clientElicits {
+				// The hook is armed but the client never declared the
+				// elicitation capability: honour the negotiation (a spec MUST)
+				// and answer without asking. The distinct marker keeps this
+				// case distinguishable from a plain successful call — a
+				// negotiation-regression test needs to tell "the server
+				// respected the handshake" from "the hook silently broke".
+				write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, "|elicit-skipped"))})
+				continue
+			}
 			if elicit {
 				// Ask the client for input mid-call and only then answer, per
 				// the MCP elicitation flow (Round 14 test hook). On a goroutine:
@@ -466,10 +516,19 @@ func main() {
 					select {
 					case resp := <-ch:
 						if resp.Error != nil {
-							suffix = fmt.Sprintf("|elicit-error=%d %s", resp.Error.Code, resp.Error.Message)
-						} else {
-							suffix = "|elicited=" + string(resp.Result)
+							// Real server SDKs turn a JSON-RPC error to their
+							// elicit call into an exception inside the tool,
+							// failing the whole tools/call — mirror that, so a
+							// gateway answering with an error instead of the
+							// spec's decline RESULT breaks the call here too.
+							b, _ := json.Marshal(fmt.Sprintf("elicit-error=%d %s", resp.Error.Code, resp.Error.Message))
+							write(message{ID: req.ID, Result: json.RawMessage(
+								fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":true}`, b))})
+							return
 						}
+						// Any RESULT — accept, decline, cancel — keeps the tool
+						// working: the spec obliges servers to handle all three.
+						suffix = "|elicited=" + string(resp.Result)
 					case <-time.After(10 * time.Second):
 						suffix = "|elicit-timeout"
 					}
@@ -653,6 +712,29 @@ func callResult(params json.RawMessage, echo bool, suffix string) string {
 	text += suffix
 	b, _ := json.Marshal(text)
 	return fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":false}`, b)
+}
+
+// clientCapabilities extracts the raw `capabilities` object from initialize
+// params, tolerantly: malformed or absent input yields nil, never an error.
+func clientCapabilities(params json.RawMessage) json.RawMessage {
+	var p struct {
+		Capabilities json.RawMessage `json:"capabilities"`
+	}
+	_ = json.Unmarshal(params, &p)
+	return p.Capabilities
+}
+
+// capabilityDeclared reports whether the raw capabilities object declares the
+// named capability — key presence alone counts, even an empty object, matching
+// how the gateway itself sniffs its client's capabilities. Any malformed shape
+// degrades to false: "cannot tell" safely means "not declared".
+func capabilityDeclared(rawCaps json.RawMessage, name string) bool {
+	var caps map[string]json.RawMessage
+	if json.Unmarshal(rawCaps, &caps) != nil {
+		return false
+	}
+	_, ok := caps[name]
+	return ok
 }
 
 func envOr(k, def string) string {

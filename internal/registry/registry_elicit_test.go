@@ -83,11 +83,14 @@ func TestElicitationRoundTripThroughRegistry(t *testing.T) {
 	}
 }
 
-// TestElicitationRefusedWithoutClientCapability (Round 14): with the client
-// flag unset (the default — HTTP transports never set it), an upstream's
-// elicitation/create is answered immediately with method-not-found under the
-// upstream's ORIGINAL id, and nothing reaches the subscribers.
-func TestElicitationRefusedWithoutClientCapability(t *testing.T) {
+// TestElicitationDeclinedWithoutClientCapability (Round 14, semantics fixed
+// after review): with the client flag unset (the default — HTTP transports
+// never set it), an upstream's elicitation/create is answered immediately
+// with the spec's {"action":"decline"} RESULT under the upstream's ORIGINAL
+// id — never a JSON-RPC error, which contradicts the declared capability and
+// which SDKs turn into a failed tools/call — and nothing reaches the
+// subscribers.
+func TestElicitationDeclinedWithoutClientCapability(t *testing.T) {
 	r, fake := newElicitTestRegistry("web")
 	ch, unsubscribe := r.SubscribeElicitations()
 	defer unsubscribe()
@@ -98,13 +101,16 @@ func TestElicitationRefusedWithoutClientCapability(t *testing.T) {
 	select {
 	case got := <-fake.responses:
 		if string(got.ID) != string(originalID) {
-			t.Errorf("refusal id = %s, want the upstream's original %s", got.ID, originalID)
+			t.Errorf("decline id = %s, want the upstream's original %s", got.ID, originalID)
 		}
-		if got.Error == nil || got.Error.Code != mcp.CodeMethodNotFound {
-			t.Errorf("refusal error = %+v, want code %d", got.Error, mcp.CodeMethodNotFound)
+		if got.Error != nil {
+			t.Errorf("upstream got a JSON-RPC error %+v, want the decline result", got.Error)
+		}
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("decline result = %s, want exactly {\"action\":\"decline\"}", got.Result)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("upstream never received the immediate refusal")
+		t.Fatal("upstream never received the immediate decline")
 	}
 	select {
 	case req := <-ch:
@@ -117,7 +123,9 @@ func TestElicitationRefusedWithoutClientCapability(t *testing.T) {
 // publish reaches NO subscriber (here: none registered at all), the parked
 // pendingElicits entry must be rolled back — RouteElicitationResponse is its
 // only other remover, so it would leak forever — and the upstream must get an
-// immediate error under its ORIGINAL id instead of hanging to its timeout.
+// immediate {"action":"decline"} under its ORIGINAL id instead of hanging to
+// its timeout: nobody can ask the human, which is a decline, not an error
+// (same user decision as the incapable-client path).
 func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
 	r, fake := newElicitTestRegistry("web")
 	r.SetClientElicitationCapable(true) // capable client, but nobody subscribed
@@ -128,10 +136,13 @@ func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
 	select {
 	case got := <-fake.responses:
 		if string(got.ID) != string(originalID) {
-			t.Errorf("error reply id = %s, want the upstream's original %s", got.ID, originalID)
+			t.Errorf("decline id = %s, want the upstream's original %s", got.ID, originalID)
 		}
-		if got.Error == nil || got.Error.Code != mcp.CodeInternalError {
-			t.Errorf("error reply = %+v, want code %d", got.Error, mcp.CodeInternalError)
+		if got.Error != nil {
+			t.Errorf("upstream got a JSON-RPC error %+v, want the decline result", got.Error)
+		}
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("decline result = %s, want exactly {\"action\":\"decline\"}", got.Result)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("upstream never received an answer for the undeliverable elicitation")
