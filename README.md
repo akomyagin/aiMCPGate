@@ -19,11 +19,15 @@ one catalog, and **logs** every call.
 > and real cancellation, `logging/setLevel` fan-out, per-upstream call limits
 > (rate limit / concurrency / result truncation / timeout), a lazy catalog and
 > `tools/list` pagination, SSE server→client streams on both the client and the
-> upstream side, and `elicitation/create` proxying (stdio↔stdio only).
+> upstream side, and `elicitation/create` proxying (stdio↔stdio only). Merged
+> since v0.3.0 but not yet released: `sampling/createMessage` and `roots/list`
+> proxying (stdio↔stdio as well), and honest capability declaration to
+> upstreams — the gateway now offers an upstream exactly what its own client
+> declared, instead of a blanket `{}`.
 >
-> **Not implemented:** `sampling`/`roots` proxying from an upstream to the
-> client, `elicitation` over the HTTP transport (either side), a per-client
-> access policy, and `DELETE /mcp` session termination.
+> **Not implemented:** server→client requests over the HTTP transport — that is
+> `elicitation`, `sampling` and `roots` alike, with HTTP on either side — a
+> per-client access policy, and `DELETE /mcp` session termination.
 
 ## Releases
 
