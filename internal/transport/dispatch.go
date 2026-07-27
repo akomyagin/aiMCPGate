@@ -104,14 +104,15 @@ type dispatcher struct {
 	// feeds it to buildCapabilities on every handshake.
 	listChanged bool
 
-	// elicitation is whether this transport can proxy an upstream's
-	// elicitation/create REQUEST to the client and route the answer back
-	// (Round 14): true only for stdio. Gates handleInitialize's
-	// SetClientElicitationCapable — over HTTP the registry flag must stay
-	// false even for a client that declares the capability, because the HTTP
-	// transport has no channel for gateway→client requests and never
-	// subscribes to SubscribeElicitations.
-	elicitation bool
+	// serverRequests is whether this transport can proxy an upstream's
+	// server→client REQUEST (elicitation/create, sampling/createMessage,
+	// roots/list) to the client and route the answer back: true only for
+	// stdio. Gates handleInitialize's capability recording — over HTTP the
+	// registry must keep declaring nothing even for a client that declares
+	// the capabilities, because the HTTP transport has no channel for
+	// gateway→client requests and never subscribes to
+	// SubscribeUpstreamRequests.
+	serverRequests bool
 
 	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
 	// that aborts that in-flight tools/call's context (Round 2). Entries live
@@ -126,16 +127,16 @@ type dispatcher struct {
 // which tools capability to advertise: true only for a transport that can push
 // a server→client notifications/tools/list_changed — today both stdio (the
 // pipe) and HTTP (the GET SSE stream, Round 12). See buildCapabilities.
-// elicitation is true only for a transport that proxies upstream
-// elicitation/create requests to the client (Round 14) — today stdio only.
-func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, elicitation bool) *dispatcher {
+// serverRequests is true only for a transport that proxies upstream-initiated
+// requests to the client (Round 14, Stage 15) — today stdio only.
+func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, serverRequests bool) *dispatcher {
 	return &dispatcher{
-		reg:         reg,
-		log:         log,
-		version:     version,
-		listChanged: listChanged,
-		elicitation: elicitation,
-		cancels:     map[string]context.CancelFunc{},
+		reg:            reg,
+		log:            log,
+		version:        version,
+		listChanged:    listChanged,
+		serverRequests: serverRequests,
+		cancels:        map[string]context.CancelFunc{},
 	}
 }
 
@@ -166,6 +167,17 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 			// one client notification with a side effect. Never a reply: a
 			// notification gets none even when it misses.
 			d.handleCancelled(msg.Params)
+			return nil
+		}
+		if msg.Method == mcp.NotifRootsListChanged {
+			// The client's roots changed: drop the cached roots/list answer and
+			// relay the notification to every upstream the gateway declared
+			// roots to (Stage 15). Gated on serverRequests like the capability
+			// recording — a transport that never proxies roots/list has no
+			// cache to drop and declared nothing to relay to.
+			if d.serverRequests {
+				d.reg.OnClientRootsListChanged()
+			}
 			return nil
 		}
 		// notifications/initialized and the like need no reply.
@@ -230,12 +242,20 @@ func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
 	if client := clientString(req.Params); client != "" {
 		d.log.Debug("client initialize", "client", client)
 	}
-	// Record whether the client can answer proxied elicitation/create requests
-	// (Round 14) — stdio only (see the elicitation field). A re-initialize
-	// simply overwrites the flag: the latest handshake wins, matching how the
-	// stdio Serve loop re-binds the client identity.
-	if d.elicitation {
-		d.reg.SetClientElicitationCapable(clientSupportsElicitation(req.Params))
+	// Record which server→client requests this client can answer — stdio only
+	// (see the serverRequests field). On the FIRST initialize the stdio Serve
+	// loop has already recorded the same set BEFORE starting the registry, so
+	// this call is a no-op restatement; on a RE-initialize it genuinely
+	// updates two things: the runtime refusal gate, and what will be declared
+	// to connections created LATER (a supervisor restart, a reload). Existing
+	// handshakes are NOT re-negotiated — MCP 2025-06-18 has no re-negotiation,
+	// so a capability withdrawn by a second initialize keeps travelling in the
+	// handshakes that already happened; the refusal path is what stays honest.
+	if d.serverRequests {
+		d.reg.SetClientServerRequestCaps(clientServerRequestCaps(req.Params))
+		// A fresh handshake may well be a different client with different
+		// roots, so anything cached from the previous one is dropped.
+		d.reg.InvalidateRootsCache()
 	}
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
@@ -265,23 +285,56 @@ func clientString(params json.RawMessage) string {
 	return p.ClientInfo.Name + "/" + p.ClientInfo.Version
 }
 
-// clientSupportsElicitation reports whether the client's initialize params
-// declared the elicitation capability (Round 14). Per MCP the KEY's presence
-// means support, even as an empty object, so only presence is checked. The
-// parse is tolerant like clientString's: absent or malformed params/
-// capabilities mean false (no support), never an error — initialize must
-// succeed regardless, and "cannot tell" safely degrades to "cannot elicit".
-func clientSupportsElicitation(params json.RawMessage) bool {
+// clientDeclaresCapability reports whether the client's initialize params
+// declared the named client capability ("elicitation", "sampling", "roots").
+// Per MCP the KEY's presence means support, even as an empty object, so only
+// presence is checked.
+func clientDeclaresCapability(params json.RawMessage, name string) bool {
+	_, ok := clientCapabilityValue(params, name)
+	return ok
+}
+
+// clientCapabilityValue returns the RAW value the client declared for the named
+// client capability, and whether it declared it at all.
+//
+// The value, not just the presence, because the gateway RENDERS its own
+// upstream declaration from it: roots carries a "listChanged" sub-flag that
+// must be mirrored rather than invented, since the gateway only relays the
+// client's notifications/roots/list_changed and never originates one (found by
+// review). A declared-but-null or declared-but-garbage value still reports
+// true — presence is what the spec makes meaningful — and every renderer
+// downstream degrades tolerantly on the value itself.
+//
+// The parse is tolerant like clientString's: absent or malformed
+// params/capabilities mean "not declared", never an error — initialize must
+// succeed regardless, and "cannot tell" safely degrades to "cannot serve it".
+func clientCapabilityValue(params json.RawMessage, name string) (json.RawMessage, bool) {
 	var p mcp.InitializeParams
 	if len(params) == 0 || json.Unmarshal(params, &p) != nil || len(p.Capabilities) == 0 {
-		return false
+		return nil, false
 	}
 	var caps map[string]json.RawMessage
 	if json.Unmarshal(p.Capabilities, &caps) != nil {
-		return false
+		return nil, false
 	}
-	_, ok := caps["elicitation"]
-	return ok
+	value, ok := caps[name]
+	return value, ok
+}
+
+// clientServerRequestCaps snapshots which server→client capabilities the
+// client declared in its initialize params, WITH their raw values — the honest
+// basis for what the gateway declares to its stdio upstreams (Stage 15). The
+// names come from the registry's spec table, so adding a proxied method does
+// not need a second list here. Same tolerant parse as clientCapabilityValue: an
+// unreadable initialize simply declares nothing.
+func clientServerRequestCaps(params json.RawMessage) map[string]json.RawMessage {
+	caps := map[string]json.RawMessage{}
+	for _, name := range registry.ServerRequestCapabilities() {
+		if value, ok := clientCapabilityValue(params, name); ok {
+			caps[name] = value
+		}
+	}
+	return caps
 }
 
 // handleToolsList returns the aggregated, namespaced catalog. Each tool's

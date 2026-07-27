@@ -104,14 +104,13 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 	}
 }
 
-// TestSupervisorRestartKeepsElicitationDeclaration pins the property the
-// elicitationProxySupported field comment claims but nothing else held: the
-// flag is re-read by startStdio on EVERY launch, so the handshake of a
-// supervisor-relaunched upstream declares elicitation exactly like the first
-// one did. A "one-shot" flag (consumed by the first launch) would pass every
-// other test and silently kill elicitation for the rest of the process's life
-// after the first crash — the FAKE_CAPS_FILE record of BOTH handshakes is
-// what catches it.
+// TestSupervisorRestartKeepsElicitationDeclaration pins a property nothing else
+// holds: the client-capability set is re-read by startStdio on EVERY launch, so
+// the handshake of a supervisor-relaunched upstream declares elicitation
+// exactly like the first one did. A "one-shot" set (consumed by the first
+// launch) would pass every other test and silently kill elicitation for the
+// rest of the process's life after the first crash — the FAKE_CAPS_FILE record
+// of BOTH handshakes is what catches it.
 func TestSupervisorRestartKeepsElicitationDeclaration(t *testing.T) {
 	bin := buildFakeServer(t)
 	capsFile := filepath.Join(t.TempDir(), "caps")
@@ -133,7 +132,7 @@ func TestSupervisorRestartKeepsElicitationDeclaration(t *testing.T) {
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	// What the stdio client-facing transport does before Start (stdioServer.Serve).
-	r.SetElicitationProxySupported(true)
+	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

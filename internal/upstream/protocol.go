@@ -54,46 +54,46 @@ type Conn struct {
 	// StartStdio/StartHTTP; empty falls back to the dev placeholder.
 	gatewayVersion string
 
-	// declaredCaps are the client-capability names the gateway declares to
-	// this upstream in the initialize handshake, each rendered as an empty
-	// object (e.g. "elicitation": {}). The REGISTRY decides the set — it
-	// alone knows whether the client-facing transport can relay a
-	// server-initiated request and whether this upstream's transport can
-	// carry the answer back; this package only puts the decision on the
-	// wire. Set once via DeclareClientCapabilities before Initialize (same
-	// no-lock rule as gatewayVersion); the zero value declares nothing and
-	// sends exactly {} — byte-identical to the pre-declaration handshake.
-	// Being a plain field, it is stable across repeated Initialize calls
-	// (the HTTP session-expiry re-init) by construction.
-	declaredCaps []string
+	// declaredCaps are the client-capabilities the gateway declares to this
+	// upstream in the initialize handshake: capability name → the READY
+	// rendered value ({} for elicitation/sampling, {"listChanged":true} for
+	// roots). The REGISTRY decides both the set and each value — it alone
+	// knows whether the client-facing transport can relay a server-initiated
+	// request, whether the gateway's own client declared the capability, and
+	// whether this upstream's transport can carry the answer back; this
+	// package only puts the decision on the wire. Rendering the VALUES here
+	// would drag that policy in (roots must claim listChanged only because
+	// the registry really does fan the notification out — Stage 15), so the
+	// caller hands them over pre-rendered. Set once via
+	// DeclareClientCapabilities before Initialize (same no-lock rule as
+	// gatewayVersion); the zero value declares nothing and sends exactly {} —
+	// byte-identical to the pre-declaration handshake. Being a plain field, it
+	// is stable across repeated Initialize calls (the HTTP session-expiry
+	// re-init) by construction.
+	declaredCaps map[string]json.RawMessage
 }
 
-// DeclareClientCapabilities records the client-capability names the gateway
-// will declare to this upstream in initialize. Must be called before
-// Initialize — capabilities are exchanged exactly once per session, so a
-// later declaration would never reach the upstream. Names only, no
-// sub-flags: every declared capability is rendered as an empty object, which
-// is all the 2025-06-18 spec defines for the capabilities the gateway can
-// actually serve today (elicitation).
-func (c *Conn) DeclareClientCapabilities(names ...string) {
-	c.declaredCaps = names
+// DeclareClientCapabilities records the client-capabilities the gateway will
+// declare to this upstream in initialize — name → the already-rendered wire
+// value. Must be called before Initialize: capabilities are exchanged exactly
+// once per session, so a later declaration would never reach the upstream.
+func (c *Conn) DeclareClientCapabilities(caps map[string]json.RawMessage) {
+	c.declaredCaps = caps
 }
 
 // declaredCapabilities renders the recorded client-capability set into the
 // wire object initialize carries. The empty set yields exactly {} — not null,
 // not an absent field — preserving the historical bytes for every path that
-// declares nothing (HTTP upstreams, doctor/call/catalog, tests).
+// declares nothing (HTTP upstreams, doctor/call/catalog, tests). json.Marshal
+// sorts map keys, so the output is deterministic for a given set.
 func (c *Conn) declaredCapabilities() json.RawMessage {
 	if len(c.declaredCaps) == 0 {
 		return json.RawMessage(`{}`)
 	}
-	caps := make(map[string]struct{}, len(c.declaredCaps))
-	for _, name := range c.declaredCaps {
-		caps[name] = struct{}{} // struct{}{} marshals to the spec's empty object
-	}
-	b, err := json.Marshal(caps)
+	b, err := json.Marshal(c.declaredCaps)
 	if err != nil {
-		// Unreachable for a map of empty structs; keep the handshake alive anyway.
+		// Unreachable for a map of raw JSON the registry rendered itself; keep
+		// the handshake alive anyway.
 		return json.RawMessage(`{}`)
 	}
 	return b
@@ -363,15 +363,30 @@ func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Messa
 	return c.transport.call(ctx, mcp.MethodCompletionComplete, params)
 }
 
+// ForwardRootsListChanged sends notifications/roots/list_changed to this
+// upstream — the gateway relaying its own client's notification (Stage 15) —
+// but only when the gateway actually declared roots to it in the handshake.
+// Per the spec both parties MUST only use negotiated capabilities, so pushing
+// this to an upstream that never saw a roots declaration would be protocol
+// noise; the no-op keeps every non-declaring path (HTTP upstreams,
+// doctor/call/catalog) byte-identical on the wire.
+func (c *Conn) ForwardRootsListChanged(ctx context.Context) error {
+	if _, ok := c.declaredCaps[mcp.CapRoots]; !ok {
+		return nil
+	}
+	return c.transport.notify(ctx, mcp.NotifRootsListChanged, nil)
+}
+
 // RespondUpstreamRequest writes msg — a response to a request the UPSTREAM
-// itself initiated (elicitation/create, Round 14) — into the upstream's stdin.
-// msg.ID must already be the upstream's ORIGINAL request id (the registry
-// rewrites it back from the gateway-minted client-facing id before calling).
+// itself initiated (elicitation/create, sampling/createMessage, roots/list) —
+// into the upstream's stdin. msg.ID must already be the upstream's ORIGINAL
+// request id (the registry rewrites it back from the gateway-minted
+// client-facing id before calling).
 //
 // Only the stdio transport supports server-initiated requests today; for an
 // HTTP upstream this returns an explicit error instead of silently dropping —
 // the caller logs it and the upstream simply times out on its own answer,
-// which is the documented out-of-scope behaviour of Round 14. A type assertion
+// which is the documented out-of-scope behaviour (Round 14, Stage 15). A type assertion
 // rather than a transport-interface method, same rationale as
 // setNegotiatedVersion above: the shared interface is not widened for the need
 // of exactly one transport.

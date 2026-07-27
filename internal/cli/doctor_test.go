@@ -247,11 +247,11 @@ upstreams:
 // truthful upstream handshake for the CLI commands: doctor, call and catalog
 // load the same config a serving gateway would — transport: stdio and all —
 // but have NO MCP client behind them, so nobody could ever answer an
-// upstream's elicitation/create and their handshakes must declare exactly {}.
-// This is precisely what deriving the declaration from config.Transport
-// (instead of the client-facing transport's explicit
-// SetElicitationProxySupported call) would break: every one of these paths
-// would start promising elicitation it cannot serve, and only the raw
+// upstream's server→client request and their handshakes must declare exactly
+// {}. This is precisely what deriving the declaration from config.Transport
+// (instead of it following the client-facing transport's explicit
+// SetClientServerRequestCaps call — Stage 15) would break: every one of these
+// paths would start promising capabilities it cannot serve, and only the raw
 // FAKE_CAPS_FILE record of the initialize the upstream received catches it.
 func TestCLIPathsDeclareNoClientCapabilities(t *testing.T) {
 	bin := buildFakeServer(t)

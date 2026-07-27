@@ -42,61 +42,55 @@ func newStdioServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger
 	return &stdioServer{
 		reg: reg,
 		log: log,
-		d:   newDispatcher(reg, log, version, true, true), // stdio can push server→client list_changed AND proxy elicitation (Round 14)
+		d:   newDispatcher(reg, log, version, true, true), // stdio can push server→client list_changed AND proxy server→client requests
 		r:   mcp.NewReader(in),
 		w:   mcp.NewWriter(out),
 	}
 }
 
-// Serve starts the registry (fan-out to all upstreams), then reads and answers
-// client messages until the client's stream ends (EOF) or ctx is cancelled.
-// The registry is torn down on return so upstream child processes exit cleanly.
+// Serve reads and answers client messages until the client's stream ends (EOF)
+// or ctx is cancelled, starting the registry (fan-out to all upstreams) LAZILY
+// on the first client request that needs it — see the frames branch below for
+// why that is not simply "on initialize". The registry is torn down on return
+// so upstream child processes exit cleanly.
 func (s *stdioServer) Serve(ctx context.Context) error {
-	// stdio can proxy an upstream's elicitation/create to its client and route
-	// the answer back (Round 14) — tell the registry BEFORE the upstream
-	// handshakes fan out, so it declares the matching client capability to
-	// stdio upstreams in initialize. Capabilities are exchanged exactly once,
-	// in the handshake; a declaration after Start could never catch up. The
-	// HTTP transport (no gateway→client request channel) and the CLI paths
-	// (no MCP client at all) never make this call and keep declaring nothing.
-	s.reg.SetElicitationProxySupported(true)
+	// EVERY subscription is registered first, before the registry can possibly
+	// start (see the lazy start in the frames branch below). The Round 14
+	// invariant is unchanged and is the reason they do NOT move inside that
+	// lazy start: once the handshakes fan out, a stdio upstream that saw a
+	// declared capability may ask at any moment, and the registry's "publish
+	// reached no subscriber" fallback must stay unreachable BY CONSTRUCTION —
+	// not merely shadowed by the client-capability gate happening to fire
+	// first (found by review).
+	//
+	// serverReqs carries upstream-initiated requests the gateway proxies to
+	// its client (Round 14 for elicitation/create; Stage 15 for
+	// sampling/createMessage and roots/list): the loop below pushes each to
+	// the client under its gateway-minted id, and the client's answer is
+	// routed back in the frames branch (RouteUpstreamResponse).
+	serverReqs, unsubscribeServerReqs := s.reg.SubscribeUpstreamRequests()
+	defer unsubscribeServerReqs()
 
-	// Subscribe to upstream-initiated elicitation/create requests (Round 14)
-	// BEFORE Start, for the same reason the flag above is set before it: once
-	// the handshakes fan out, a stdio upstream that saw the declared capability
-	// may ask at any moment, and the registry's "publish reached no subscriber"
-	// fallback must stay unreachable by construction — not merely shadowed by
-	// the client-capability gate happening to fire first (found by review). An
-	// upstream needing human input mid-tools/call publishes here; the loop
-	// below pushes the request to the client under the gateway-minted id, and
-	// the client's answer is routed back in the frames branch
-	// (RouteElicitationResponse). Unsubscribing after Close (this defer runs
-	// last) is harmless: it only deletes a map entry under the registry's own
-	// mutex.
-	elicitReqs, unsubscribeElicits := s.reg.SubscribeElicitations()
-	defer unsubscribeElicits()
-
-	if err := s.reg.Start(ctx); err != nil {
-		return err
-	}
-	defer func() { _ = s.reg.Close() }()
-
-	s.log.Info("stdio transport ready", "tools", s.reg.ToolCount())
-
-	// Subscribe to runtime catalog changes (Stage 7c): whenever an upstream is
-	// auto-restarted, sends its own list_changed, or the config is reloaded, the
-	// registry signals here and we push notifications/tools/list_changed to the
-	// client so it re-lists. stdio is the same single pipe the client already
-	// reads, so this server→client notification needs no extra channel.
+	// catalogChanged carries runtime catalog changes (Stage 7c): whenever an
+	// upstream is auto-restarted, sends its own list_changed, or the config is
+	// reloaded, the registry signals here and we push
+	// notifications/tools/list_changed to the client so it re-lists. stdio is
+	// the same single pipe the client already reads, so this server→client
+	// notification needs no extra channel.
 	catalogChanged, unsubscribe := s.reg.Subscribe()
 	defer unsubscribe()
 
-	// Subscribe to upstream notifications forwarded verbatim (Round 2 —
-	// today notifications/progress): an upstream reporting progress on an
-	// in-flight tools/call publishes here and the loop below pushes it to the
-	// client over the same pipe, gated on initialized like list_changed.
+	// upstreamNotifs carries upstream notifications forwarded verbatim
+	// (Round 2 — today notifications/progress): an upstream reporting progress
+	// on an in-flight tools/call publishes here and the loop below pushes it
+	// to the client over the same pipe, gated on initialized like list_changed.
 	upstreamNotifs, unsubscribeNotifs := s.reg.SubscribeNotifications()
 	defer unsubscribeNotifs()
+
+	// The registry is torn down on return no matter how far the lazy start
+	// below got: Close is correct for a registry that never started (its phase
+	// is still phaseNew, conns and supervisors are empty).
+	defer func() { _ = s.reg.Close() }()
 
 	// mcp.Reader.Read blocks and is not context-aware, so run it in its own
 	// goroutine and feed decoded frames over a channel. This lets Serve select
@@ -121,6 +115,11 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 	// out.
 	initialized := false
 	pendingListChanged := false
+
+	// started guards the LAZY registry bring-up in the frames branch below.
+	// Like the two flags above it is a plain local: this select loop is the
+	// only goroutine that touches it.
+	started := false
 
 	// dispatchCtx is what every d.dispatch call receives. stdio serves exactly
 	// ONE client per process, so after a successful initialize it is wrapped
@@ -159,17 +158,29 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				s.log.Warn("write forwarded notification failed", "err", err)
 				return nil
 			}
-		case req := <-elicitReqs:
-			// An upstream's elicitation/create proxied to the client under the
-			// gateway-minted string id (Round 14). Dropped before initialize
-			// like progress: by construction the request cannot precede the
-			// handshake (it only arises mid-tools/call), but the gate stays
-			// consistent with the other push paths.
+		case req := <-serverReqs:
+			// An upstream's server→client request proxied to the client under
+			// the gateway-minted string id. The method travels in the event, so
+			// this branch is method-agnostic: elicitation/create,
+			// sampling/createMessage and roots/list all take the same write.
+			// Before initialize it is REFUSED, not dropped. By construction
+			// such a request cannot arise (it only happens mid-call, and the
+			// registry does not even start until the client's initialize has
+			// been parsed), but a silent drop would leave the registry's
+			// pending entry parked forever — and for roots/list that single
+			// leaked entry wedges the single-flight for the life of the
+			// process, so every later asker parks behind a question nobody
+			// will ever answer. Refusing makes this a check rather than a bet
+			// on the ordering never changing (found by review).
 			if !initialized {
+				s.log.Warn("server→client request before the client handshake, refusing",
+					"method", req.Method, "id", req.GatewayID)
+				s.reg.RefusePendingServerReq(req.GatewayID,
+					"the gateway's client has not completed its handshake")
 				continue
 			}
-			if err := s.writeOrBail(ctx, mcp.NewRequest(mcp.StringID(req.GatewayID), mcp.MethodElicitationCreate, req.Params)); err != nil {
-				s.log.Warn("write elicitation request failed", "err", err)
+			if err := s.writeOrBail(ctx, mcp.NewRequest(mcp.StringID(req.GatewayID), req.Method, req.Params)); err != nil {
+				s.log.Warn("write upstream request failed", "method", req.Method, "err", err)
 				return nil
 			}
 		case fr, ok := <-frames:
@@ -189,6 +200,52 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 					s.log.Warn("read client message", "err", fr.err)
 				}
 				continue
+			}
+			// Lazy registry bring-up. The upstream handshakes must not happen
+			// before the client's initialize is PARSED: what the gateway may
+			// declare to its upstreams (elicitation/sampling/roots) is exactly
+			// what this client declared, capabilities are exchanged once per
+			// session, and a declaration after Start could never catch up
+			// (Stage 15).
+			//
+			// The trigger is "the first request that needs the registry", not
+			// "initialize", on purpose. ping is the one request the spec allows
+			// before the handshake and it consults nothing, so starting on it
+			// would freeze an empty declaration set forever for a client that
+			// pings first — the feature would die silently. Client
+			// NOTIFICATIONS need no catalog either. Every other request does,
+			// including the non-conformant "tools/list before initialize",
+			// which therefore still gets the full aggregated catalog — it just
+			// degrades to today's behaviour of declaring exactly {} upstream,
+			// since no capabilities have been seen yet.
+			needsRegistry := fr.msg.IsRequest() && fr.msg.Method != mcp.MethodPing
+			if needsRegistry && !started {
+				var caps map[string]json.RawMessage
+				if fr.msg.Method == mcp.MethodInitialize {
+					caps = clientServerRequestCaps(fr.msg.Params)
+				}
+				s.reg.SetClientServerRequestCaps(caps) // strictly BEFORE Start
+				if err := s.reg.Start(ctx); err != nil {
+					// Start only fails when the gateway cannot proceed at all
+					// or when EVERY upstream failed — deliberately treated as a
+					// misconfiguration rather than a useful degraded mode (see
+					// Registry.Start). Answering with an empty catalog would
+					// hide that inside a client that just sees zero tools, so
+					// the client gets a diagnosable JSON-RPC error under its own
+					// request id instead of an abrupt EOF, and Serve still
+					// returns the error — the process exits with it exactly as
+					// before this became lazy. The message is sanitized (no
+					// upstream names, no internal strings), same policy as
+					// handleToolsCall; the details go to the operational log.
+					// A failed write is ignored: the client may already be gone
+					// and that must not replace the real cause.
+					s.log.Error("registry start failed", "err", err)
+					_ = s.writeOrBail(ctx, mcp.NewError(fr.msg.ID, mcp.CodeInternalError,
+						"gateway failed to start its upstreams", nil))
+					return err
+				}
+				started = true
+				s.log.Info("stdio transport ready", "tools", s.reg.ToolCount())
 			}
 			if fr.msg.IsRequest() && fr.msg.Method == mcp.MethodToolsCall {
 				// tools/call — and ONLY tools/call — dispatches on its own
@@ -217,14 +274,14 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 			}
 			if fr.msg.IsResponse() && !fr.msg.IsMalformedHybrid() {
 				// A response FROM the client: the only ones the gateway ever
-				// expects are answers to its own proxied elicitation/create
-				// requests (Round 14), carrying the gateway-minted string id.
+				// expects are answers to its own proxied server→client
+				// requests, carrying the gateway-minted string id.
 				// Consumed here, never dispatched — it was not a request, so no
 				// reply goes back. Anything unmatched falls through to the
 				// dispatcher, which drops it with a log exactly as before.
 				var gatewayID string
 				if json.Unmarshal(fr.msg.ID, &gatewayID) == nil &&
-					s.reg.RouteElicitationResponse(gatewayID, fr.msg) {
+					s.reg.RouteUpstreamResponse(gatewayID, fr.msg) {
 					continue
 				}
 			}

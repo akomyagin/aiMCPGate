@@ -21,6 +21,19 @@ func (f *elicitRecordingUpstream) RespondUpstreamRequest(msg *mcp.Message) error
 	return nil
 }
 
+// declaredCaps builds a client-capability set the way the client-facing
+// transport does — name → the RAW value the client sent — for the many tests
+// that only care THAT a capability was declared. The value is the commonest
+// real one, {}. Tests that assert on the value itself (roots' listChanged
+// sub-flag) spell the map out instead.
+func declaredCaps(names ...string) map[string]json.RawMessage {
+	caps := map[string]json.RawMessage{}
+	for _, name := range names {
+		caps[name] = json.RawMessage(`{}`)
+	}
+	return caps
+}
+
 // newElicitTestRegistry builds a registry with one recording fake conn wired
 // in directly — the elicitation plumbing touches no catalog or lifecycle
 // state, so no Start is needed (same rationale as newNotifTestRegistry).
@@ -40,15 +53,15 @@ func newElicitTestRegistry(name string) (*Registry, *elicitRecordingUpstream) {
 // leak into each other.
 func TestElicitationRoundTripThroughRegistry(t *testing.T) {
 	r, fake := newElicitTestRegistry("web")
-	r.SetClientElicitationCapable(true)
-	ch, unsubscribe := r.SubscribeElicitations()
+	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
+	ch, unsubscribe := r.SubscribeUpstreamRequests()
 	defer unsubscribe()
 
 	originalID := mcp.IntID(7)
 	params := json.RawMessage(`{"message":"need input"}`)
-	r.onUpstreamElicit("web", originalID, params)
+	r.onUpstreamRequest("web", mcp.MethodElicitationCreate, originalID, params)
 
-	var req ElicitationRequest
+	var req UpstreamRequest
 	select {
 	case req = <-ch:
 	case <-time.After(2 * time.Second):
@@ -62,8 +75,8 @@ func TestElicitationRoundTripThroughRegistry(t *testing.T) {
 	}
 
 	answer := mcp.NewResult(mcp.StringID(req.GatewayID), json.RawMessage(`{"action":"decline"}`))
-	if !r.RouteElicitationResponse(req.GatewayID, answer) {
-		t.Fatal("RouteElicitationResponse = false for a pending gateway id")
+	if !r.RouteUpstreamResponse(req.GatewayID, answer) {
+		t.Fatal("RouteUpstreamResponse = false for a pending gateway id")
 	}
 	select {
 	case got := <-fake.responses:
@@ -78,8 +91,8 @@ func TestElicitationRoundTripThroughRegistry(t *testing.T) {
 	}
 
 	// A second answer under the same id is stale: the pending entry is gone.
-	if r.RouteElicitationResponse(req.GatewayID, answer) {
-		t.Error("RouteElicitationResponse = true for an already-consumed id, want false")
+	if r.RouteUpstreamResponse(req.GatewayID, answer) {
+		t.Error("RouteUpstreamResponse = true for an already-consumed id, want false")
 	}
 }
 
@@ -92,11 +105,11 @@ func TestElicitationRoundTripThroughRegistry(t *testing.T) {
 // subscribers.
 func TestElicitationDeclinedWithoutClientCapability(t *testing.T) {
 	r, fake := newElicitTestRegistry("web")
-	ch, unsubscribe := r.SubscribeElicitations()
+	ch, unsubscribe := r.SubscribeUpstreamRequests()
 	defer unsubscribe()
 
 	originalID := mcp.IntID(3)
-	r.onUpstreamElicit("web", originalID, json.RawMessage(`{"message":"need input"}`))
+	r.onUpstreamRequest("web", mcp.MethodElicitationCreate, originalID, json.RawMessage(`{"message":"need input"}`))
 
 	select {
 	case got := <-fake.responses:
@@ -121,17 +134,17 @@ func TestElicitationDeclinedWithoutClientCapability(t *testing.T) {
 
 // TestElicitationUndeliveredAnsweredAndNotLeaked (review fix): when the
 // publish reaches NO subscriber (here: none registered at all), the parked
-// pendingElicits entry must be rolled back — RouteElicitationResponse is its
+// pendingServerReqs entry must be rolled back — RouteUpstreamResponse is its
 // only other remover, so it would leak forever — and the upstream must get an
 // immediate {"action":"decline"} under its ORIGINAL id instead of hanging to
 // its timeout: nobody can ask the human, which is a decline, not an error
 // (same user decision as the incapable-client path).
 func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
 	r, fake := newElicitTestRegistry("web")
-	r.SetClientElicitationCapable(true) // capable client, but nobody subscribed
+	r.SetClientServerRequestCaps(declaredCaps("elicitation")) // capable client, but nobody subscribed
 
 	originalID := mcp.IntID(9)
-	r.onUpstreamElicit("web", originalID, json.RawMessage(`{"message":"need input"}`))
+	r.onUpstreamRequest("web", mcp.MethodElicitationCreate, originalID, json.RawMessage(`{"message":"need input"}`))
 
 	select {
 	case got := <-fake.responses:
@@ -148,11 +161,11 @@ func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
 		t.Fatal("upstream never received an answer for the undeliverable elicitation")
 	}
 
-	r.elicitMu.Lock()
-	pending := len(r.pendingElicits)
-	r.elicitMu.Unlock()
+	r.serverReqMu.Lock()
+	pending := len(r.pendingServerReqs)
+	r.serverReqMu.Unlock()
 	if pending != 0 {
-		t.Errorf("pendingElicits holds %d entries after an undelivered publish, want 0 (leak)", pending)
+		t.Errorf("pendingServerReqs holds %d entries after an undelivered publish, want 0 (leak)", pending)
 	}
 }
 
@@ -162,12 +175,12 @@ func TestElicitationUndeliveredAnsweredAndNotLeaked(t *testing.T) {
 // forever across reloads/restarts.
 func TestDropUpstreamClearsPendingElicits(t *testing.T) {
 	r, _ := newElicitTestRegistry("web")
-	r.SetClientElicitationCapable(true)
-	ch, unsubscribe := r.SubscribeElicitations()
+	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
+	ch, unsubscribe := r.SubscribeUpstreamRequests()
 	defer unsubscribe()
 
-	r.onUpstreamElicit("web", mcp.IntID(1), json.RawMessage(`{}`))
-	var req ElicitationRequest
+	r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{}`))
+	var req UpstreamRequest
 	select {
 	case req = <-ch:
 	case <-time.After(2 * time.Second):
@@ -176,25 +189,25 @@ func TestDropUpstreamClearsPendingElicits(t *testing.T) {
 
 	r.dropUpstream("web")
 
-	r.elicitMu.Lock()
-	pending := len(r.pendingElicits)
-	r.elicitMu.Unlock()
+	r.serverReqMu.Lock()
+	pending := len(r.pendingServerReqs)
+	r.serverReqMu.Unlock()
 	if pending != 0 {
-		t.Errorf("pendingElicits holds %d entries after dropUpstream, want 0", pending)
+		t.Errorf("pendingServerReqs holds %d entries after dropUpstream, want 0", pending)
 	}
-	if r.RouteElicitationResponse(req.GatewayID, mcp.NewResult(mcp.StringID(req.GatewayID), json.RawMessage(`{}`))) {
-		t.Error("RouteElicitationResponse = true for a dropped upstream's elicitation, want false")
+	if r.RouteUpstreamResponse(req.GatewayID, mcp.NewResult(mcp.StringID(req.GatewayID), json.RawMessage(`{}`))) {
+		t.Error("RouteUpstreamResponse = true for a dropped upstream's elicitation, want false")
 	}
 }
 
-// TestRouteElicitationResponseUnknownID (Round 14): an answer whose id matches
+// TestRouteUpstreamResponseUnknownID (Round 14): an answer whose id matches
 // no pending elicitation (stale, duplicate, or plain garbage) is reported
 // false — the caller falls back to its normal unexpected-response handling —
 // and nothing panics.
-func TestRouteElicitationResponseUnknownID(t *testing.T) {
+func TestRouteUpstreamResponseUnknownID(t *testing.T) {
 	r := New(&config.Config{}, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
 	msg := mcp.NewResult(mcp.StringID("elicit-999"), json.RawMessage(`{}`))
-	if r.RouteElicitationResponse("elicit-999", msg) {
-		t.Error("RouteElicitationResponse = true for an unknown gateway id, want false")
+	if r.RouteUpstreamResponse("elicit-999", msg) {
+		t.Error("RouteUpstreamResponse = true for an unknown gateway id, want false")
 	}
 }

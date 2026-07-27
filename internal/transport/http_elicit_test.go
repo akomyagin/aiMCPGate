@@ -18,7 +18,7 @@ import (
 // TestHTTPGatewayDoesNotDeclareElicitationToUpstream pins the negative half of
 // the truthful upstream handshake (the fix after Round 14): the HTTP
 // client-facing transport has no channel for gateway→client requests, never
-// calls SetElicitationProxySupported, and so the gateway must NOT declare the
+// calls SetClientServerRequestCaps, and so the gateway must NOT declare the
 // elicitation capability to its stdio upstreams — declaring would promise a
 // proxy chain that does not exist. Asserted from both ends: the fakeserver's
 // FAKE_CAPS_FILE records the raw capabilities the handshake actually carried,

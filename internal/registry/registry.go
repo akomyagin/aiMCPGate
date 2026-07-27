@@ -183,10 +183,18 @@ type Upstream interface {
 	// already prepared (ref.name rewritten to the upstream's original for a
 	// prompt ref; everything else verbatim — Round 5).
 	Complete(ctx context.Context, params json.RawMessage) (*mcp.Message, error)
+	// ForwardRootsListChanged sends notifications/roots/list_changed to the
+	// upstream, but ONLY if the gateway declared it the roots client-capability
+	// in the handshake; otherwise it is a no-op returning nil (Stage 15). The
+	// gate deliberately lives on the connection, which knows what IT was told
+	// to declare — roots is a CLIENT capability, so HasUpstreamCapability
+	// (which scans upstreams' SERVER capabilities) could never answer this.
+	ForwardRootsListChanged(ctx context.Context) error
 	// RespondUpstreamRequest writes a response to a request the upstream
-	// itself initiated (elicitation/create, Round 14) into its stdin; msg.ID
-	// must already carry the upstream's original request id. Errors for
-	// transports without server-initiated requests (HTTP).
+	// itself initiated (elicitation/create, sampling/createMessage,
+	// roots/list) into its stdin; msg.ID must already carry the upstream's
+	// original request id. Errors for transports without server-initiated
+	// requests (HTTP).
 	RespondUpstreamRequest(msg *mcp.Message) error
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
@@ -344,42 +352,79 @@ type Registry struct {
 	notifSubs   map[int]chan mcp.Message
 	nextNotifID int
 
-	// clientElicitationCapable records whether the gateway's OWN client
-	// declared the elicitation capability in its initialize (Round 14). A
-	// single global flag is correct because stdio serves exactly ONE client per
-	// process (see stdioServer.Serve); the HTTP transport never sets it, so it
-	// stays false there and any upstream elicitation over HTTP is declined
-	// immediately — the safe default. Atomic: written once per handshake,
-	// read on every upstream elicitation/create from a reader goroutine.
-	clientElicitationCapable atomic.Bool
+	// clientCaps are the server→client capabilities the gateway's OWN client
+	// declared in its initialize — the honest basis for what the gateway
+	// declares to its stdio upstreams (Stage 15, superseding Round 14's
+	// optimistic "declare elicitation regardless"). A single global set is
+	// correct because stdio serves exactly ONE client per process (see
+	// stdioServer.Serve).
+	//
+	// Each entry carries the capability's RAW VALUE as the client wrote it, not
+	// a bare flag: presence gates whether a request can be served at all, while
+	// the value is what the upstream declaration is RENDERED from — roots'
+	// listChanged sub-flag has to be mirrored rather than asserted, since the
+	// gateway only ever relays the client's notifications/roots/list_changed
+	// (found by review).
+	//
+	// nil means "nothing was declared" and yields exactly {} on the wire — the
+	// historical bytes for every path with no MCP client behind it: the HTTP
+	// transport, doctor/call/catalog, tests. Gate 1 of the declaration model is
+	// expressed by WHO calls SetClientServerRequestCaps: only a client-facing
+	// transport able to relay a server→client request calls it at all, so no
+	// separate transport flag is kept here.
+	//
+	// Copy-on-write behind an atomic pointer, never mutated in place: it is
+	// read from the launch goroutines of Start, from supervisor-restart and
+	// reload goroutines, and from upstream reader goroutines, while being
+	// written by the client-facing transport before Start and again by the
+	// dispatcher on a re-initialize.
+	clientCaps atomic.Pointer[map[string]json.RawMessage]
 
-	// elicitationProxySupported records whether THIS process's client-facing
-	// transport can proxy an upstream's elicitation/create request to the
-	// client and route the answer back — today only the stdio transport,
-	// which calls SetElicitationProxySupported(true) before Start. It gates
-	// what the gateway DECLARES as its own client capabilities in the
-	// handshake with a stdio upstream (see startStdio); the false default
-	// keeps every path that never claims the ability — the HTTP transport,
-	// doctor/call/catalog (no MCP client at all), existing tests — declaring
-	// exactly {} as before. Deliberately NOT derived from config.Transport:
-	// those CLI paths load the same config with transport: stdio and would
-	// get a false "yes". Atomic because it is written before Start but read
-	// again by startStdio on supervisor-restart and reload goroutines later.
-	elicitationProxySupported atomic.Bool
+	// serverReqMu guards pendingServerReqs — gateway-minted id → where the
+	// client's answer must be routed back — and serverReqSubs, the transports
+	// subscribed to receive proxied server→client requests (Round 14 for
+	// elicitation, Stage 15 for sampling/roots). Its own small mutex for the
+	// same reason notifMu is: onUpstreamRequest runs on an upstream's reader
+	// goroutine and must never entangle with the catalog's critical sections.
+	// serverReqID mints the "<prefix><n>" client-facing ids — ONE counter for
+	// all methods, since the pending map is shared — because the upstream's id
+	// space and the client's are unrelated and could collide, so the id is
+	// ALWAYS rewritten en route. See serverreq.go for the pipeline itself.
+	serverReqMu       sync.Mutex
+	pendingServerReqs map[string]pendingServerReq
+	serverReqSubs     map[int]chan UpstreamRequest
+	nextServerReqSub  int
+	serverReqID       atomic.Int64
 
-	// elicitMu guards pendingElicits — gateway-minted id → where the client's
-	// answer must be routed back — and elicitSubs, the transports subscribed
-	// to receive proxied elicitation requests (Round 14). Its own small mutex
-	// for the same reason notifMu is: onUpstreamElicit runs on an upstream's
-	// reader goroutine and must never entangle with the catalog's critical
-	// sections. elicitID mints the "elicit-<n>" client-facing ids — the
-	// upstream's id space and the client's are unrelated and could collide,
-	// so the id is ALWAYS rewritten en route.
-	elicitMu        sync.Mutex
-	pendingElicits  map[string]pendingElicit
-	elicitSubs      map[int]chan ElicitationRequest
-	nextElicitSubID int
-	elicitID        atomic.Int64
+	// serverReqTimeout is how long ONE proxied server→client request may stay
+	// pending before the gateway stops waiting for its client and refuses the
+	// upstream (defaultServerReqTimeout). A field rather than the constant
+	// itself ONLY so tests can shrink it — a five-minute deadline is not
+	// something a test suite can wait out — and deliberately not a config knob;
+	// see the constant for why five minutes. Written once at New, read from the
+	// upstream reader goroutines that arm the timers.
+	serverReqTimeout time.Duration
+
+	// rootsMu guards the roots/list cache and its single-flight state
+	// (Stage 15). Its OWN mutex, neither r.mu nor serverReqMu: the handler runs
+	// on an upstream's reader goroutine and must not entangle with the catalog
+	// or with the generic pending-request map.
+	//
+	// N upstreams asking for roots would otherwise mean N identical questions
+	// to one client, so the first question is remembered: rootsCache holds the
+	// client's raw result (nil = invalid), rootsFetchID the gateway id of the
+	// question currently in flight ("" = none), rootsWaiters the upstreams
+	// parked behind it. rootsStale records that an invalidation arrived WHILE a
+	// question was in flight — the late answer is still delivered to whoever
+	// asked before the change (the spec tolerates that race), but it must not
+	// be cached. There is no TTL on purpose: the client signals every change
+	// with notifications/roots/list_changed, and a timer on top of an exact
+	// signal would only add nondeterminism.
+	rootsMu      sync.Mutex
+	rootsCache   json.RawMessage
+	rootsFetchID string
+	rootsStale   bool
+	rootsWaiters []rootsWaiter
 
 	// relistMu guards relistTimers, the per-upstream debounce timers for
 	// tools/list_changed notifications (Stage 7b), and relistStates, the
@@ -490,34 +535,35 @@ type auxCatalog struct {
 func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, payloadLog logging.PayloadLog, supervise bool, version string) *Registry {
 	procCtx, procCancel := context.WithCancel(context.Background())
 	r := &Registry{
-		log:            logger,
-		callLog:        callLog,
-		payloadLog:     payloadLog,
-		autoRestart:    supervise,
-		version:        version,
-		conns:          map[string]Upstream{},
-		tools:          map[string]ToolDescriptor{},
-		toolRoute:      map[string]route{},
-		rawTools:       map[string][]mcp.Tool{},
-		prompts:        map[string]PromptDescriptor{},
-		promptRoute:    map[string]route{},
-		rawPrompts:     map[string][]mcp.Prompt{},
-		resources:      map[string]ResourceDescriptor{},
-		resourceRoute:  map[string]string{},
-		rawResources:   map[string][]mcp.Resource{},
-		rawTemplates:   map[string][]mcp.ResourceTemplate{},
-		handshakes:     map[string]handshakeMeta{},
-		subscribers:    map[int]chan struct{}{},
-		notifSubs:      map[int]chan mcp.Message{},
-		pendingElicits: map[string]pendingElicit{},
-		elicitSubs:     map[int]chan ElicitationRequest{},
-		relistTimers:   map[string]*time.Timer{},
-		relistStates:   map[string]*relistState{},
-		limiters:       map[string]*limiterEntry{},
-		sems:           map[string]*semEntry{},
-		supCancel:      map[string]context.CancelFunc{},
-		procCtx:        procCtx,
-		procCancel:     procCancel,
+		log:               logger,
+		callLog:           callLog,
+		payloadLog:        payloadLog,
+		autoRestart:       supervise,
+		version:           version,
+		conns:             map[string]Upstream{},
+		tools:             map[string]ToolDescriptor{},
+		toolRoute:         map[string]route{},
+		rawTools:          map[string][]mcp.Tool{},
+		prompts:           map[string]PromptDescriptor{},
+		promptRoute:       map[string]route{},
+		rawPrompts:        map[string][]mcp.Prompt{},
+		resources:         map[string]ResourceDescriptor{},
+		resourceRoute:     map[string]string{},
+		rawResources:      map[string][]mcp.Resource{},
+		rawTemplates:      map[string][]mcp.ResourceTemplate{},
+		handshakes:        map[string]handshakeMeta{},
+		subscribers:       map[int]chan struct{}{},
+		notifSubs:         map[int]chan mcp.Message{},
+		pendingServerReqs: map[string]pendingServerReq{},
+		serverReqSubs:     map[int]chan UpstreamRequest{},
+		serverReqTimeout:  defaultServerReqTimeout,
+		relistTimers:      map[string]*time.Timer{},
+		relistStates:      map[string]*relistState{},
+		limiters:          map[string]*limiterEntry{},
+		sems:              map[string]*semEntry{},
+		supCancel:         map[string]context.CancelFunc{},
+		procCtx:           procCtx,
+		procCancel:        procCancel,
 	}
 	r.cfg.Store(cfg)
 	r.start = r.startUpstream
@@ -561,31 +607,25 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	}
 	name := u.Name
 	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
-	// onElicit is stdio-only (Round 14): StartHTTP takes no such callback —
-	// an HTTP upstream has no channel for server-initiated REQUESTS in this
-	// round, deliberately out of scope.
-	onElicit := func(id, params json.RawMessage) { r.onUpstreamElicit(name, id, params) }
-	conn, err := upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onElicit)
+	// onRequest is stdio-only (Round 14): StartHTTP takes no such callback —
+	// an HTTP upstream has no channel for server-initiated REQUESTS, still
+	// deliberately out of scope. WHICH methods are proxied is decided by the
+	// registry's spec table (serverreq.go), not by the transport.
+	onRequest := func(method string, id, params json.RawMessage) {
+		r.onUpstreamRequest(name, method, id, params)
+	}
+	conn, err := upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onRequest)
 	if err != nil {
 		return nil, err
 	}
-	// Declare the gateway's own client capabilities for the handshake — only
-	// elicitation, and only when BOTH legs of the proxy chain exist: the
-	// client-facing transport can relay the request to a client (the flag),
-	// and this upstream is stdio, so RespondUpstreamRequest can carry the
-	// answer back (which is why this lives here and not in startHTTP — an
-	// HTTP upstream keeps receiving {}). The client's OWN capability is
-	// deliberately not consulted: it is unknown until its initialize, long
-	// after this handshake, so the gateway declares that it can SERVE the
-	// method and answers honestly per request when the client turns out
-	// incapable (onUpstreamElicit's immediate decline). sampling/roots are NOT
-	// declared — there is no implementation behind them (readLoop ignores
-	// those requests), and declaring them would be the same lie the old {}
-	// literal was, with the sign flipped. Setting the field on the concrete
-	// *Conn here is race-free: Initialize runs later on this same launch
-	// goroutine.
-	if r.elicitationProxySupported.Load() {
-		conn.DeclareClientCapabilities("elicitation")
+	// Declare the gateway's own client capabilities for the handshake. The set
+	// comes from declaredClientCaps (serverreq.go) and is applied ONLY here,
+	// never in startHTTP: an HTTP upstream has no channel for
+	// RespondUpstreamRequest to carry an answer back, so it keeps receiving
+	// exactly {}. Setting the field on the concrete *Conn here is race-free:
+	// Initialize runs later on this same launch goroutine.
+	if caps := r.declaredClientCaps(); len(caps) > 0 {
+		conn.DeclareClientCapabilities(caps)
 	}
 	return conn, nil
 }
@@ -1391,7 +1431,7 @@ func (r *Registry) dropUpstream(name string) {
 	r.mu.Lock()
 	r.dropLocked(name)
 	r.mu.Unlock()
-	r.dropPendingElicits(name)
+	r.dropPendingServerReqs(name)
 }
 
 // Gated catalog mutations. dropUpstreamIfCurrent, replaceUpstreamIfLive and
@@ -1424,7 +1464,7 @@ func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
 	}
 	r.dropLocked(name)
 	r.mu.Unlock()
-	r.dropPendingElicits(name)
+	r.dropPendingServerReqs(name)
 	return true
 }
 
@@ -1516,9 +1556,10 @@ func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp
 	}
 	r.installLocked(name, conn, tools, &aux, &meta, "upstream catalog replaced")
 	r.mu.Unlock()
-	// The dead predecessor's parked elicitations can never be answered through
-	// the fresh connection (its id space is new) — drop them (found by review).
-	r.dropPendingElicits(name)
+	// The dead predecessor's parked server→client requests can never be
+	// answered through the fresh connection (its id space is new) — drop them
+	// (found by review).
+	r.dropPendingServerReqs(name)
 	return true
 }
 
@@ -1632,213 +1673,6 @@ func (r *Registry) forwardNotification(msg mcp.Message) {
 			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
 		}
 	}
-}
-
-// pendingElicit records where the client's answer to one proxied
-// elicitation/create must be routed back (Round 14): which upstream asked, and
-// under what id in the UPSTREAM's own id space.
-type pendingElicit struct {
-	upstream   string
-	originalID json.RawMessage
-}
-
-// ElicitationRequest is one upstream-initiated elicitation/create the gateway
-// proxies to its client (Round 14). GatewayID is the gateway-minted id the
-// client-facing request must carry ("elicit-<n>" — see onUpstreamElicit for
-// why the upstream's own id never travels); Params is the upstream's params
-// object, verbatim.
-type ElicitationRequest struct {
-	GatewayID string
-	Params    json.RawMessage
-}
-
-// SetClientElicitationCapable records whether the gateway's client declared
-// the elicitation capability in its initialize handshake (Round 14). Called by
-// the stdio transport's dispatcher only — stdio serves exactly one client per
-// process, so the flag is global to the registry. The HTTP transport never
-// calls it; the flag then stays false and every upstream elicitation/create is
-// declined immediately instead of hanging (see onUpstreamElicit).
-func (r *Registry) SetClientElicitationCapable(ok bool) {
-	r.clientElicitationCapable.Store(ok)
-}
-
-// SetElicitationProxySupported records whether this process's client-facing
-// transport can proxy upstream-initiated elicitation/create requests to its
-// client and route the answer back (Round 14). The stdio transport calls it
-// with true BEFORE Start, so the flag is already set when the upstream
-// handshakes fan out and startStdio decides which client capabilities to
-// declare; nobody else calls it and the zero value means "declare nothing".
-// Distinct from SetClientElicitationCapable on purpose: this is a property of
-// the TRANSPORT, known at process start — whether the CLIENT can actually
-// answer only becomes known at its own initialize, long after the upstream
-// handshakes, so it cannot gate the declaration (see startStdio).
-func (r *Registry) SetElicitationProxySupported(ok bool) {
-	r.elicitationProxySupported.Store(ok)
-}
-
-// SubscribeElicitations registers interest in upstream-initiated
-// elicitation/create requests the gateway proxies to its client (Round 14) —
-// SubscribeNotifications' twin for the one upstream message that expects an
-// answer back (RouteElicitationResponse). Same delivery contract: buffered
-// channel (notifSubBuffer), strictly non-blocking send from the upstream's
-// reader goroutine, and an unsubscribe function the caller MUST call when it
-// stops listening.
-func (r *Registry) SubscribeElicitations() (<-chan ElicitationRequest, func()) {
-	ch := make(chan ElicitationRequest, notifSubBuffer)
-	r.elicitMu.Lock()
-	id := r.nextElicitSubID
-	r.nextElicitSubID++
-	r.elicitSubs[id] = ch
-	r.elicitMu.Unlock()
-
-	return ch, func() {
-		r.elicitMu.Lock()
-		delete(r.elicitSubs, id)
-		r.elicitMu.Unlock()
-	}
-}
-
-// onUpstreamElicit handles an elicitation/create REQUEST pushed by a stdio
-// upstream mid-tools/call (Round 14). Like onUpstreamNotification it runs on
-// that upstream's single reader goroutine, so it must not block or re-enter
-// the connection synchronously.
-//
-// When the gateway's client never declared the elicitation capability, the
-// upstream is answered immediately with {"action":"decline"} instead of being
-// left to hang until its own timeout — there is no human to ask, and per the
-// spec a decline is exactly that answer. Otherwise the request is parked in
-// pendingElicits under a freshly minted gateway id and published to the
-// subscribed transport (non-blocking, like forwardNotification). A publish
-// that reached NO subscriber (none registered, or every buffer full) rolls
-// the parked entry back and declines immediately too:
-// RouteElicitationResponse is the entry's only other remover, so an
-// undeliverable request would otherwise leak in pendingElicits forever
-// (found by review). Neither branch means "the request itself is invalid" —
-// the gateway never inspects the params — so no path here answers with a
-// JSON-RPC error (see respondElicitDecline for why an error would be wrong).
-func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMessage) {
-	if !r.clientElicitationCapable.Load() {
-		r.respondElicitDecline(name, originalID,
-			"the gateway's client did not declare the elicitation capability")
-		return
-	}
-
-	gatewayID := fmt.Sprintf("elicit-%d", r.elicitID.Add(1))
-	req := ElicitationRequest{GatewayID: gatewayID, Params: params}
-	delivered := false
-	r.elicitMu.Lock()
-	r.pendingElicits[gatewayID] = pendingElicit{upstream: name, originalID: originalID}
-	for _, ch := range r.elicitSubs {
-		select {
-		case ch <- req:
-			delivered = true
-		default:
-			r.log.Debug("elicitation subscriber buffer full, dropping", "upstream", name, "id", gatewayID)
-		}
-	}
-	if !delivered {
-		delete(r.pendingElicits, gatewayID) // roll back: nobody will ever answer it
-	}
-	r.elicitMu.Unlock()
-	if !delivered {
-		r.respondElicitDecline(name, originalID,
-			"no client transport accepted the request")
-		return
-	}
-	r.log.Debug("upstream elicitation proxied to client", "upstream", name, "id", gatewayID)
-}
-
-// respondElicitDecline answers an upstream's elicitation/create with the
-// spec's {"action":"decline"} result under the upstream's OWN id — used when
-// no human can be asked (incapable client, or no subscriber accepted the
-// publish), so the upstream gets an immediate answer instead of hanging until
-// its own timeout. reason is Debug-logged only; it never travels to the
-// upstream — a decline result carries no message field.
-//
-// A RESULT, not a JSON-RPC error, by explicit user decision (2026-07-27): a
-// decline is one of the three documented ElicitResult actions every server
-// MUST handle (typically by proceeding without the extra input), whereas an
-// error both contradicts the elicitation capability the gateway declared in
-// this very session (startStdio) and is turned into an exception by server
-// SDKs, failing the whole tools/call — calls that succeeded before the
-// gateway declared anything. "cancel" was considered and rejected: some
-// servers treat it as "abort the whole operation", decline merely as "no
-// extra input". The write runs off the caller's goroutine: a stdin write can
-// block on a stuck child, and the upstream reader publishing the callback
-// must never stall on it.
-func (r *Registry) respondElicitDecline(name string, originalID json.RawMessage, reason string) {
-	r.mu.RLock()
-	conn := r.conns[name]
-	r.mu.RUnlock()
-	if conn == nil {
-		return // the upstream vanished between its write and this callback
-	}
-	r.log.Debug("upstream elicitation declined", "upstream", name, "reason", reason)
-	reply := mcp.NewResult(originalID, json.RawMessage(`{"action":"decline"}`))
-	go func() {
-		if err := conn.RespondUpstreamRequest(reply); err != nil {
-			r.log.Warn("decline upstream elicitation failed", "upstream", name, "err", err)
-		}
-	}()
-}
-
-// dropPendingElicits discards every parked elicitation belonging to name —
-// called whenever name's connection is removed or replaced (reload removal,
-// restart give-up, a fresh connection installed after a crash): the answer
-// could no longer reach the process that asked, and RouteElicitationResponse
-// is otherwise the ONLY remover, so entries for a gone connection would
-// accumulate forever (found by review). Deliberately NOT part of dropLocked:
-// a same-connection re-merge (relistUpstream's drop-then-merge) must keep its
-// still-answerable pending elicitations.
-func (r *Registry) dropPendingElicits(name string) {
-	r.elicitMu.Lock()
-	for id, p := range r.pendingElicits {
-		if p.upstream == name {
-			delete(r.pendingElicits, id)
-		}
-	}
-	r.elicitMu.Unlock()
-}
-
-// RouteElicitationResponse routes the client's answer to a proxied
-// elicitation/create back to the upstream that asked (Round 14). gatewayID is
-// the gateway-minted id the transport decoded from the client's response;
-// msg is that response, whose ID is rewritten back to the upstream's original
-// before the write. It reports whether gatewayID matched a pending
-// elicitation — false means unknown or stale (a duplicate answer, a request
-// already consumed), which the caller treats like any other unexpected client
-// response: log and drop, never panic.
-func (r *Registry) RouteElicitationResponse(gatewayID string, msg *mcp.Message) bool {
-	r.elicitMu.Lock()
-	p, ok := r.pendingElicits[gatewayID]
-	if ok {
-		delete(r.pendingElicits, gatewayID)
-	}
-	r.elicitMu.Unlock()
-	if !ok {
-		return false
-	}
-
-	r.mu.RLock()
-	conn := r.conns[p.upstream]
-	r.mu.RUnlock()
-	if conn == nil {
-		// The upstream died or was retired while the human was answering: the
-		// answer has nowhere to go. Still consumed (true) — it DID match a real
-		// pending elicitation; it is just undeliverable now.
-		r.log.Warn("elicitation answer for a gone upstream, dropping", "upstream", p.upstream, "id", gatewayID)
-		return true
-	}
-	msg.ID = p.originalID
-	// Off the caller's goroutine (the client transport's Serve loop): a stdin
-	// write can block on a stuck child, and the loop must keep serving other
-	// clients' traffic regardless — same rule as onUpstreamElicit's refusal.
-	go func() {
-		if err := conn.RespondUpstreamRequest(msg); err != nil {
-			r.log.Warn("deliver elicitation answer failed", "upstream", p.upstream, "id", gatewayID, "err", err)
-		}
-	}()
-	return true
 }
 
 // withLogger stamps the emitting upstream's name into a notifications/message
@@ -2785,6 +2619,11 @@ func (r *Registry) Close() error {
 	r.relistTimers = map[string]*time.Timer{}
 	r.relistStates = map[string]*relistState{}
 	r.relistMu.Unlock()
+
+	// Same rule for the proxied server→client requests: their deadlines must
+	// not outlive the shutdown that is about to remove every upstream they
+	// could answer to (Stage 15 — see closeServerReqs).
+	r.closeServerReqs()
 
 	// Wait (bounded) for in-flight re-lists: a runRelist may still be inside a
 	// blocking ListTools against a connection we are about to Close below, and

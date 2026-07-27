@@ -113,8 +113,12 @@ func runServe(parent context.Context, configPath, envFile string, watchConfig ti
 		go pollConfig(ctx, watchPath, watchConfig, reg, logger)
 	}
 
-	// Serve starts the registry (upstream fan-out) and blocks handling client
-	// requests until ctx is cancelled or the client disconnects.
+	// Serve blocks handling client requests until ctx is cancelled or the
+	// client disconnects, and tears the registry down on the way out. It also
+	// OWNS the registry's bring-up: HTTP starts the upstream fan-out up front,
+	// while stdio starts it lazily, on the first client request that needs a
+	// catalog — the gateway cannot declare what its own client supports to its
+	// upstreams before that client's initialize has been parsed (Stage 15).
 	return srv.Serve(ctx)
 }
 

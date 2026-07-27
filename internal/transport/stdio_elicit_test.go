@@ -85,17 +85,20 @@ func TestStdioElicitationRoundTrip(t *testing.T) {
 	}
 }
 
-// TestStdioElicitationDeclinedWithoutClientCapability (Round 14, semantics
-// fixed after review): when the client's initialize did NOT declare the
-// elicitation capability, the gateway must answer the upstream's
-// elicitation/create immediately with the spec's {"action":"decline"} RESULT
-// — never a JSON-RPC error, which SDKs turn into an exception that fails the
-// whole tools/call — the upstream must not hang until its own timeout, and
-// nothing may be pushed to the client. The fakeserver embeds any result it
-// received into the tool result ("|elicited=<raw result>") and turns an error
-// into a FAILED call (isError:true), so one prompt, successful reply carrying
-// the decline marker proves every property at once.
-func TestStdioElicitationDeclinedWithoutClientCapability(t *testing.T) {
+// TestStdioElicitationNotAskedWithoutClientCapability (Round 14 test,
+// REWRITTEN in Stage 15). It used to assert that a client without the
+// elicitation capability makes the gateway answer the upstream's
+// elicitation/create with {"action":"decline"}. That assertion became
+// physically unreachable: since Stage 15 the gateway declares only what its
+// client actually declared, so a client with no elicitation capability means
+// the upstream's handshake carries no elicitation either — and a
+// negotiation-respecting server (which the fakeserver is, like every
+// spec-abiding one) never asks at all. The stronger property is asserted
+// instead: no request is made, the call succeeds immediately, and nothing is
+// pushed to the client. The decline path itself did not disappear; it is
+// covered against a deliberately rude upstream in
+// TestStdioElicitationFromRudeUpstreamDeclined (stdio_caps_test.go).
+func TestStdioElicitationNotAskedWithoutClientCapability(t *testing.T) {
 	c, cancel, done := startServerWithConfig(t, elicitTestConfig(t), nil)
 	defer func() { cancel(); <-done }()
 
@@ -119,47 +122,47 @@ func TestStdioElicitationDeclinedWithoutClientCapability(t *testing.T) {
 		t.Fatalf("first message id=%s method=%q, want the call reply %s (elicitation pushed to an incapable client?)",
 			resp.ID, resp.Method, callID)
 	}
-	// The call SUCCEEDS: a declined elicitation is a normal answer the
-	// upstream handles, not a failure. An error-shaped gateway answer would
-	// surface here as the fakeserver's isError:true "elicit-error=" result.
 	if resp.Error != nil {
 		t.Fatalf("tools/call error: %v", resp.Error)
 	}
 	if strings.Contains(string(resp.Result), "elicit-error") ||
 		strings.Contains(string(resp.Result), `"isError":true`) {
-		t.Fatalf("gateway answered the elicitation with an error, failing the call that used to succeed: %s", resp.Result)
+		t.Fatalf("the call failed instead of proceeding without elicitation: %s", resp.Result)
 	}
-	// The upstream received exactly a decline — not a timeout, not a skip.
-	// The marker rides inside the result's text string, so the quotes of the
-	// embedded ElicitResult arrive JSON-escaped.
-	if !strings.Contains(string(resp.Result), "elicited=") ||
-		!strings.Contains(string(resp.Result), `\"action\":\"decline\"`) {
-		t.Errorf("upstream did not receive an immediate decline result: %s", resp.Result)
+	// The upstream honoured the negotiation: its distinct marker, not an
+	// answered elicitation and not a timeout.
+	if !strings.Contains(string(resp.Result), "elicit-skipped") {
+		t.Errorf("upstream asked (or the hook broke) despite an undeclared capability: %s", resp.Result)
 	}
-	// Well before the fakeserver's 10s elicitation timeout: the decline was
-	// immediate, not a hang.
+	// Well before the fakeserver's 10s elicitation timeout: nothing waited.
 	if elapsed > 5*time.Second {
-		t.Errorf("decline took %v — the upstream waited instead of being answered immediately", elapsed)
+		t.Errorf("call took %v — something waited instead of skipping outright", elapsed)
 	}
 }
 
-// TestClientSupportsElicitation covers the tolerant capability sniffing on the
-// raw initialize params (Round 14): only the PRESENCE of the "elicitation" key
-// counts, and any malformed shape degrades to false, never an error.
-func TestClientSupportsElicitation(t *testing.T) {
+// TestClientDeclaresCapability covers the tolerant capability sniffing on the
+// raw initialize params (Round 14, generalized in Stage 15 to all three
+// server→client capabilities): only the PRESENCE of the key counts, and any
+// malformed shape degrades to false, never an error.
+func TestClientDeclaresCapability(t *testing.T) {
 	tests := []struct {
 		name   string
 		params string // "" means absent params
+		cap    string
 		want   bool
 	}{
-		{"declared empty object", `{"capabilities":{"elicitation":{}}}`, true},
-		{"declared with content", `{"capabilities":{"elicitation":{"form":true},"roots":{}}}`, true},
-		{"other capabilities only", `{"capabilities":{"roots":{},"sampling":{}}}`, false},
-		{"empty capabilities", `{"capabilities":{}}`, false},
-		{"no capabilities field", `{"clientInfo":{"name":"x","version":"1"}}`, false},
-		{"absent params", "", false},
-		{"malformed params", `[42]`, false},
-		{"capabilities not an object", `{"capabilities":["elicitation"]}`, false},
+		{"declared empty object", `{"capabilities":{"elicitation":{}}}`, "elicitation", true},
+		{"declared with content", `{"capabilities":{"elicitation":{"form":true},"roots":{}}}`, "elicitation", true},
+		{"other capabilities only", `{"capabilities":{"roots":{},"sampling":{}}}`, "elicitation", false},
+		{"sampling declared", `{"capabilities":{"sampling":{}}}`, "sampling", true},
+		{"sampling absent", `{"capabilities":{"elicitation":{}}}`, "sampling", false},
+		{"roots declared with listChanged", `{"capabilities":{"roots":{"listChanged":true}}}`, "roots", true},
+		{"roots absent", `{"capabilities":{"sampling":{}}}`, "roots", false},
+		{"empty capabilities", `{"capabilities":{}}`, "elicitation", false},
+		{"no capabilities field", `{"clientInfo":{"name":"x","version":"1"}}`, "elicitation", false},
+		{"absent params", "", "elicitation", false},
+		{"malformed params", `[42]`, "sampling", false},
+		{"capabilities not an object", `{"capabilities":["elicitation"]}`, "elicitation", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -167,8 +170,49 @@ func TestClientSupportsElicitation(t *testing.T) {
 			if tt.params != "" {
 				params = json.RawMessage(tt.params)
 			}
-			if got := clientSupportsElicitation(params); got != tt.want {
-				t.Errorf("clientSupportsElicitation(%s) = %v, want %v", tt.params, got, tt.want)
+			if got := clientDeclaresCapability(params, tt.cap); got != tt.want {
+				t.Errorf("clientDeclaresCapability(%s, %q) = %v, want %v", tt.params, tt.cap, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClientServerRequestCapsCollectsWholeSet pins the whole-set helper the
+// stdio transport feeds the registry with: exactly the declared names, nothing
+// invented, an unreadable initialize declaring nothing at all — and each name's
+// RAW VALUE carried through untouched, because the registry renders its own
+// upstream declaration from it (roots' listChanged must be mirrored, not
+// asserted — found by review).
+func TestClientServerRequestCapsCollectsWholeSet(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+		want   map[string]string // capability → the raw value it must carry
+	}{
+		{"all three", `{"capabilities":{"elicitation":{},"sampling":{},"roots":{"listChanged":true}}}`,
+			map[string]string{"elicitation": "{}", "sampling": "{}", "roots": `{"listChanged":true}`}},
+		{"only elicitation", `{"capabilities":{"elicitation":{}}}`,
+			map[string]string{"elicitation": "{}"}},
+		{"roots without listChanged keeps its bare value", `{"capabilities":{"roots":{}}}`,
+			map[string]string{"roots": "{}"}},
+		{"unknown capability ignored", `{"capabilities":{"experimental":{}}}`, nil},
+		{"malformed params", `[42]`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientServerRequestCaps(json.RawMessage(tt.params))
+			if len(got) != len(tt.want) {
+				t.Fatalf("caps = %v, want exactly %v", got, tt.want)
+			}
+			for name, want := range tt.want {
+				value, ok := got[name]
+				if !ok {
+					t.Errorf("caps missing %q: %v", name, got)
+					continue
+				}
+				if string(value) != want {
+					t.Errorf("caps[%q] = %s, want the client's own %s", name, value, want)
+				}
 			}
 		})
 	}

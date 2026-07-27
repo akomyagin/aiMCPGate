@@ -48,6 +48,23 @@ const (
 	// travels as raw JSON both ways, so nothing is parsed or lost en route.
 	MethodElicitationCreate = "elicitation/create"
 
+	// MethodSamplingCreateMessage is sent by an UPSTREAM server (not the
+	// gateway's own client) mid-tools/call, asking the client's LLM for a
+	// completion. The gateway (Stage 15) proxies it verbatim to its own client
+	// — stdio↔stdio only — rewriting only the JSON-RPC id (the upstream's id
+	// space and the gateway's client-facing id space are unrelated and could
+	// collide). There are deliberately NO params/result types: the payload
+	// travels as raw JSON both ways, so nothing is parsed or lost en route —
+	// and nothing of it is ever logged, since it carries conversation content.
+	MethodSamplingCreateMessage = "sampling/createMessage"
+
+	// MethodRootsList is sent by an UPSTREAM server asking the client for its
+	// filesystem roots. The gateway (Stage 15) answers N upstreams from ONE
+	// client request: the reply is cached and re-served until the client
+	// signals NotifRootsListChanged. Like the two methods above it carries no
+	// params/result types — the client's result is relayed verbatim.
+	MethodRootsList = "roots/list"
+
 	// NotifInitialized is sent by a client after a successful initialize.
 	NotifInitialized = "notifications/initialized"
 
@@ -79,6 +96,37 @@ const (
 	// cancelled — with the gateway's own upstream-side id, never the client's
 	// (Round 2).
 	NotifCancelled = "notifications/cancelled"
+
+	// NotifRootsListChanged is sent by a CLIENT when its list of roots
+	// changed. The gateway both RECEIVES it (dropping its cached roots/list
+	// answer) and SENDS it on to every stdio upstream it declared the roots
+	// client-capability to — which is why that declaration carries
+	// "listChanged": true (Stage 15).
+	NotifRootsListChanged = "notifications/roots/list_changed"
+)
+
+// The CLIENT capability names behind the three server→client requests the
+// gateway proxies. They live here, next to their methods, because TWO packages
+// need the same strings and a silent divergence between them is invisible:
+// internal/registry keys its per-method spec table by them, and
+// internal/upstream gates Conn.ForwardRootsListChanged on finding CapRoots in
+// what the handshake actually declared. A literal in the second place would
+// mean renaming the first breaks the fan-out with every test still green
+// (found by review).
+const (
+	// CapElicitation lets a server ask the client's USER for input
+	// (MethodElicitationCreate). Declared as {} — it has no sub-flags.
+	CapElicitation = "elicitation"
+
+	// CapSampling lets a server ask the client's LLM for a completion
+	// (MethodSamplingCreateMessage). Declared as {} — no sub-flags either.
+	CapSampling = "sampling"
+
+	// CapRoots lets a server ask the client for its filesystem roots
+	// (MethodRootsList). Unlike the other two it HAS a sub-flag,
+	// "listChanged", promising NotifRootsListChanged notifications — which the
+	// gateway may only pass on when its own client promised it first.
+	CapRoots = "roots"
 )
 
 // CancelledParams is the params object of a notifications/cancelled

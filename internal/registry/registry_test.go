@@ -49,10 +49,11 @@ func (fakeUpstreamBase) ReadResource(context.Context, string) (*mcp.Message, err
 func (fakeUpstreamBase) Complete(context.Context, json.RawMessage) (*mcp.Message, error) {
 	return nil, nil
 }
-func (fakeUpstreamBase) RespondUpstreamRequest(*mcp.Message) error { return nil }
-func (fakeUpstreamBase) Close() error                              { return nil }
-func (fakeUpstreamBase) Done() (<-chan struct{}, bool)             { return nil, false }
-func (fakeUpstreamBase) StderrTail() ([]string, bool)              { return nil, false }
+func (fakeUpstreamBase) ForwardRootsListChanged(context.Context) error { return nil }
+func (fakeUpstreamBase) RespondUpstreamRequest(*mcp.Message) error     { return nil }
+func (fakeUpstreamBase) Close() error                                  { return nil }
+func (fakeUpstreamBase) Done() (<-chan struct{}, bool)                 { return nil, false }
+func (fakeUpstreamBase) StderrTail() ([]string, bool)                  { return nil, false }
 
 // fakeUpstream is an in-process Upstream used to test the multiplexer without
 // spawning processes. Each fake mints its own call-side ids from a private

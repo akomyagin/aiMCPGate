@@ -113,13 +113,16 @@ type stdioTransport struct {
 	// upstream notifying immediately on startup — found by independent review.)
 	onNotify func(method string, params json.RawMessage)
 
-	// onElicit, when set, is invoked by readLoop for an elicitation/create
-	// REQUEST received from the upstream — its original id plus raw params
-	// (Round 14). The registry sets it to proxy the request to the gateway's
-	// own client. Same contract as onNotify: set once in StartStdio before the
-	// reader goroutine starts (no lock needed), must not block or call back
-	// into the connection synchronously.
-	onElicit func(id json.RawMessage, params json.RawMessage)
+	// onRequest, when set, is invoked by readLoop for EVERY server-initiated
+	// REQUEST received from the upstream — its method, original id and raw
+	// params (Round 14 for elicitation/create; Stage 15 generalized it to
+	// sampling/createMessage and roots/list). The registry sets it to proxy
+	// the request to the gateway's own client; deciding WHICH methods are
+	// proxied is the registry's policy (its spec table), not this package's —
+	// this transport only classifies the frame. Same contract as onNotify: set
+	// once in StartStdio before the reader goroutine starts (no lock needed),
+	// must not block or call back into the connection synchronously.
+	onRequest func(method string, id, params json.RawMessage)
 }
 
 // Name returns the upstream's stable identifier.
@@ -148,11 +151,11 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 // so no lock is needed. The callback must not block or call back into the
 // connection synchronously (Stage 7b).
 //
-// onElicit, when non-nil, is invoked (from the same reader goroutine, same
-// contract) for each elicitation/create REQUEST the upstream sends mid-call
-// (Round 14), with the upstream's original id and raw params. nil means such
-// requests are ignored, the pre-Round 14 behaviour.
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string, params json.RawMessage), onElicit func(id json.RawMessage, params json.RawMessage)) (*Conn, error) {
+// onRequest, when non-nil, is invoked (from the same reader goroutine, same
+// contract) for each server-initiated REQUEST the upstream sends mid-call,
+// with the method, the upstream's original id and raw params. nil means such
+// requests are ignored (log-and-drop), the pre-Round 14 behaviour.
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
@@ -190,8 +193,8 @@ func StartStdio(ctx context.Context, log *slog.Logger, name, command string, arg
 		waiters:    make(map[string]chan *mcp.Message),
 		done:       make(chan struct{}),
 		stderrDone: make(chan struct{}),
-		onNotify:   onNotify, // must be set before go t.readLoop() below
-		onElicit:   onElicit, // same rule: the reader may see an elicit request immediately
+		onNotify:   onNotify,  // must be set before go t.readLoop() below
+		onRequest:  onRequest, // same rule: the reader may see a request immediately
 	}
 
 	go t.readLoop()
@@ -237,13 +240,16 @@ func (c *stdioTransport) readLoop() {
 				c.onNotify(msg.Method, msg.Params)
 			}
 		default:
-			// A request FROM an upstream. Only elicitation/create is proxied
-			// through to the gateway's client (Round 14); every other
-			// server-initiated request (sampling, roots, unknown) keeps the
-			// old log-and-ignore behaviour — the round's scope is deliberately
-			// limited to elicitation.
-			if msg.Method == mcp.MethodElicitationCreate && c.onElicit != nil {
-				c.onElicit(msg.ID, msg.Params)
+			// A request FROM an upstream. Every such frame goes to the
+			// registry's callback verbatim — WHICH methods the gateway actually
+			// proxies (elicitation/create, sampling/createMessage, roots/list)
+			// is the registry's policy, expressed by its spec table, so the
+			// filter lives there and not in this transport (Stage 15). With no
+			// callback installed the old log-and-ignore behaviour stands; a
+			// method the registry does not know is log-and-ignored there, same
+			// as before.
+			if c.onRequest != nil {
+				c.onRequest(msg.Method, msg.ID, msg.Params)
 			} else {
 				c.log.Debug("upstream request ignored", "upstream", c.name, "method", msg.Method)
 			}
