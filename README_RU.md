@@ -5,15 +5,26 @@
 Шлюз / прокси для **MCP-серверов** (Model Context Protocol) на Go. Presents
 себя MCP-клиенту (Claude Code, Cursor и др.) как **один** MCP-сервер, а под
 капотом **мультиплексирует** вызовы к нескольким upstream MCP-серверам,
-**агрегирует** их каталоги инструментов в один и **логирует** каждый вызов.
-(Агрегация ресурсов между upstream пока не реализована — `resources/list`
-возвращает пустой каталог; см. `internal/transport/dispatch.go`.)
+**агрегирует** их инструменты, промпты и ресурсы в один каталог и **логирует**
+каждый вызов.
 
-> Статус: **MVP завершён (Этапы 0–6)**. Фаза 1 — мультиплексирование
-> stdio-upstream за stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт
-> клиент↔шлюз, HTTP-upstream, CLI-просмотрщик журнала (`mcp-gate logs`);
-> релиз-пайплайн (`goreleaser`, кросс-компиляция linux/darwin/windows ×
-> amd64/arm64 без CGO).
+> Статус: **MVP завершён (Этапы 0–6) + post-MVP Этапы 7–12 и ещё 14 раундов,
+> выпущенные в v0.3.0.** Фаза 1 — мультиплексирование stdio-upstream за
+> stdio-эндпоинтом с журналом; Фаза 2 — HTTP/SSE-транспорт клиент↔шлюз,
+> HTTP-upstream, CLI-просмотрщик журнала (`mcp-gate logs`); релиз-пайплайн
+> (`goreleaser`, кросс-компиляция linux/darwin/windows × amd64/arm64 без CGO).
+> Post-MVP добавил авто-рестарт upstream, горячую перезагрузку конфига,
+> фильтрацию/переименование инструментов, `doctor`, а в v0.3.0 — полную
+> агрегацию `prompts`/`resources`/`resources/templates`/`completion`, `ping`,
+> форвардинг прогресса и реальную отмену вызова, fan-out `logging/setLevel`,
+> лимиты вызовов per-upstream (rate limit / конкурентность / усечение
+> результата / таймаут), lazy-каталог и пагинацию `tools/list`, SSE-стримы
+> server→client с обеих сторон и проксирование `elicitation/create` (только
+> stdio↔stdio).
+>
+> **Не реализовано:** проксирование `sampling`/`roots` от upstream к клиенту,
+> `elicitation` через HTTP-транспорт (ни с одной из сторон), политика доступа
+> per-client и терминация сессии `DELETE /mcp`.
 
 ## Релизы
 
@@ -71,8 +82,9 @@ npx aimcpgate serve -c ./config.yaml
 `aiMCPGate` даёт:
 
 - **Одну точку входа** — один MCP-эндпоинт вместо N в конфиге клиента.
-- **Единый каталог** — инструменты всех upstream-серверов сведены вместе (с
-  неймспейсингом `<upstream>__<tool>`, чтобы имена не сталкивались).
+- **Единый каталог** — инструменты и промпты всех upstream-серверов сведены
+  вместе (с неймспейсингом `<upstream>__<tool>`, чтобы имена не сталкивались),
+  плюс их ресурсы и шаблоны ресурсов (адресуются URI, поэтому не переименовываются).
 - **Журнал вызовов** — какой upstream, что вызвано, когда, успех/ошибка. Это и
   есть добавленная ценность поверх «просто прокси».
 
@@ -94,7 +106,8 @@ MCP-клиент ──stdio/HTTP──▶ aiMCPGate ──JSON-RPC──▶ ups
 - **Фаза 1** — мультиплексирование 2+ **stdio** upstream за одним **stdio**
   эндпоинтом (тот же транспорт, что видит Claude Code) + базовое логирование.
 - **Фаза 2** — **HTTP/SSE** транспорт, HTTP upstream-серверы, просмотрщик
-  журнала (CLI/веб), опционально политика доступа.
+  журнала (сделан CLI-вариант; веб-вью осознанно не делали), опционально
+  политика доступа — **она рассмотрена и отклонена**.
 
 ## Сборка
 
@@ -121,9 +134,21 @@ mcp-gate serve --config ./config-http.yaml
 # упал (удобно для CI/cron); без авто-рестарта и без журналирования — один проход:
 mcp-gate doctor --config ./config.yaml
 
+# разовый вызов одного агрегированного тула из терминала (один проход, без
+# супервизора — быстрый способ отладить конфиг, фильтр или rename без клиента):
+mcp-gate call github__search_repositories '{"query":"mcp"}' --config ./config.yaml
+
+# отчёт о размере агрегированного каталога по upstream (тулы / байты / ~токены)
+# плюс самые тяжёлые тулы — данные для решений про allow-list и strip:
+mcp-gate catalog --config ./config.yaml --top 20
+
 # просмотр журнала вызовов (последние 50; фильтры по upstream/tool/статусу):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
+# следить за журналом по мере роста либо агрегировать его вместо списка записей
+# (--follow и --stats взаимоисключающие):
+mcp-gate logs --config ./config.yaml --follow
+mcp-gate logs --config ./config.yaml --stats
 
 # сгенерировать случайный auth-токен (для HTTP-транспорта) и подсказку, куда его вписать:
 mcp-gate token --generate
@@ -137,11 +162,20 @@ mcp-gate client-config --config ./config-http.yaml
 # напечатать SKILL.md, обучающий агента работе с агрегированным каталогом
 # (по умолчанию встроенный текст; переопределяется через skill_file в конфиге):
 mcp-gate skill > .claude/skills/mcp-gate/SKILL.md
+
+# shell-автодополнение (встроенная команда cobra; готовые файлы также лежат
+# в архивах релиза):
+mcp-gate completion bash > /etc/bash_completion.d/mcp-gate
 ```
 
-Все команды, кроме `token --generate` и `skill` (та откатывается на встроенный
-текст), загружают конфиг: передайте `--config` или положите `config.yaml` рядом
-с бинарём (см. «Конфигурация» ниже).
+Все команды, кроме `token --generate`, `completion` и `skill` (та откатывается
+на встроенный текст), загружают конфиг: передайте `--config` или положите
+`config.yaml` рядом с бинарём (см. «Конфигурация» ниже).
+
+`serve`, `doctor`, `call` и `catalog` принимают также `--env-file ./.env` —
+минимальный парсер `KEY=VALUE`, применяемый **до** загрузки конфига, поэтому
+ссылки `${VAR}` внутри конфига резолвятся из этого файла. Реальное окружение
+процесса всегда важнее файла.
 
 ## Перезагрузка конфига (SIGHUP)
 
@@ -169,9 +203,18 @@ upstream, следующий вызов просто использует нов
 
 **Поведенческое замечание:** поскольку шлюз ставит обработчик SIGHUP, этот
 сигнал больше не завершает процесс, как это делал бы дефолт ОС. Для остановки
-шлюза используйте Ctrl-C, SIGINT или SIGTERM. SIGHUP существует только в Unix;
-на Windows его нет, и перезагрузка недоступна (процесс обслуживает конфиг, с
-которым был запущен, до перезапуска).
+шлюза используйте Ctrl-C, SIGINT или SIGTERM.
+
+SIGHUP существует только в Unix. На Windows — или если просто не хочется
+посылать сигналы — есть opt-in поллинг-альтернатива:
+
+```bash
+mcp-gate serve --config ./config.yaml --watch-config        # голый флаг = раз в 2s
+mcp-gate serve --config ./config.yaml --watch-config=10s    # именно «=», не пробел
+```
+
+Она статит mtime конфига с этим интервалом и применяет ровно тот же путь
+перезагрузки, что SIGHUP. Работать одновременно с обработчиком SIGHUP безопасно.
 
 ## Конфигурация
 
@@ -198,10 +241,19 @@ transport: stdio            # stdio (Фаза 1) | http (Фаза 2)
 listen_addr: "127.0.0.1:28080"  # только для transport: http; по умолчанию loopback
 # auth_token: ${AIMCPGATE_TOKEN}  # обязателен, если listen_addr шире loopback
 log_file: ./logs/calls.jsonl
+# debug_payload_log: ./logs/payloads.jsonl  # OPT-IN, по умолчанию выключен: пишет
+#                                   # сырые аргументы И результаты — там бывают секреты
 # Необязательные глобальные лимиты вызовов (каждый можно переопределить per-upstream):
 # rate_limit: { rps: 5, burst: 2 }  # token bucket на upstream для tools/call
 # max_result_bytes: 65536           # усечение огромных текстовых результатов (0 = выкл)
 # call_timeout: 30s                 # таймаут одного запроса к upstream
+# Как каталог подаётся клиенту (оба поля перечитываются на лету):
+# catalog_mode: lazy                # normal (дефолт) | lazy: клиент видит только
+#                                   # gate_search_tools / gate_describe / gate_call
+# page_size: 50                     # пагинация tools/list (0/отсутствие = весь каталог;
+#                                   # в lazy-режиме игнорируется)
+# Политика авто-рестарта упавших stdio-upstream (дефолт: вкл, 1s→30s, 5 попыток):
+# restart: { enabled: true, initial_backoff: 1s, max_backoff: 30s, max_attempts: 5 }
 upstreams:
   - name: filesystem        # stdio-upstream
     command: npx
@@ -212,6 +264,16 @@ upstreams:
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}   # из окружения, не хардкод
     enabled: true
+    # Необязательные per-upstream фильтр и проекция каталога (ключи — ОРИГИНАЛЬНЫЕ
+    # имена тулов; всё правится на лету по SIGHUP без перезапуска upstream):
+    # tools:
+    #   allow: ["search_repositories"]  # если непустой — только эти
+    #   deny: ["delete_repository"]     # вычитается всегда, даже из allow
+    #   rename: { search_repositories: "gh_search" }
+    #   strip_annotations: true         # убрать тяжёлые поля каталога
+    #   strip_output_schema: true
+    #   max_description: 200            # урезать описания до N рун
+    #   describe: { get_issue: "Получить один issue." }  # заменить целиком
     # Необязательные per-upstream лимиты (переопределяют глобальные для этого upstream):
     # rate_limit: { rps: 1, burst: 1 }  # rps: 0 отключает глобальный лимит здесь
     # max_concurrent: 4                 # потолок одновременных вызовов

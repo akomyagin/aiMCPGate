@@ -5,15 +5,25 @@
 A gateway / proxy for **MCP servers** (Model Context Protocol) written in Go.
 It presents itself to an MCP client (Claude Code, Cursor, etc.) as **one**
 MCP server, while under the hood it **multiplexes** calls across several
-upstream MCP servers, **aggregates** their tool catalogs into one, and
-**logs** every call. (Resource aggregation across upstreams is not implemented
-yet — `resources/list` returns an empty catalog; see `internal/transport/dispatch.go`.)
+upstream MCP servers, **aggregates** their tools, prompts and resources into
+one catalog, and **logs** every call.
 
-> Status: **MVP complete (Stages 0–6)**. Phase 1 — multiplexing stdio
-> upstreams behind a stdio endpoint with a call log; Phase 2 — HTTP/SSE
-> client-facing transport, HTTP upstreams, a CLI log viewer (`mcp-gate
-> logs`); release pipeline (`goreleaser`, cross-compiled for
-> linux/darwin/windows × amd64/arm64, no CGO).
+> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–12 and 14 further
+> rounds shipped in v0.3.0.** Phase 1 — multiplexing stdio upstreams behind a
+> stdio endpoint with a call log; Phase 2 — HTTP/SSE client-facing transport,
+> HTTP upstreams, a CLI log viewer (`mcp-gate logs`); release pipeline
+> (`goreleaser`, cross-compiled for linux/darwin/windows × amd64/arm64, no
+> CGO). Post-MVP added upstream auto-restart, hot config reload, tool
+> filtering/renaming, `doctor`, and — in v0.3.0 — full `prompts`/`resources`/
+> `resources/templates`/`completion` aggregation, `ping`, progress forwarding
+> and real cancellation, `logging/setLevel` fan-out, per-upstream call limits
+> (rate limit / concurrency / result truncation / timeout), a lazy catalog and
+> `tools/list` pagination, SSE server→client streams on both the client and the
+> upstream side, and `elicitation/create` proxying (stdio↔stdio only).
+>
+> **Not implemented:** `sampling`/`roots` proxying from an upstream to the
+> client, `elicitation` over the HTTP transport (either side), a per-client
+> access policy, and `DELETE /mcp` session termination.
 
 ## Releases
 
@@ -72,8 +82,9 @@ config. `aiMCPGate` gives you:
 
 - **One entry point** — a single MCP endpoint instead of N entries in the
   client config.
-- **One catalog** — every upstream server's tools merged together (namespaced
-  as `<upstream>__<tool>` so names never collide).
+- **One catalog** — every upstream server's tools and prompts merged together
+  (namespaced as `<upstream>__<tool>` so names never collide), plus their
+  resources and resource templates (addressed by URI, so never renamed).
 - **A call log** — which upstream, which tool, when, success/failure. This is
   the value added on top of "just a proxy".
 
@@ -94,7 +105,8 @@ MCP client ──stdio/HTTP──▶ aiMCPGate ──JSON-RPC──▶ upstream 
 - **Phase 1** — multiplexing 2+ **stdio** upstreams behind one **stdio**
   endpoint (the same transport Claude Code speaks) plus basic logging.
 - **Phase 2** — **HTTP/SSE** transport, HTTP upstream servers, a log viewer
-  (CLI/web), optionally an access policy.
+  (the CLI one was built; the web view was deliberately dropped), optionally an
+  access policy — **that one was considered and declined**.
 
 ## Build
 
@@ -121,9 +133,21 @@ mcp-gate serve --config ./config-http.yaml
 # (scriptable for CI/cron), no auto-restart, no call logging — one pass then exit:
 mcp-gate doctor --config ./config.yaml
 
+# call one aggregated tool once from the shell (single bring-up, no supervisor —
+# the fastest way to debug a config, a filter or a rename without a live client):
+mcp-gate call github__search_repositories '{"query":"mcp"}' --config ./config.yaml
+
+# report the aggregated catalog size per upstream (tools / bytes / ~tokens) plus
+# the heaviest individual tools — the data behind allow-list / strip decisions:
+mcp-gate catalog --config ./config.yaml --top 20
+
 # view the call log (last 50 records; filter by upstream/tool/status):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
+# keep watching the log as it grows, or aggregate it instead of listing records
+# (--follow and --stats are mutually exclusive):
+mcp-gate logs --config ./config.yaml --follow
+mcp-gate logs --config ./config.yaml --stats
 
 # generate a random auth token (for the HTTP transport) and see how to wire it in:
 mcp-gate token --generate
@@ -137,11 +161,20 @@ mcp-gate client-config --config ./config-http.yaml
 # print a SKILL.md teaching an agent how to use the aggregated catalog
 # (built-in text by default; overridable via skill_file in the config):
 mcp-gate skill > .claude/skills/mcp-gate/SKILL.md
+
+# shell completions (cobra's built-in command; the release archives also ship
+# pre-generated ones):
+mcp-gate completion bash > /etc/bash_completion.d/mcp-gate
 ```
 
-All commands except `token --generate` and `skill` (which falls back to a built-in
-guide) load the config: pass `--config`, or drop a `config.yaml` next to the
-binary (see Configuration below).
+All commands except `token --generate`, `completion` and `skill` (which falls
+back to a built-in guide) load the config: pass `--config`, or drop a
+`config.yaml` next to the binary (see Configuration below).
+
+`serve`, `doctor`, `call` and `catalog` also accept `--env-file ./.env` — a
+minimal `KEY=VALUE` parser applied **before** the config is loaded, so `${VAR}`
+references inside the config resolve from that file. The real process
+environment always wins over the file.
 
 ## Reloading config (SIGHUP)
 
@@ -168,9 +201,18 @@ config stays live, so a typo never takes the gateway down.
 
 **Behavioural note:** since the gateway installs a SIGHUP handler, SIGHUP no
 longer terminates the process the way the OS default would. To stop the gateway
-use Ctrl-C, SIGINT, or SIGTERM. SIGHUP is Unix-only; on Windows it does not
-exist and reload is unavailable (the process serves the config it started with
-until restarted).
+use Ctrl-C, SIGINT, or SIGTERM.
+
+SIGHUP is Unix-only. On Windows — or anywhere you would rather not send signals
+— use the opt-in polling alternative instead:
+
+```bash
+mcp-gate serve --config ./config.yaml --watch-config        # bare flag = poll every 2s
+mcp-gate serve --config ./config.yaml --watch-config=10s    # note the "=", not a space
+```
+
+It stats the config file's mtime on that interval and applies the same reload
+path SIGHUP takes. Running it alongside the SIGHUP handler is safe.
 
 ## Configuration
 
@@ -198,10 +240,19 @@ transport: stdio            # stdio (Phase 1) | http (Phase 2)
 listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default
 # auth_token: ${AIMCPGATE_TOKEN}  # required if you widen listen_addr past loopback
 log_file: ./logs/calls.jsonl
+# debug_payload_log: ./logs/payloads.jsonl  # OPT-IN, off by default: logs raw
+#                                   # arguments AND results — can contain secrets
 # Optional global call limits (each can be overridden per upstream):
 # rate_limit: { rps: 5, burst: 2 }  # token bucket per upstream for tools/call
 # max_result_bytes: 65536           # truncate oversized textual results (0 = off)
 # call_timeout: 30s                 # bounds one upstream request
+# How the catalog is presented to the client (both hot-reloadable):
+# catalog_mode: lazy                # normal (default) | lazy: the client sees only
+#                                   # gate_search_tools / gate_describe / gate_call
+# page_size: 50                     # paginate tools/list (0/omitted = whole catalog;
+#                                   # ignored in lazy mode)
+# Auto-restart policy for crashed stdio upstreams (defaults: on, 1s→30s, 5 tries):
+# restart: { enabled: true, initial_backoff: 1s, max_backoff: 30s, max_attempts: 5 }
 upstreams:
   - name: filesystem        # stdio upstream
     command: npx
@@ -212,6 +263,16 @@ upstreams:
     env:
       GITHUB_TOKEN: ${GITHUB_TOKEN}   # from the environment, not hardcoded
     enabled: true
+    # Optional per-upstream tool filter / catalog projection (keys are ORIGINAL
+    # tool names; all editable live via SIGHUP with no upstream restart):
+    # tools:
+    #   allow: ["search_repositories"]  # if non-empty, only these survive
+    #   deny: ["delete_repository"]     # always subtracted, even from allow
+    #   rename: { search_repositories: "gh_search" }
+    #   strip_annotations: true         # drop heavyweight catalog fields
+    #   strip_output_schema: true
+    #   max_description: 200            # truncate descriptions to N runes
+    #   describe: { get_issue: "Fetch one issue." }   # replace wholesale
     # Optional per-upstream call limits (override the globals for this upstream):
     # rate_limit: { rps: 1, burst: 1 }  # rps: 0 disables the global limit here
     # max_concurrent: 4                 # cap on simultaneous in-flight calls
