@@ -89,7 +89,17 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 // custom config or a call log.
 func startServerWithConfig(t *testing.T, cfg *config.Config, callLog logging.CallLog) (*fakeClient, context.CancelFunc, <-chan error) {
 	t.Helper()
-	reg := registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test")
+	return startServerWithRegistry(t, cfg, registry.New(cfg, quietLogger(), callLog, noopPayloadLog(), true, "0.0.0-test"))
+}
+
+// startServerWithRegistry is the same, with the registry handed in — for the
+// rare test that must also talk to the registry DIRECTLY, out of band from the
+// client pipe. Only one does: reproducing a server→client request that reaches
+// the Serve loop before the client's handshake needs the runtime capability
+// gate opened without an initialize, which is the very thing the transport
+// refuses to do.
+func startServerWithRegistry(t *testing.T, cfg *config.Config, reg *registry.Registry) (*fakeClient, context.CancelFunc, <-chan error) {
+	t.Helper()
 
 	clientToSrv, srvIn := io.Pipe() // client writes to srvIn side... (see below)
 	srvOut, clientFromSrv := io.Pipe()
@@ -745,6 +755,12 @@ func TestStdioForwardsProgressDuringToolsCall(t *testing.T) {
 // list_changed there is nothing durable to defer (progress is only meaningful
 // against an in-flight client call, impossible pre-handshake). After
 // initialize the path works normally.
+//
+// Since Stage 15 the registry starts lazily, on the first client request that
+// needs it, so the upstream that fires the push does not even exist until the
+// client speaks. The pre-initialize window is therefore opened with a
+// tools/list (a request that needs the catalog but is not the handshake) —
+// the test's subject, drop-versus-park, is unchanged.
 func TestStdioDropsProgressBeforeInitialize(t *testing.T) {
 	bin := buildFakeServer(t)
 	progressFile := filepath.Join(t.TempDir(), "progress-trigger")
@@ -778,6 +794,18 @@ func TestStdioDropsProgressBeforeInitialize(t *testing.T) {
 		if err := os.WriteFile(progressFile, []byte("go"), 0o600); err != nil {
 			t.Fatalf("touch progress trigger: %v", err)
 		}
+	}
+
+	// Bring the upstream up WITHOUT initializing: tools/list needs the catalog,
+	// so it starts the registry, but it leaves the handshake gate closed.
+	listID := c.request(mcp.MethodToolsList, nil)
+	select {
+	case m := <-msgs:
+		if string(m.ID) != string(listID) {
+			t.Fatalf("first message id = %s, want the tools/list id %s", m.ID, listID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no tools/list response within deadline")
 	}
 
 	// Fire a progress push before initialize: nothing may reach the client.

@@ -212,9 +212,12 @@ func TestListResourcesMethodNotFoundIsEmptyCatalog(t *testing.T) {
 
 // captureTransport records the raw params of the last call it received and
 // answers with an empty successful result — the wire-level probe for what
-// CallTool actually sends.
+// CallTool actually sends. It also records every NOTIFICATION method it was
+// asked to send, the probe ForwardRootsListChanged needs.
 type captureTransport struct {
-	params json.RawMessage
+	params    json.RawMessage
+	notifs    []string
+	notifyErr error
 }
 
 func (c *captureTransport) call(_ context.Context, _ string, params json.RawMessage) (*mcp.Message, error) {
@@ -222,24 +225,34 @@ func (c *captureTransport) call(_ context.Context, _ string, params json.RawMess
 	return mcp.NewResult(mcp.IntID(1), json.RawMessage(`{}`)), nil
 }
 
-func (c *captureTransport) notify(context.Context, string, json.RawMessage) error { return nil }
-func (c *captureTransport) Name() string                                          { return "capture" }
-func (c *captureTransport) Close() error                                          { return nil }
-func (c *captureTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
-func (c *captureTransport) StderrTail() ([]string, bool)                          { return nil, false }
+func (c *captureTransport) notify(_ context.Context, method string, _ json.RawMessage) error {
+	c.notifs = append(c.notifs, method)
+	return c.notifyErr
+}
+
+func (c *captureTransport) Name() string                  { return "capture" }
+func (c *captureTransport) Close() error                  { return nil }
+func (c *captureTransport) Done() (<-chan struct{}, bool) { return nil, false }
+func (c *captureTransport) StderrTail() ([]string, bool)  { return nil, false }
 
 // TestInitializeWireCapabilities pins what Initialize DECLARES to the upstream
-// as the gateway's client capabilities. A Conn told to declare elicitation
-// (what the registry does for a stdio upstream when the client-facing
-// transport can proxy the request) must send the key in params.capabilities —
-// an upstream honouring the spec's "only use negotiated capabilities" MUST
-// otherwise never send elicitation/create. A Conn told nothing — the zero
-// value every non-declaring path builds (HTTP upstreams, doctor/call/catalog)
-// — must send exactly {}, byte-identical to the pre-declaration handshake.
+// as the gateway's client capabilities. A Conn told to declare a set (what the
+// registry does for a stdio upstream, from the capabilities its OWN client
+// declared) must send every key with the EXACT value it was handed — an
+// upstream honouring the spec's "only use negotiated capabilities" MUST
+// otherwise never send the matching request, and roots specifically must carry
+// listChanged:true because the gateway does fan that notification out. A Conn
+// told nothing — the zero value every non-declaring path builds (HTTP
+// upstreams, doctor/call/catalog) — must send exactly {}, byte-identical to
+// the pre-declaration handshake.
 func TestInitializeWireCapabilities(t *testing.T) {
 	tr := &captureTransport{}
 	c := &Conn{transport: tr}
-	c.DeclareClientCapabilities("elicitation")
+	c.DeclareClientCapabilities(map[string]json.RawMessage{
+		"elicitation": json.RawMessage(`{}`),
+		"sampling":    json.RawMessage(`{}`),
+		"roots":       json.RawMessage(`{"listChanged":true}`),
+	})
 	if _, err := c.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize (declared): %v", err)
 	}
@@ -249,10 +262,23 @@ func TestInitializeWireCapabilities(t *testing.T) {
 	if err := json.Unmarshal(tr.params, &declared); err != nil {
 		t.Fatalf("decode sent initialize params: %v", err)
 	}
-	if v, ok := declared.Capabilities["elicitation"]; !ok {
-		t.Errorf("declared conn sent capabilities without the elicitation key: %s", tr.params)
-	} else if string(v) != "{}" {
-		t.Errorf("elicitation capability = %s, want the spec's empty object {}", v)
+	want := map[string]string{
+		"elicitation": "{}",
+		"sampling":    "{}",
+		"roots":       `{"listChanged":true}`,
+	}
+	if len(declared.Capabilities) != len(want) {
+		t.Fatalf("declared %v, want exactly %v", declared.Capabilities, want)
+	}
+	for name, wantValue := range want {
+		v, ok := declared.Capabilities[name]
+		if !ok {
+			t.Errorf("declared conn sent capabilities without the %s key: %s", name, tr.params)
+			continue
+		}
+		if string(v) != wantValue {
+			t.Errorf("%s capability = %s, want %s", name, v, wantValue)
+		}
 	}
 
 	tr = &captureTransport{}
@@ -301,5 +327,43 @@ func TestCallToolWireParamsCarryMetaExactly(t *testing.T) {
 	}
 	if _, present := noMeta["_meta"]; present {
 		t.Errorf("params carry an invented _meta key: %s", tr.params)
+	}
+}
+
+// TestForwardRootsListChangedHonoursDeclaration (D8) pins the per-connection
+// gate of the roots fan-out: the notification goes out only to an upstream the
+// gateway actually declared roots to. roots is a CLIENT capability — an
+// upstream never declares it — so the only honest source for this decision is
+// what THIS connection was told to declare.
+func TestForwardRootsListChangedHonoursDeclaration(t *testing.T) {
+	tr := &captureTransport{}
+	c := &Conn{transport: tr}
+	c.DeclareClientCapabilities(map[string]json.RawMessage{"roots": json.RawMessage(`{"listChanged":true}`)})
+	if err := c.ForwardRootsListChanged(context.Background()); err != nil {
+		t.Fatalf("ForwardRootsListChanged (declared): %v", err)
+	}
+	if len(tr.notifs) != 1 || tr.notifs[0] != mcp.NotifRootsListChanged {
+		t.Errorf("notifications sent = %v, want exactly [%s]", tr.notifs, mcp.NotifRootsListChanged)
+	}
+
+	// Declared something else: still a no-op — the gate is per capability.
+	tr = &captureTransport{}
+	c = &Conn{transport: tr}
+	c.DeclareClientCapabilities(map[string]json.RawMessage{"elicitation": json.RawMessage(`{}`)})
+	if err := c.ForwardRootsListChanged(context.Background()); err != nil {
+		t.Fatalf("ForwardRootsListChanged (other capability): %v", err)
+	}
+	if len(tr.notifs) != 0 {
+		t.Errorf("notifications sent = %v to an upstream never told about roots, want none", tr.notifs)
+	}
+
+	// Declared nothing at all (HTTP upstreams, doctor/call/catalog): no-op, nil.
+	tr = &captureTransport{}
+	c = &Conn{transport: tr}
+	if err := c.ForwardRootsListChanged(context.Background()); err != nil {
+		t.Fatalf("ForwardRootsListChanged (undeclared): %v", err)
+	}
+	if len(tr.notifs) != 0 {
+		t.Errorf("notifications sent = %v by an undeclaring conn, want none", tr.notifs)
 	}
 }

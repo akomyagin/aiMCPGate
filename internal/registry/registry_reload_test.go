@@ -88,7 +88,7 @@ func TestReloadedUpstreamKeepsElicitationDeclaration(t *testing.T) {
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	// What the stdio client-facing transport does before Start (stdioServer.Serve).
-	r.SetElicitationProxySupported(true)
+	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

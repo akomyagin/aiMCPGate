@@ -123,7 +123,9 @@ func TestRegistryDoesNotDeclareElicitationToHTTPUpstream(t *testing.T) {
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	// What the stdio client-facing transport does before Start — the very
 	// setting that makes startStdio declare must NOT leak to the HTTP leg.
-	r.SetElicitationProxySupported(true)
+	// (Stage 15: one honest setter replaced the two Round 14 flags; the HTTP
+	// leg's expectation is unchanged.)
+	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -136,7 +138,7 @@ func TestRegistryDoesNotDeclareElicitationToHTTPUpstream(t *testing.T) {
 	got := sawCaps
 	mu.Unlock()
 	if got != "{}" {
-		t.Errorf("HTTP upstream received capabilities %s, want exactly {} even with the proxy flag set", got)
+		t.Errorf("HTTP upstream received capabilities %s, want exactly {} even with the client caps set", got)
 	}
 }
 

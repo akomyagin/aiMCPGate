@@ -135,6 +135,38 @@
 //	                   answers immediately with the distinct "|elicit-skipped"
 //	                   marker — distinguishable from a plain success, so a test
 //	                   can tell "honoured the negotiation" from "hook broke".
+//	FAKE_SAMPLING    if "1", every tools/call FIRST sends a
+//	                   sampling/createMessage REQUEST to its client (id
+//	                   "fake-sampling-<n>", fixed messages/maxTokens params) and
+//	                   waits up to 10s for the response before answering. A
+//	                   RESULT appends "|sampled=<raw result>" to the tool text;
+//	                   a JSON-RPC ERROR FAILS the call (isError:true, text
+//	                   "sampling-error=<code> <message>"), the way real server
+//	                   SDKs surface it; silence appends "|sampling-timeout".
+//	                   Like FAKE_ELICIT the hook RESPECTS capability
+//	                   negotiation: with no "sampling" in the client's
+//	                   initialize nothing is sent and the call answers
+//	                   "|sampling-skipped" (Stage 15).
+//	FAKE_ROOTS       if "1", every tools/call FIRST sends a roots/list REQUEST
+//	                   to its client (id "fake-roots-<n>", no params) and waits
+//	                   up to 10s. Suffixes mirror FAKE_SAMPLING: "|roots=<raw>",
+//	                   an isError:true "roots-error=<code> <message>",
+//	                   "|roots-timeout", and "|roots-skipped" when the client
+//	                   declared no "roots" capability (Stage 15).
+//	FAKE_ROOTS_CHANGED_FILE  path the server APPENDS one line to for every
+//	                   notifications/roots/list_changed it receives — the record
+//	                   proving the gateway fanned the client's notification out
+//	                   (shape of FAKE_CANCEL_FILE). Independent of FAKE_ROOTS.
+//	FAKE_SAMPLING_FORCE  like FAKE_SAMPLING, but DELIBERATELY ignores capability
+//	                   negotiation — the "rude" server counterpart of
+//	                   FAKE_ELICIT_FORCE, used only by the negative test that
+//	                   pins the -32601 refusal (Stage 15).
+//	FAKE_ELICIT_FORCE  like FAKE_ELICIT, but DELIBERATELY ignores capability
+//	                   negotiation: the elicitation/create goes out even when
+//	                   the client declared nothing. It models the "rude" server
+//	                   the gateway's refusal paths exist for, and it is the ONLY
+//	                   hook allowed to break the negotiation MUST — used solely
+//	                   by the negative test that pins the refusal (Stage 15).
 //	FAKE_CAPS_FILE   path the server APPENDS the raw `capabilities` object of
 //	                   each received initialize to (one JSON line) — a direct
 //	                   record of what the gateway DECLARED in its handshake,
@@ -220,6 +252,12 @@ func main() {
 	cancelFile := os.Getenv("FAKE_CANCEL_FILE")
 	asyncCalls := os.Getenv("FAKE_ASYNC_CALLS") == "1"
 	elicit := os.Getenv("FAKE_ELICIT") == "1"
+	// The one hook that may ignore the negotiation — see FAKE_ELICIT_FORCE.
+	elicitForce := os.Getenv("FAKE_ELICIT_FORCE") == "1"
+	sampling := os.Getenv("FAKE_SAMPLING") == "1"
+	samplingForce := os.Getenv("FAKE_SAMPLING_FORCE") == "1"
+	roots := os.Getenv("FAKE_ROOTS") == "1"
+	rootsChangedFile := os.Getenv("FAKE_ROOTS_CHANGED_FILE")
 	capsFile := os.Getenv("FAKE_CAPS_FILE")
 	logging := os.Getenv("FAKE_LOGGING") == "1"
 	logFile := os.Getenv("FAKE_LOG_FILE")
@@ -308,19 +346,44 @@ func main() {
 		}()
 	}
 
-	// elicitation plumbing (FAKE_ELICIT): each elicit-enabled tools/call runs
-	// on its own goroutine, registers a waiter for its "fake-elicit-<n>" id and
-	// blocks on it; the main read loop routes RESPONSES (no method) here.
-	var elicitMu sync.Mutex
-	elicitWaiters := map[string]chan message{}
+	// server→client plumbing (FAKE_ELICIT / FAKE_SAMPLING / FAKE_ROOTS): each
+	// hooked tools/call runs on its own goroutine, registers a waiter for its
+	// "fake-<kind>-<n>" id and blocks on it; the main read loop routes
+	// RESPONSES (no method) here, by id, whatever the method was.
+	var reqMu sync.Mutex
+	reqWaiters := map[string]chan message{}
 	elicitSeq := 0
+	samplingSeq := 0
+	rootsSeq := 0
 
-	// clientElicits records whether the client's LAST initialize declared the
-	// elicitation capability — the FAKE_ELICIT hook consults it, because a
-	// spec-abiding server MUST only use negotiated capabilities. Written and
-	// read on the main loop only (the elicit goroutines are spawned after the
-	// gate), so no lock is needed.
+	// clientElicits / clientSamples / clientRoots record which server→client
+	// capabilities the client's LAST initialize declared — the hooks consult
+	// them, because a spec-abiding server MUST only use negotiated
+	// capabilities. Written and read on the main loop only (the ask goroutines
+	// are spawned after the gate), so no lock is needed.
 	clientElicits := false
+	clientSamples := false
+	clientRoots := false
+
+	// ask sends one server→client request and waits up to 10s for the
+	// response, cleaning its waiter up on timeout. Called from the per-call
+	// goroutines only — the main loop must stay free to read the answer.
+	ask := func(id json.RawMessage, method string, params json.RawMessage) (message, bool) {
+		ch := make(chan message, 1)
+		reqMu.Lock()
+		reqWaiters[string(id)] = ch
+		reqMu.Unlock()
+		write(message{ID: id, Method: method, Params: params})
+		select {
+		case resp := <-ch:
+			return resp, true
+		case <-time.After(10 * time.Second):
+			reqMu.Lock()
+			delete(reqWaiters, string(id))
+			reqMu.Unlock()
+			return message{}, false
+		}
+	}
 
 	callCount := 0
 	for sc.Scan() {
@@ -333,15 +396,16 @@ func main() {
 			continue
 		}
 		if req.Method == "" && (req.Result != nil || req.Error != nil) {
-			// A response to a server-initiated request (elicitation/create):
-			// hand it to the waiting tools/call goroutine by id. An unknown id
-			// is silently dropped, like a real server would.
-			elicitMu.Lock()
-			ch, ok := elicitWaiters[string(req.ID)]
+			// A response to a server-initiated request (elicitation/create,
+			// sampling/createMessage, roots/list): hand it to the waiting
+			// tools/call goroutine by id — the routing is method-agnostic. An
+			// unknown id is silently dropped, like a real server would.
+			reqMu.Lock()
+			ch, ok := reqWaiters[string(req.ID)]
 			if ok {
-				delete(elicitWaiters, string(req.ID))
+				delete(reqWaiters, string(req.ID))
 			}
-			elicitMu.Unlock()
+			reqMu.Unlock()
 			if ok {
 				ch <- req
 			}
@@ -358,6 +422,8 @@ func main() {
 			// raw object for direct test assertions (FAKE_CAPS_FILE).
 			rawCaps := clientCapabilities(req.Params)
 			clientElicits = capabilityDeclared(rawCaps, "elicitation")
+			clientSamples = capabilityDeclared(rawCaps, "sampling")
+			clientRoots = capabilityDeclared(rawCaps, "roots")
 			if capsFile != "" {
 				f, err := os.OpenFile(capsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 				if err == nil {
@@ -426,6 +492,16 @@ func main() {
 			b, _ := json.Marshal(string(req.Params))
 			write(message{ID: req.ID, Result: json.RawMessage(
 				fmt.Sprintf(`{"completion":{"values":[%s],"hasMore":false}}`, b))})
+		case "notifications/roots/list_changed":
+			// Record that the gateway fanned the client's notification out to
+			// this upstream. Append, never truncate: a test may expect several.
+			if rootsChangedFile != "" {
+				f, err := os.OpenFile(rootsChangedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintln(f, "roots-changed")
+					f.Close()
+				}
+			}
 		case "notifications/cancelled":
 			// Record the cancellation so a test can assert the gateway sent it
 			// (and with WHICH requestId). Append, don't truncate: a test may
@@ -488,7 +564,7 @@ func main() {
 							`{"progressToken":%s,"progress":1,"total":2}`, p.Meta.ProgressToken))})
 				}
 			}
-			if elicit && !clientElicits {
+			if elicit && !elicitForce && !clientElicits {
 				// The hook is armed but the client never declared the
 				// elicitation capability: honour the negotiation (a spec MUST)
 				// and answer without asking. The distinct marker keeps this
@@ -498,16 +574,16 @@ func main() {
 				write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, "|elicit-skipped"))})
 				continue
 			}
-			if elicit {
+			if elicit || elicitForce {
 				// Ask the client for input mid-call and only then answer, per
 				// the MCP elicitation flow (Round 14 test hook). On a goroutine:
 				// the main loop must keep reading stdin to see the response.
 				elicitSeq++
 				elicitID, _ := json.Marshal(fmt.Sprintf("fake-elicit-%d", elicitSeq))
 				ch := make(chan message, 1)
-				elicitMu.Lock()
-				elicitWaiters[string(elicitID)] = ch
-				elicitMu.Unlock()
+				reqMu.Lock()
+				reqWaiters[string(elicitID)] = ch
+				reqMu.Unlock()
 				req := req
 				go func() {
 					write(message{ID: elicitID, Method: "elicitation/create",
@@ -531,6 +607,66 @@ func main() {
 						suffix = "|elicited=" + string(resp.Result)
 					case <-time.After(10 * time.Second):
 						suffix = "|elicit-timeout"
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, suffix))})
+				}()
+				continue
+			}
+			if sampling && !samplingForce && !clientSamples {
+				// Armed but not negotiated: honour the handshake (a spec MUST)
+				// and answer without asking. The distinct marker keeps this
+				// case tellable from a plain success.
+				write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, "|sampling-skipped"))})
+				continue
+			}
+			if sampling || samplingForce {
+				samplingSeq++
+				samplingID, _ := json.Marshal(fmt.Sprintf("fake-sampling-%d", samplingSeq))
+				req := req
+				go func() {
+					resp, ok := ask(samplingID, "sampling/createMessage",
+						json.RawMessage(`{"messages":[{"role":"user","content":{"type":"text","text":"say hi"}}],"maxTokens":16}`))
+					var suffix string
+					switch {
+					case !ok:
+						suffix = "|sampling-timeout"
+					case resp.Error != nil:
+						// Real server SDKs turn a JSON-RPC error to their
+						// sampling call into an exception inside the tool,
+						// failing the whole tools/call — mirror that.
+						b, _ := json.Marshal(fmt.Sprintf("sampling-error=%d %s", resp.Error.Code, resp.Error.Message))
+						write(message{ID: req.ID, Result: json.RawMessage(
+							fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":true}`, b))})
+						return
+					default:
+						suffix = "|sampled=" + string(resp.Result)
+					}
+					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, suffix))})
+				}()
+				continue
+			}
+			if roots && !clientRoots {
+				// Armed but not negotiated — same rule as sampling above.
+				write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, "|roots-skipped"))})
+				continue
+			}
+			if roots {
+				rootsSeq++
+				rootsID, _ := json.Marshal(fmt.Sprintf("fake-roots-%d", rootsSeq))
+				req := req
+				go func() {
+					resp, ok := ask(rootsID, "roots/list", nil)
+					var suffix string
+					switch {
+					case !ok:
+						suffix = "|roots-timeout"
+					case resp.Error != nil:
+						b, _ := json.Marshal(fmt.Sprintf("roots-error=%d %s", resp.Error.Code, resp.Error.Message))
+						write(message{ID: req.ID, Result: json.RawMessage(
+							fmt.Sprintf(`{"content":[{"type":"text","text":%s}],"isError":true}`, b))})
+						return
+					default:
+						suffix = "|roots=" + string(resp.Result)
 					}
 					write(message{ID: req.ID, Result: json.RawMessage(callResult(req.Params, echo, suffix))})
 				}()

@@ -87,7 +87,7 @@ func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger,
 		log: log,
 		// HTTP pushes list_changed over the GET SSE stream (Round 12) but has
 		// no channel for gateway→client REQUESTS, so no elicitation (Round 14).
-		d:    newDispatcher(reg, log, version, true, false),
+		d:    newDispatcher(reg, log, version, true, false), // HTTP: list_changed over SSE, but no server→client requests
 		addr: cfg.EffectiveListenAddr(),
 		cfg:  reg.ConfigSnapshot,
 	}
