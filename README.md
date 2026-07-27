@@ -21,13 +21,14 @@ one catalog, and **logs** every call.
 > `tools/list` pagination, SSE server→client streams on both the client and the
 > upstream side, and `elicitation/create` proxying (stdio↔stdio only). Merged
 > since v0.3.0 but not yet released: `sampling/createMessage` and `roots/list`
-> proxying (stdio↔stdio as well), and honest capability declaration to
+> proxying (stdio↔stdio as well), honest capability declaration to
 > upstreams — the gateway now offers an upstream exactly what its own client
-> declared, instead of a blanket `{}`.
+> declared, instead of a blanket `{}` — and server-side `Mcp-Session-Id`
+> sessions on the HTTP transport, with `DELETE /mcp` termination.
 >
 > **Not implemented:** server→client requests over the HTTP transport — that is
-> `elicitation`, `sampling` and `roots` alike, with HTTP on either side — a
-> per-client access policy, and `DELETE /mcp` session termination.
+> `elicitation`, `sampling` and `roots` alike, with HTTP on either side — and a
+> per-client access policy.
 
 ## Releases
 
@@ -129,7 +130,8 @@ go run ./cmd version
 # stdio mode (the client launches the gateway as a subprocess):
 mcp-gate serve --config ./config.yaml
 
-# http mode (transport: http in the config) — endpoint at http://<listen_addr>/mcp:
+# http mode (transport: http in the config) — endpoint at http://<listen_addr>/mcp;
+# every request after initialize carries the issued Mcp-Session-Id (see below):
 mcp-gate serve --config ./config-http.yaml
 
 # check every enabled upstream once (launch → handshake → tools/list) and print
@@ -179,6 +181,36 @@ back to a built-in guide) load the config: pass `--config`, or drop a
 minimal `KEY=VALUE` parser applied **before** the config is loaded, so `${VAR}`
 references inside the config resolve from that file. The real process
 environment always wins over the file.
+
+### HTTP sessions (`Mcp-Session-Id`)
+
+In http mode the gateway runs Streamable HTTP sessions: the reply to
+`initialize` carries an **`Mcp-Session-Id`** header, and every request after it
+— POST, the GET SSE stream, DELETE — must send that header back. Without it the
+answer is **400**; with an unknown or expired id, **404**, which tells the
+client to `initialize` again. A session is released by **`DELETE /mcp`** (204),
+or after 30 minutes with no requests — an open SSE stream counts as activity and
+keeps it alive.
+
+MCP clients do all of this for you. For hand-made `curl` calls, take the header
+from the initialize response and echo it back:
+
+```bash
+SID=$(curl -sD - -o /dev/null -X POST http://127.0.0.1:28080/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' \
+  | tr -d '\r' | awk -F': ' '/^[Mm]cp-[Ss]ession-[Ii]d/{print $2}')
+
+curl -s -X POST http://127.0.0.1:28080/mcp \
+  -H 'Content-Type: application/json' -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+curl -s -X DELETE http://127.0.0.1:28080/mcp -H "Mcp-Session-Id: $SID"
+```
+
+The session also makes the call log honest: every call is audited under the
+`clientInfo` of the session that made it, so several HTTP clients are told apart
+in `calls.jsonl` instead of sharing one blank `client` field.
 
 ## Reloading config (SIGHUP)
 

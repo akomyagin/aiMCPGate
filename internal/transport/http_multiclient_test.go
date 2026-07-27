@@ -83,8 +83,11 @@ func startHTTPGatewayMulti(t *testing.T, n int) (*httptest.Server, func()) {
 
 // postErr is a goroutine-safe variant of post: it returns errors instead of
 // calling t.Fatalf, because Fatal is only legal on the test goroutine and these
-// helpers run inside worker goroutines.
-func postErr(srv *httptest.Server, msg *mcp.Message) (*http.Response, error) {
+// helpers run inside worker goroutines. sid, when non-empty, is sent as the
+// Stage 16 session header — every post-handshake request needs it, and each
+// concurrent "client" here carries its OWN session id, which is what makes
+// these tests exercise the session store under -race.
+func postErr(srv *httptest.Server, msg *mcp.Message, sid string) (*http.Response, error) {
 	body, err := mcp.Encode(msg)
 	if err != nil {
 		return nil, fmt.Errorf("encode: %w", err)
@@ -95,6 +98,9 @@ func postErr(srv *httptest.Server, msg *mcp.Message) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	if sid != "" {
+		req.Header.Set(sessionHeader, sid)
+	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST: %w", err)
@@ -102,12 +108,42 @@ func postErr(srv *httptest.Server, msg *mcp.Message) (*http.Response, error) {
 	return resp, nil
 }
 
+// initSessionErr is the goroutine-safe initialize: it performs the handshake
+// with its own clientInfo and returns the session id the gateway issued.
+func initSessionErr(srv *httptest.Server, clientName string) (string, *mcp.Message, error) {
+	msg := mcp.NewRequest(mcp.IntID(nextTestID()), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: clientName, Version: "1.0.0"},
+	}))
+	resp, err := postErr(srv, msg, "")
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("initialize: HTTP status = %d, want 200", resp.StatusCode)
+	}
+	sid := resp.Header.Get(sessionHeader)
+	if sid == "" {
+		return "", nil, fmt.Errorf("initialize response carries no %s header", sessionHeader)
+	}
+	var out mcp.Message
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", nil, fmt.Errorf("initialize: decode response: %w", err)
+	}
+	if string(out.ID) != string(msg.ID) {
+		return "", nil, fmt.Errorf("initialize: response id = %s, want %s (responses mixed up between clients?)", out.ID, msg.ID)
+	}
+	return sid, &out, nil
+}
+
 // roundTrip POSTs one request and decodes the single JSON-RPC reply, verifying
 // the HTTP status and — crucially for multi-client correctness — that the reply
 // carries EXACTLY the id this caller sent (any other id means the gateway mixed
 // up responses between concurrent clients).
-func roundTrip(srv *httptest.Server, msg *mcp.Message) (*mcp.Message, error) {
-	resp, err := postErr(srv, msg)
+func roundTrip(srv *httptest.Server, msg *mcp.Message, sid string) (*mcp.Message, error) {
+	resp, err := postErr(srv, msg, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -133,12 +169,9 @@ func roundTrip(srv *httptest.Server, msg *mcp.Message) (*mcp.Message, error) {
 func clientCycle(srv *httptest.Server, client, numUpstreams, callsPerClient int) error {
 	nextID := func() json.RawMessage { return mcp.IntID(nextTestID()) }
 
-	// initialize — each "client" performs its own handshake with its own id.
-	msg, err := roundTrip(srv, mcp.NewRequest(nextID(), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    json.RawMessage(`{}`),
-		ClientInfo:      mcp.Implementation{Name: fmt.Sprintf("client-%d", client), Version: "1.0.0"},
-	})))
+	// initialize — each "client" performs its own handshake with its own id
+	// and gets its OWN session id back, which every later request carries.
+	sid, msg, err := initSessionErr(srv, fmt.Sprintf("client-%d", client))
 	if err != nil {
 		return fmt.Errorf("client %d: %w", client, err)
 	}
@@ -155,7 +188,7 @@ func clientCycle(srv *httptest.Server, client, numUpstreams, callsPerClient int)
 
 	// notifications/initialized — a notification, so the gateway must answer
 	// 202 Accepted with no body (per the HTTP transport contract).
-	resp, err := postErr(srv, mcp.NewNotification(mcp.NotifInitialized, nil))
+	resp, err := postErr(srv, mcp.NewNotification(mcp.NotifInitialized, nil), sid)
 	if err != nil {
 		return fmt.Errorf("client %d: %w", client, err)
 	}
@@ -166,7 +199,7 @@ func clientCycle(srv *httptest.Server, client, numUpstreams, callsPerClient int)
 
 	// tools/list — the aggregated catalog must be complete and consistent no
 	// matter how many clients are reading it concurrently.
-	msg, err = roundTrip(srv, mcp.NewRequest(nextID(), mcp.MethodToolsList, nil))
+	msg, err = roundTrip(srv, mcp.NewRequest(nextID(), mcp.MethodToolsList, nil), sid)
 	if err != nil {
 		return fmt.Errorf("client %d: %w", client, err)
 	}
@@ -197,7 +230,7 @@ func clientCycle(srv *httptest.Server, client, numUpstreams, callsPerClient int)
 	for j := 0; j < callsPerClient; j++ {
 		name := fmt.Sprintf("up%d__%s", (client+j)%numUpstreams, tools[j%len(tools)])
 		uid := nextTestID()
-		if err := checkEchoCall(srv, mcp.IntID(uid), name, uniqueMarker(uid)); err != nil {
+		if err := checkEchoCall(srv, mcp.IntID(uid), name, uniqueMarker(uid), sid); err != nil {
 			return fmt.Errorf("client %d call %d: %w", client, j, err)
 		}
 	}
@@ -207,11 +240,11 @@ func clientCycle(srv *httptest.Server, client, numUpstreams, callsPerClient int)
 // checkEchoCall performs one tools/call with a unique marker in the arguments
 // and verifies the FAKE_ECHO=1 upstream echoed back exactly that marker — proof
 // that the result belongs to this request, not to a concurrent one.
-func checkEchoCall(srv *httptest.Server, id json.RawMessage, tool, marker string) error {
+func checkEchoCall(srv *httptest.Server, id json.RawMessage, tool, marker, sid string) error {
 	msg, err := roundTrip(srv, mcp.NewRequest(id, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
 		Name:      tool,
 		Arguments: json.RawMessage(fmt.Sprintf(`{"marker":%q}`, marker)),
-	})))
+	})), sid)
 	if err != nil {
 		return err
 	}
@@ -285,9 +318,19 @@ func TestHTTPConcurrentCallsToSameUpstream(t *testing.T) {
 		wg.Add(1)
 		go func(client int) {
 			defer wg.Done()
+			// One session per "client": the handshake is part of the session
+			// now, so this test also puts 50 concurrent create/touch
+			// operations through the session store under -race.
+			sid, _, err := initSessionErr(srv, fmt.Sprintf("client-%d", client))
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("client %d: %w", client, err))
+				mu.Unlock()
+				return
+			}
 			for j := 0; j < callsPerClient; j++ {
 				uid := nextTestID()
-				if err := checkEchoCall(srv, mcp.IntID(uid), "up0__search", uniqueMarker(uid)); err != nil {
+				if err := checkEchoCall(srv, mcp.IntID(uid), "up0__search", uniqueMarker(uid), sid); err != nil {
 					mu.Lock()
 					errs = append(errs, fmt.Errorf("client %d call %d: %w", client, j, err))
 					mu.Unlock()

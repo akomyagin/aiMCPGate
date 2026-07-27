@@ -75,6 +75,11 @@ type httpServer struct {
 	addr string
 	cfg  func() *config.Config
 
+	// sessions holds the live client sessions keyed by Mcp-Session-Id
+	// (Stage 16, session.go). It is the only per-CLIENT state the HTTP
+	// transport keeps; everything else (registry, dispatcher) is per-process.
+	sessions *sessionStore
+
 	// onListen, when non-nil, is invoked with the bound listener address just
 	// before Serve starts accepting. Test hook only (the graceful-shutdown
 	// test needs the ephemeral port Serve bound); nil in production wiring.
@@ -87,9 +92,14 @@ func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger,
 		log: log,
 		// HTTP pushes list_changed over the GET SSE stream (Round 12) but has
 		// no channel for gateway→client REQUESTS, so no elicitation (Round 14).
-		d:    newDispatcher(reg, log, version, true, false), // HTTP: list_changed over SSE, but no server→client requests
-		addr: cfg.EffectiveListenAddr(),
-		cfg:  reg.ConfigSnapshot,
+		// Stage 16 built the session layer that such a channel needs (a
+		// server→client request must be addressed to a specific session's SSE
+		// stream, and its answer arrives on a POST carrying that session id),
+		// but deliberately stops there: the flag flips in Stage 17.
+		d:        newDispatcher(reg, log, version, true, false), // HTTP: list_changed over SSE, but no server→client requests
+		addr:     cfg.EffectiveListenAddr(),
+		cfg:      reg.ConfigSnapshot,
+		sessions: newSessionStore(),
 	}
 }
 
@@ -184,7 +194,9 @@ func originAllowed(origin string) bool {
 }
 
 // handleMCP is the single MCP endpoint. POST carries one client JSON-RPC
-// message; GET opens the server→client SSE stream (Round 12).
+// message; GET opens the server→client SSE stream (Round 12); DELETE
+// terminates the session named by Mcp-Session-Id (Stage 16). Anything else is
+// 405.
 //
 // Any request carrying an Origin header (i.e. sent by a browser) must come from
 // a localhost page, otherwise it is rejected 403 before any dispatch — a
@@ -203,6 +215,8 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 		s.handlePost(w, r)
 	case http.MethodGet:
 		s.handleSSE(w, r)
+	case http.MethodDelete:
+		s.handleDelete(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -223,12 +237,14 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 // each hold their own subscription — nothing extra is needed here; the gateway
 // is single-user by design but not single-stream.
 //
-// Unlike stdio there is no initialized gate: HTTP requests are stateless to
-// the gateway (no Mcp-Session-Id — the known limitation documented on
-// handlePost), so it cannot know whether "the" client has completed the
-// handshake. Opening the GET stream is taken as the client's own declaration
-// that it is ready for server→client traffic — a spec-conformant client only
-// opens it after initialize anyway.
+// The stream sits behind the session gate (Stage 16): GET without
+// Mcp-Session-Id is 400, with an unknown or expired one 404. A valid session
+// exists only after initialize, so this IS the handshake gate stdio has — and
+// it is what lets Stage 17 address a server→client request to the streams of
+// ONE session instead of broadcasting it to whoever happens to be listening.
+// While the stream is open it counts in the session's stream tally, which
+// holds off idle expiry; terminating the session (DELETE, or expiry once the
+// last stream is gone) closes done and ends the stream here.
 //
 // Stream resumption (Last-Event-ID) is deliberately NOT implemented — the
 // spec makes resumability optional, and replaying missed events has little
@@ -237,6 +253,13 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 // per-connection counter) so clients see well-formed SSE frames; honoring
 // Last-Event-ID is deferred until a real client needs it.
 func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.requireSession(w, r)
+	if !ok {
+		return
+	}
+	s.sessions.streamStarted(sess)
+	defer s.sessions.streamEnded(sess)
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		// Cannot happen with net/http's real ResponseWriter, but a middleware
@@ -307,6 +330,10 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 			// Client disconnected, or the process is shutting down (Serve
 			// derives every request context from its own ctx via BaseContext).
 			return
+		case <-sess.done:
+			// The session was terminated (DELETE /mcp, or swept as expired):
+			// its streams must not outlive it.
+			return
 		case <-catalogChanged:
 			if !writeEvent(mcp.NewNotification(mcp.NotifToolsListChanged, nil)) {
 				return
@@ -321,19 +348,95 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleDelete terminates the session named by Mcp-Session-Id (Stage 16): the
+// spec's explicit client-side "I am done" signal, which frees the session
+// state and ends its SSE streams instead of waiting out the idle timeout.
+// Missing header is 400, an unknown or already-terminated id is 404, success
+// is 204 with no body. It does NOT go through requireSession: terminate both
+// looks the session up and removes it, and touching a session we are about to
+// delete would be pointless.
+func (s *httpServer) handleDelete(w http.ResponseWriter, r *http.Request) {
+	sid := r.Header.Get(sessionHeader)
+	if sid == "" {
+		http.Error(w, "missing "+sessionHeader, http.StatusBadRequest)
+		return
+	}
+	if !s.sessions.terminate(sid) {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	s.log.Debug("http session terminated by client")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// sessionHeader is the Streamable HTTP session header, spelled exactly as the
+// spec does. Go's http.Header canonicalizes on both get and set, so the casing
+// here is for humans reading the code (and for the mirrored client-side use in
+// internal/upstream/http.go).
+const sessionHeader = "Mcp-Session-Id"
+
+// requireSession enforces the Stage 16 session gate for every request except
+// initialize: no header at all is 400, an unknown or expired id is 404. On
+// failure it has already written the response and reports ok=false.
+//
+// The bodies are plain text via http.Error, NOT JSON-RPC errors: this is the
+// transport layer, and a spec-conformant client reacts to the HTTP status (404
+// means "re-initialize") without parsing a body. The rule holds for
+// notifications too — the spec has the server answer with a status and no
+// body. Foreign session ids are never echoed back into the error text.
+func (s *httpServer) requireSession(w http.ResponseWriter, r *http.Request) (*httpSession, bool) {
+	sid := r.Header.Get(sessionHeader)
+	if sid == "" {
+		http.Error(w, "missing "+sessionHeader, http.StatusBadRequest)
+		return nil, false
+	}
+	sess, _, ok := s.sessions.touch(sid)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return nil, false
+	}
+	return sess, true
+}
+
 // handlePost decodes the single JSON-RPC message in the request body, dispatches
 // it, and replies: 202 Accepted with no body for a notification (nothing to
 // answer), or a single application/json JSON-RPC response for a request.
 //
-// Client identification (CallRecord.Client) is a KNOWN LIMITATION here: the
-// gateway issues no server-side session id (Mcp-Session-Id), so an HTTP
-// request after initialize carries nothing tying it back to the client that
-// initialized — requests are stateless to us. The client identity is therefore
-// attached (registry.WithClient) only to the initialize request ITSELF, whose
-// params carry clientInfo; every other request — tools/call included — is
-// audited with an empty Client over HTTP. Fixing this honestly requires
-// real session management, deliberately out of scope for this round.
+// Session handling (Stage 16). initialize is the ONE method that may arrive
+// without Mcp-Session-Id: it creates a session and the reply carries the new
+// id. Every other message — request, notification or response, ping included —
+// must carry a valid id: missing is 400, unknown/expired is 404. ping is
+// deliberately NOT given a second exemption even though the lifecycle spec
+// allows it before initialize: the transport rule ("everything after the id is
+// issued carries it") is stated at server level, and a client that wants to
+// ping can initialize first — cheaply and conformantly. An initialize that
+// DOES carry a valid id re-initializes that same session in place (its id is
+// kept and echoed), mirroring how the stdio dispatcher treats a repeated
+// handshake.
+//
+// Client identification (CallRecord.Client) rides on that session: the
+// clientInfo from initialize is stored once and attached (registry.WithClient)
+// to EVERY request of the session, so an HTTP tools/call is audited under the
+// client that actually made it. Before Stage 16 only the initialize request
+// itself could be attributed and everything else was logged with an empty
+// Client — and with several HTTP clients there was no way to tell them apart
+// at all.
 func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
+	// Ordering: a bad session id is rejected BEFORE the body is read (no point
+	// buffering 4 MiB for a request that cannot be served), but a request with
+	// NO header still gets decoded first, so a malformed body keeps answering
+	// with the JSON-RPC parse error it always did rather than a bare 400.
+	sid := r.Header.Get(sessionHeader)
+	var sess *httpSession
+	var sessClient string
+	if sid != "" {
+		var ok bool
+		if sess, sessClient, ok = s.sessions.touch(sid); !ok {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
 	var msg mcp.Message
@@ -345,10 +448,37 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	if msg.IsRequest() && msg.Method == mcp.MethodInitialize {
-		// Per-request only — see the limitation in the doc comment above.
-		ctx = registry.WithClient(ctx, clientString(msg.Params))
+	isInit := msg.IsRequest() && msg.Method == mcp.MethodInitialize
+	switch {
+	case sess == nil && !isInit:
+		http.Error(w, "missing "+sessionHeader, http.StatusBadRequest)
+		return
+	case sess == nil: // first initialize → new session
+		client := clientString(msg.Params)
+		var ok bool
+		if sess, ok = s.sessions.create(client, clientServerRequestCaps(msg.Params)); !ok {
+			http.Error(w, "too many sessions", http.StatusServiceUnavailable)
+			return
+		}
+		sessClient = client
+		s.log.Debug("http session created", "client", client)
+	case isInit: // re-initialize of a live session: same id, refreshed identity
+		sessClient = clientString(msg.Params)
+		if !s.sessions.reinit(sess, sessClient, clientServerRequestCaps(msg.Params)) {
+			// Lost a race with a concurrent DELETE that removed this exact
+			// session between touch and here (see reinit's doc comment) —
+			// answer as if the id had never been valid, and do NOT set the
+			// session header: that would echo a dead session's id as if the
+			// re-initialize had succeeded.
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	ctx := registry.WithClient(r.Context(), sessClient)
+	if isInit {
+		// Must be set before any WriteHeader below.
+		w.Header().Set(sessionHeader, sess.id)
 	}
 	reply := s.d.dispatch(ctx, &msg)
 	if reply == nil {

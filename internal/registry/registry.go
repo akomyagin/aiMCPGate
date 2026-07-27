@@ -2461,9 +2461,12 @@ func callOutcome(resp *mcp.Message, err error) (ok bool, errMsg string) {
 
 // audit writes one CallRecord. Arguments are never logged (may hold secrets).
 // The calling client's identity ("name/version" from its initialize, if the
-// transport attached one via WithClient) is read from ctx — empty when the
-// transport could not identify the client (see the HTTP limitation in
-// transport.handlePost).
+// transport attached one via WithClient) is read from ctx — empty only when
+// the transport never saw an initialize for this call at all. Since Stage 16
+// the HTTP transport attaches it via the session it maintains (see
+// transport/session.go), so it rides EVERY request of a session, not just the
+// initialize request itself — the same as stdio, where it comes from the
+// single process-wide handshake.
 func (r *Registry) audit(ctx context.Context, up, method, tool string, start time.Time, resp *mcp.Message, err error) {
 	if r.callLog == nil {
 		return

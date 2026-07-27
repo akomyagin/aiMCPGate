@@ -47,12 +47,13 @@ reload the config (add/remove/change upstreams) without restarting mcp-gate. An
 upstream that is down at a given moment is simply absent — there is no
 broken/disabled placeholder to filter out.
 
-Over stdio, mcp-gate advertises ` + "`listChanged: true`" + ` and sends you a
+mcp-gate advertises ` + "`listChanged: true`" + ` and sends you a
 ` + "`notifications/tools/list_changed`" + ` whenever the catalog changes — call
-` + "`tools/list`" + ` again when you receive one to refresh what you know. Over the
-HTTP transport there is no server→client channel, so you will NOT get that
-notification; instead just re-run ` + "`tools/list`" + ` when a tool you expect is
-missing.
+` + "`tools/list`" + ` again when you receive one to refresh what you know. Over stdio
+you always get it. Over the HTTP transport it only reaches you if you have an
+open GET ` + "`/mcp`" + ` SSE stream on your current session — a client that never opens
+one simply won't see it, so if a tool you expect is missing, re-run
+` + "`tools/list`" + ` first rather than waiting for a notification that may not come.
 
 So: if a tool you expect is missing, re-check ` + "`tools/list`" + ` first (it may be
 under a different upstream prefix than you assumed, or a just-crashed upstream

@@ -21,13 +21,14 @@
 > результата / таймаут), lazy-каталог и пагинацию `tools/list`, SSE-стримы
 > server→client с обеих сторон и проксирование `elicitation/create` (только
 > stdio↔stdio). Смержено после v0.3.0, но ещё не выпущено: проксирование
-> `sampling/createMessage` и `roots/list` (тоже только stdio↔stdio) и честное
+> `sampling/createMessage` и `roots/list` (тоже только stdio↔stdio), честное
 > объявление capabilities upstream'ам — шлюз предлагает upstream'у ровно то,
-> что заявил его собственный клиент, а не безусловное `{}`.
+> что заявил его собственный клиент, а не безусловное `{}`, — и серверные
+> сессии `Mcp-Session-Id` в HTTP-транспорте с терминацией по `DELETE /mcp`.
 >
 > **Не реализовано:** server→client-запросы через HTTP-транспорт — то есть
 > `elicitation`, `sampling` и `roots` одинаково, при HTTP с любой из сторон, —
-> политика доступа per-client и терминация сессии `DELETE /mcp`.
+> и политика доступа per-client.
 
 ## Релизы
 
@@ -129,7 +130,8 @@ go run ./cmd version
 # stdio-режим (клиент запускает шлюз как подпроцесс):
 mcp-gate serve --config ./config.yaml
 
-# http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp:
+# http-режим (transport: http в конфиге) — эндпоинт на http://<listen_addr>/mcp;
+# каждый запрос после initialize несёт выданный Mcp-Session-Id (см. ниже):
 mcp-gate serve --config ./config-http.yaml
 
 # проверить каждый включённый upstream один раз (запуск → handshake → tools/list)
@@ -179,6 +181,35 @@ mcp-gate completion bash > /etc/bash_completion.d/mcp-gate
 минимальный парсер `KEY=VALUE`, применяемый **до** загрузки конфига, поэтому
 ссылки `${VAR}` внутри конфига резолвятся из этого файла. Реальное окружение
 процесса всегда важнее файла.
+
+### HTTP-сессии (`Mcp-Session-Id`)
+
+В http-режиме шлюз ведёт сессии Streamable HTTP: ответ на `initialize` несёт
+заголовок **`Mcp-Session-Id`**, и каждый последующий запрос — POST, GET-SSE-стрим,
+DELETE — обязан присылать его обратно. Без заголовка ответ **400**; с неизвестным
+или истёкшим id — **404**, что означает «переинициализируйся». Сессия
+освобождается по **`DELETE /mcp`** (204) либо после 30 минут без запросов —
+открытый SSE-стрим считается активностью и держит её живой.
+
+MCP-клиенты делают всё это сами. Для ручных вызовов через `curl` возьмите
+заголовок из ответа на initialize и присылайте его обратно:
+
+```bash
+SID=$(curl -sD - -o /dev/null -X POST http://127.0.0.1:28080/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' \
+  | tr -d '\r' | awk -F': ' '/^[Mm]cp-[Ss]ession-[Ii]d/{print $2}')
+
+curl -s -X POST http://127.0.0.1:28080/mcp \
+  -H 'Content-Type: application/json' -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+curl -s -X DELETE http://127.0.0.1:28080/mcp -H "Mcp-Session-Id: $SID"
+```
+
+Сессия делает честным и журнал вызовов: каждый вызов пишется под `clientInfo`
+той сессии, которая его сделала, поэтому несколько HTTP-клиентов различимы в
+`calls.jsonl`, а не делят одно пустое поле `client`.
 
 ## Перезагрузка конфига (SIGHUP)
 
