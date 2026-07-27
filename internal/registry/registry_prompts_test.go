@@ -35,8 +35,8 @@ func promptCatalog(r *Registry) map[string]string {
 // the recorded prompts over instead of losing them.
 func TestRegistryAggregatesAndNamespacesPrompts(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "bare", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "bare", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"docs": {name: "docs", tools: []string{"search"}, caps: promptsCaps, prompts: []string{"summarize", "review"}},
@@ -84,8 +84,8 @@ func TestRegistryAggregatesAndNamespacesPrompts(t *testing.T) {
 // as tools.
 func TestRegistryPromptCollisionKeepFirst(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "alpha", Enabled: true},
-		{Name: "alpha__x", Enabled: true},
+		{Name: "alpha", Enabled: boolPtr(true)},
+		{Name: "alpha__x", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"alpha":    {name: "alpha", tools: []string{"a"}, caps: promptsCaps, prompts: []string{"x__p"}},
@@ -124,8 +124,8 @@ func TestRegistryPromptCollisionKeepFirst(t *testing.T) {
 // other upstream is never touched.
 func TestRegistryGetPromptRoutesAndRewritesName(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	docs := &fakeUpstream{name: "docs", tools: []string{"a"}, caps: promptsCaps, prompts: []string{"greet"}}
 	web := &fakeUpstream{name: "web", tools: []string{"b"}, caps: promptsCaps, prompts: []string{"greet"}}
@@ -160,7 +160,7 @@ func TestRegistryGetPromptRoutesAndRewritesName(t *testing.T) {
 // TestRegistryGetPromptUnknownErrors: an unrouted name yields a clean error,
 // naming only the prompt the client itself asked for.
 func TestRegistryGetPromptUnknownErrors(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "docs", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "docs", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"docs": {name: "docs", tools: []string{"a"}, caps: promptsCaps, prompts: []string{"greet"}},
 	})
@@ -192,7 +192,7 @@ func (p *panicListPromptsUpstream) ListPrompts(context.Context) ([]mcp.Prompt, e
 // declares no "prompts" capability must never receive prompts/list at all —
 // not merely have its (error) result discarded.
 func TestRegistryNoListPromptsWithoutCapability(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "bare", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "bare", Enabled: boolPtr(true)}}}
 	bare := &panicListPromptsUpstream{
 		fakeUpstream: &fakeUpstream{name: "bare", tools: []string{"a"}, caps: json.RawMessage(`{"tools":{}}`)},
 	}
@@ -213,7 +213,7 @@ func TestRegistryNoListPromptsWithoutCapability(t *testing.T) {
 // its tools still come up, Start does not fail, the catalog just has no
 // prompts from it (best-effort, unlike the fatal tools/list).
 func TestRegistryListPromptsErrorDoesNotFailLaunch(t *testing.T) {
-	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "flaky", Enabled: true}}}
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "flaky", Enabled: boolPtr(true)}}}
 	r := newTestRegistry(t, cfg, nil, map[string]*fakeUpstream{
 		"flaky": {name: "flaky", tools: []string{"a"}, caps: promptsCaps,
 			prompts: []string{"greet"}, promptsErr: errors.New("prompts exploded")},
@@ -237,8 +237,8 @@ func TestRegistryListPromptsErrorDoesNotFailLaunch(t *testing.T) {
 // and prompts/get against the dropped name fails cleanly.
 func TestRegistryDropUpstreamClearsPrompts(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "docs", Enabled: true},
-		{Name: "web", Enabled: true},
+		{Name: "docs", Enabled: boolPtr(true)},
+		{Name: "web", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"docs": {name: "docs", tools: []string{"a"}, caps: promptsCaps, prompts: []string{"summarize"}},

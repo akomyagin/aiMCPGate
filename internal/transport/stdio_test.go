@@ -67,14 +67,14 @@ func startServer(t *testing.T, twoUpstreams bool) (*fakeClient, context.CancelFu
 	bin := buildFakeServer(t)
 
 	ups := []config.Upstream{
-		{Name: "github", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "github", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "github",
 			"FAKE_TOOLS": "search,create_issue",
 			"FAKE_ECHO":  "1",
 		}},
 	}
 	if twoUpstreams {
-		ups = append(ups, config.Upstream{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		ups = append(ups, config.Upstream{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "web",
 			"FAKE_TOOLS": "search,fetch", // "search" collides with github__search
 			"FAKE_ECHO":  "1",
@@ -213,7 +213,7 @@ func TestStdioPushesListChangedOnCatalogChange(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "crasher", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -271,7 +271,7 @@ func TestStdioNoListChangedBeforeInitialize(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "eager", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "eager", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":           "ping",
 				"FAKE_NOTIFY_ON_START": "1",
 			}},
@@ -442,7 +442,7 @@ func TestStdioResourcesListIsEmpty(t *testing.T) {
 func TestStdioCallLogHasNoSecrets(t *testing.T) {
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "web",
 			"FAKE_TOOLS": "fetch",
 			"FAKE_ECHO":  "1",
@@ -481,7 +481,7 @@ func TestStdioCallTimeoutSurfacesError(t *testing.T) {
 	cfg := &config.Config{
 		CallTimeout: 300 * time.Millisecond,
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":       "web",
 				"FAKE_TOOLS":      "fetch",
 				"FAKE_CALL_DELAY": "3s",
@@ -529,7 +529,7 @@ func oneUpstreamConfig(t *testing.T) *config.Config {
 	t.Helper()
 	bin := buildFakeServer(t)
 	return &config.Config{Upstreams: []config.Upstream{
-		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "web",
 			"FAKE_TOOLS": "fetch",
 		}},
@@ -693,7 +693,7 @@ func TestStdioToolsCallForwardsMetaEndToEnd(t *testing.T) {
 func TestStdioForwardsProgressDuringToolsCall(t *testing.T) {
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":     "web",
 			"FAKE_TOOLS":    "fetch",
 			"FAKE_ECHO":     "1",
@@ -751,7 +751,7 @@ func TestStdioDropsProgressBeforeInitialize(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":         "fetch",
 				"FAKE_PROGRESS_FILE": progressFile,
 			}},
@@ -832,12 +832,12 @@ func TestStdioConcurrentToolsCallsDoNotBlock(t *testing.T) {
 	bin := buildFakeServer(t)
 	const slowDelay = 3 * time.Second
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "slow", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":       "slow",
 			"FAKE_TOOLS":      "hang",
 			"FAKE_CALL_DELAY": slowDelay.String(),
 		}},
-		{Name: "fast", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "fast", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "fast",
 			"FAKE_TOOLS": "quick",
 			"FAKE_ECHO":  "1",
@@ -886,7 +886,7 @@ func TestStdioCancelledAbortsInFlightCall(t *testing.T) {
 	bin := buildFakeServer(t)
 	cancelFile := filepath.Join(t.TempDir(), "cancelled.jsonl")
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "slow", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":        "slow",
 			"FAKE_TOOLS":       "hang",
 			"FAKE_CALL_DELAY":  "30s",
@@ -969,13 +969,13 @@ func TestStdioCancelledAbortsInFlightCall(t *testing.T) {
 func TestStdioInitializeAggregatesInstructions(t *testing.T) {
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "zeta", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "zeta", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS": "z", "FAKE_INSTRUCTIONS": "Zeta usage notes.",
 		}},
-		{Name: "alpha", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "alpha", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS": "a", "FAKE_INSTRUCTIONS": "Alpha usage notes.",
 		}},
-		{Name: "quiet", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "quiet", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS": "q",
 		}},
 	}}

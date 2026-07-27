@@ -30,7 +30,7 @@ import (
 func TestReloadBeforeStartRejected(t *testing.T) {
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
-		Upstreams: []config.Upstream{{Name: "never", Command: "true", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "never", Command: "true", Enabled: boolPtr(true)}},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	defer r.Close()
@@ -49,7 +49,7 @@ func TestCloseThenReloadRejected(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "a"}},
+			{Name: "one", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "a"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -77,7 +77,7 @@ func TestCloseThenReloadRejected(t *testing.T) {
 func TestConcurrentReloadAndClose(t *testing.T) {
 	bin := buildFakeServer(t)
 	up := func(name, tools string) config.Upstream {
-		return config.Upstream{Name: name, Command: bin, Enabled: true,
+		return config.Upstream{Name: name, Command: bin, Enabled: boolPtr(true),
 			Env: map[string]string{"FAKE_TOOLS": tools}}
 	}
 	cfg := &config.Config{

@@ -117,6 +117,10 @@ func (h *addrCapture) Handle(_ context.Context, rec slog.Record) error {
 	return nil
 }
 
+// boolPtr is a tiny helper for config.Upstream.Enabled (*bool: nil = key
+// absent in YAML = enabled).
+func boolPtr(b bool) *bool { return &b }
+
 func noopPayloadLog(t *testing.T) logging.PayloadLog {
 	t.Helper()
 	p, err := logging.NewPayloadLog("")
@@ -141,7 +145,7 @@ func startHTTPGateway(t *testing.T) string {
 		Transport:  config.TransportHTTP,
 		ListenAddr: "127.0.0.1:0", // ephemeral port; discovered via addrCapture
 		Upstreams: []config.Upstream{
-			{Name: "demo", URL: upstream.URL, Enabled: true}, // kind inferred http
+			{Name: "demo", URL: upstream.URL, Enabled: boolPtr(true)}, // kind inferred http
 		},
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))

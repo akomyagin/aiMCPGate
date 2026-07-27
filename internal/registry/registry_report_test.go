@@ -17,9 +17,9 @@ import (
 // the assertion does not depend on config order).
 func TestStartReportListsSuccessesAndFailures(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "good", Enabled: true},
-		{Name: "broken", Enabled: true},
-		{Name: "disabled", Enabled: false},
+		{Name: "good", Enabled: boolPtr(true)},
+		{Name: "broken", Enabled: boolPtr(true)},
+		{Name: "disabled", Enabled: boolPtr(false)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"good":     {name: "good", tools: []string{"a", "b"}},
@@ -54,8 +54,8 @@ func TestStartReportListsSuccessesAndFailures(t *testing.T) {
 // the doctor table is printed instead of a bare error.
 func TestStartReportAllFailed(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "b1", Enabled: true},
-		{Name: "b2", Enabled: true},
+		{Name: "b1", Enabled: boolPtr(true)},
+		{Name: "b2", Enabled: boolPtr(true)},
 	}}
 	fakes := map[string]*fakeUpstream{
 		"b1": {name: "b1", initErr: errors.New("boom1")},
@@ -93,7 +93,7 @@ func TestNoSuperviseSkipsRestart(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "once", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "once", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",

@@ -70,7 +70,7 @@ func TestSupervisorRestartsCrashedUpstream(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "crasher", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -123,7 +123,7 @@ func TestSupervisorRestartKeepsElicitationDeclaration(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "crasher", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -220,7 +220,7 @@ func TestSupervisorReapsCrashedProcess(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "crasher", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -291,7 +291,7 @@ func TestSupervisorGivesUpAndDrops(t *testing.T) {
 			MaxAttempts:    2,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "doomed", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "doomed", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -328,7 +328,7 @@ func TestSupervisorDisabled(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "solo", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "solo", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -366,7 +366,7 @@ func TestSupervisorStopsCleanlyOnClose(t *testing.T) {
 			MaxAttempts:    0, // unlimited: the supervisor would loop forever if Close did not stop it
 		},
 		Upstreams: []config.Upstream{
-			{Name: "flapper", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "flapper", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "ping",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -429,7 +429,7 @@ func TestRestartGiveUpDoesNotDropReplacedConn(t *testing.T) {
 			MaxBackoff:     5 * time.Millisecond,
 			MaxAttempts:    1, // one failing relaunch, then give-up
 		},
-		Upstreams: []config.Upstream{{Name: "up", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "up", Enabled: boolPtr(true)}},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	r.start = func(_ context.Context, u config.Upstream) (Upstream, error) {
@@ -520,7 +520,7 @@ func TestUpstreamListChangedRefreshesCatalog(t *testing.T) {
 		// re-list, not a spurious auto-restart.
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "dyn", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "dyn", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS_FILE":  toolsFile,
 				"FAKE_NOTIFY_FILE": notifyFile,
 			}},
@@ -562,7 +562,7 @@ func TestUpstreamListChangedNotifiesSubscribers(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "dyn", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "dyn", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS_FILE":  toolsFile,
 				"FAKE_NOTIFY_FILE": notifyFile,
 			}},
@@ -630,7 +630,7 @@ func TestSupervisorLogsStderrTailOnCrash(t *testing.T) {
 			MaxAttempts:    5,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "crasher", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "crasher", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":        "ping",
 				"FAKE_ECHO":         "1",
 				"FAKE_EXIT_AFTER":   "1",

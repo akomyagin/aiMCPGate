@@ -39,8 +39,8 @@ func startLoggingServer(t *testing.T, loggyExtraEnv map[string]string) (c *fakeC
 		loggyEnv[k] = v
 	}
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "loggy", Command: bin, Enabled: true, Env: loggyEnv},
-		{Name: "bare", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "loggy", Command: bin, Enabled: boolPtr(true), Env: loggyEnv},
+		{Name: "bare", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":          "bare",
 			"FAKE_TOOLS":         "fetch",
 			"FAKE_SETLEVEL_FILE": bareFile,

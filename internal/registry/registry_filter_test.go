@@ -277,11 +277,11 @@ func TestTruncateJSONStringNonString(t *testing.T) {
 // client-facing name and routed to the upstream under the ORIGINAL name.
 func TestRegistryAppliesToolFilter(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "gh", Enabled: true, Tools: config.ToolFilter{
+		{Name: "gh", Enabled: boolPtr(true), Tools: config.ToolFilter{
 			Deny:   []string{"delete_repo"},
 			Rename: map[string]string{"search": "gh_search"},
 		}},
-		{Name: "web", Enabled: true}, // no filter: everything passes through
+		{Name: "web", Enabled: boolPtr(true)}, // no filter: everything passes through
 	}}
 	gh := &fakeUpstream{name: "gh", tools: []string{"search", "create_issue", "delete_repo"}}
 	web := &fakeUpstream{name: "web", tools: []string{"fetch"}}
@@ -326,7 +326,7 @@ func TestRegistryAppliesToolFilter(t *testing.T) {
 // advertisement.
 func TestStartReportCountsFilteredTools(t *testing.T) {
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "gh", Enabled: true, Tools: config.ToolFilter{
+		{Name: "gh", Enabled: boolPtr(true), Tools: config.ToolFilter{
 			Allow: []string{"search"},
 		}},
 	}}
@@ -364,7 +364,7 @@ func TestReloadFilterOnlyDoesNotRelaunch(t *testing.T) {
 	if err := os.WriteFile(toolsFile, []byte("alpha,beta"), 0o600); err != nil {
 		t.Fatalf("seed tools file: %v", err)
 	}
-	base := config.Upstream{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{
+	base := config.Upstream{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 		"FAKE_TOOLS_FILE": toolsFile,
 		"FAKE_ECHO":       "1",
 	}}
@@ -445,7 +445,7 @@ func TestReloadAllowExpansionRestoresFilteredTool(t *testing.T) {
 	if err := os.WriteFile(toolsFile, []byte("alpha,beta"), 0o600); err != nil {
 		t.Fatalf("seed tools file: %v", err)
 	}
-	base := config.Upstream{Name: "svc", Command: bin, Enabled: true,
+	base := config.Upstream{Name: "svc", Command: bin, Enabled: boolPtr(true),
 		Env:   map[string]string{"FAKE_TOOLS_FILE": toolsFile},
 		Tools: config.ToolFilter{Allow: []string{"alpha"}},
 	}

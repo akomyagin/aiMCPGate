@@ -61,7 +61,7 @@ func startHTTPGatewayMulti(t *testing.T, n int) (*httptest.Server, func()) {
 	ups := make([]config.Upstream, 0, n)
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("up%d", i)
-		ups = append(ups, config.Upstream{Name: name, Command: bin, Enabled: true, Env: map[string]string{
+		ups = append(ups, config.Upstream{Name: name, Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  name,
 			"FAKE_TOOLS": "search,fetch",
 			"FAKE_ECHO":  "1",

@@ -84,6 +84,11 @@ call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 # `mcp-gate skill` with no config gives you the default text as a starting point.
 # skill_file: ./skill.md
 
+# Every upstream below writes `enabled` out explicitly — clearer in an example.
+# Defaults if omitted: enabled. Only an explicit `enabled: false` keeps an
+# upstream out of the gateway (it is then skipped by serve, doctor and the
+# aggregated catalog alike) — a valueless `enabled:` counts as omitted, so
+# commenting the value out does NOT disable the upstream.
 upstreams:
   # stdio upstream: a local MCP server launched as a child process.
   - name: filesystem                       # ^[a-zA-Z0-9_-]+$ (namespacing)

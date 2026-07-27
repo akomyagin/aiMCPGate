@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,7 @@ func hasTool(r *Registry, ns string) bool {
 func TestReloadAddsAndRemovesUpstreams(t *testing.T) {
 	bin := buildFakeServer(t)
 	base := func(name, tools string) config.Upstream {
-		return config.Upstream{Name: name, Command: bin, Enabled: true, Env: map[string]string{
+		return config.Upstream{Name: name, Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS": tools,
 			"FAKE_ECHO":  "1",
 		}}
@@ -75,7 +76,7 @@ func TestReloadedUpstreamKeepsElicitationDeclaration(t *testing.T) {
 	capsAlpha := filepath.Join(dir, "caps-alpha")
 	capsBeta := filepath.Join(dir, "caps-beta")
 	withCaps := func(name, tools, capsFile string) config.Upstream {
-		return config.Upstream{Name: name, Command: bin, Enabled: true, Env: map[string]string{
+		return config.Upstream{Name: name, Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS":     tools,
 			"FAKE_CAPS_FILE": capsFile,
 		}}
@@ -122,7 +123,7 @@ func TestReloadChangedUpstreamRelaunches(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "old"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -136,7 +137,7 @@ func TestReloadChangedUpstreamRelaunches(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "new"}},
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "new"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -155,7 +156,7 @@ func TestReloadChangedUpstreamRelaunches(t *testing.T) {
 // working continuously.
 func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 	bin := buildFakeServer(t)
-	up := config.Upstream{Name: "keep", Command: bin, Enabled: true, Env: map[string]string{
+	up := config.Upstream{Name: "keep", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 		"FAKE_TOOLS": "k",
 		"FAKE_ECHO":  "1",
 	}}
@@ -176,7 +177,7 @@ func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
 			up,
-			{Name: "extra", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "e"}},
+			{Name: "extra", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "e"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -197,8 +198,8 @@ func TestReloadUnchangedUpstreamLeftRunning(t *testing.T) {
 // enabled:false in the reloaded config removes it (treated as a removal).
 func TestReloadDisabledUpstreamRemoved(t *testing.T) {
 	bin := buildFakeServer(t)
-	on := config.Upstream{Name: "toggle", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "t"}}
-	stay := config.Upstream{Name: "stay", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "s"}}
+	on := config.Upstream{Name: "toggle", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "t"}}
+	stay := config.Upstream{Name: "stay", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "s"}}
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{on, stay},
@@ -211,7 +212,7 @@ func TestReloadDisabledUpstreamRemoved(t *testing.T) {
 	waitForTool(t, r, "toggle__t", 2*time.Second)
 
 	off := on
-	off.Enabled = false
+	off.Enabled = boolPtr(false)
 	newCfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{off, stay},
@@ -226,6 +227,116 @@ func TestReloadDisabledUpstreamRemoved(t *testing.T) {
 	}
 }
 
+// TestReloadEnabledKeyOmittedRoundTrip walks the reload diff through all three
+// states of the `enabled:` key, starting from the one the pointer type exists
+// for: NO key at all. The upstream must be live after Start, disappear on an
+// explicit enabled:false, and come back when the key is dropped again — the
+// diff must read "key absent" as enabled on BOTH of its sides (the newCfg scan
+// and enabledByName's index of old/new), or a toggle would strand an upstream
+// that is neither added nor removed.
+func TestReloadEnabledKeyOmittedRoundTrip(t *testing.T) {
+	bin := buildFakeServer(t)
+	// Deliberately no Enabled field: this is the config a user hand-writes.
+	implicit := config.Upstream{Name: "implicit", Command: bin, Env: map[string]string{"FAKE_TOOLS": "t"}}
+	stay := config.Upstream{Name: "stay", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "s"}}
+	newConfig := func(u config.Upstream) *config.Config {
+		return &config.Config{
+			Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+			Upstreams: []config.Upstream{u, stay},
+		}
+	}
+
+	r := New(newConfig(implicit), quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	// Start alone already proves the default: without it the fake never launches.
+	waitForTool(t, r, "implicit__t", 2*time.Second)
+
+	off := implicit
+	off.Enabled = boolPtr(false)
+	if err := r.Reload(context.Background(), newConfig(off)); err != nil {
+		t.Fatalf("Reload (disable): %v", err)
+	}
+	waitForNoTool(t, r, "implicit__t", 2*time.Second)
+
+	// Back to the key being absent: the diff must treat it as an addition.
+	if err := r.Reload(context.Background(), newConfig(implicit)); err != nil {
+		t.Fatalf("Reload (re-enable by omitting the key): %v", err)
+	}
+	waitForTool(t, r, "implicit__t", 2*time.Second)
+
+	if !hasTool(r, "stay__s") {
+		t.Error("stay__s should remain across both reloads")
+	}
+}
+
+// TestReloadEnabledMadeExplicitLeavesUpstreamRunning covers the transition the
+// round-trip above does NOT: absent key → explicit enabled:true (and back).
+// Both sides mean "enabled", so the diff must classify the upstream as
+// UNCHANGED and leave the child process alone — a spurious relaunch would kill
+// in-flight calls for a config edit that changed nothing semantically.
+//
+// "Left alone" is asserted on the reload's own log records rather than on the
+// tool still being present: a torn-down-and-relaunched upstream ends up with
+// its tools back too, so the catalog cannot tell the two apart. Reload logs
+// "upstream reconfigured by reload" for a CHANGED upstream (registry.go:2076)
+// and "upstream added by reload" for a new one (:2080); an unchanged upstream
+// produces neither. Making SameLaunch compare Enabled — the obvious wrong
+// implementation — turns nil→true into "reconfigured" and reddens this test.
+func TestReloadEnabledMadeExplicitLeavesUpstreamRunning(t *testing.T) {
+	bin := buildFakeServer(t)
+	// No Enabled field: the hand-written config the pointer type exists for.
+	implicit := config.Upstream{Name: "implicit", Command: bin, Env: map[string]string{
+		"FAKE_TOOLS": "t",
+		"FAKE_ECHO":  "1",
+	}}
+	newConfig := func(u config.Upstream) *config.Config {
+		return &config.Config{
+			Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+			Upstreams: []config.Upstream{u},
+		}
+	}
+
+	logBuf := &syncLogBuffer{}
+	r := New(newConfig(implicit), slog.New(slog.NewTextHandler(logBuf, nil)), nil, noopPayloadLog(), true, "0.0.0-test")
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	waitForTool(t, r, "implicit__t", 2*time.Second)
+
+	assertLeftAlone := func(step string) {
+		t.Helper()
+		for _, rec := range []string{
+			"upstream reconfigured by reload",
+			"upstream added by reload",
+			"upstream removed by reload",
+		} {
+			if strings.Contains(logBuf.String(), rec) {
+				t.Errorf("%s: upstream must be UNCHANGED, but reload logged %q", step, rec)
+			}
+		}
+		if _, err := r.CallTool(context.Background(), "implicit__t", []byte(`{}`), nil); err != nil {
+			t.Errorf("%s: upstream not callable after reload: %v", step, err)
+		}
+	}
+
+	explicit := implicit
+	explicit.Enabled = boolPtr(true)
+	if err := r.Reload(context.Background(), newConfig(explicit)); err != nil {
+		t.Fatalf("Reload (nil → true): %v", err)
+	}
+	assertLeftAlone("nil → true")
+
+	// And back: dropping the key again is just as much a no-op.
+	if err := r.Reload(context.Background(), newConfig(implicit)); err != nil {
+		t.Fatalf("Reload (true → nil): %v", err)
+	}
+	assertLeftAlone("true → nil")
+}
+
 // TestReloadNotifiesSubscribers checks a reload fans out one catalog-change
 // signal to subscribers (so the client is told to re-list).
 func TestReloadNotifiesSubscribers(t *testing.T) {
@@ -233,7 +344,7 @@ func TestReloadNotifiesSubscribers(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "1"}},
+			{Name: "one", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "1"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -248,8 +359,8 @@ func TestReloadNotifiesSubscribers(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "one", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "1"}},
-			{Name: "two", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "2"}},
+			{Name: "one", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "1"}},
+			{Name: "two", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "2"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -277,8 +388,8 @@ func TestReloadRetiredSupervisorDoesNotRestart(t *testing.T) {
 			MaxAttempts:    0, // unlimited: a leaked supervisor would resurrect it forever
 		},
 		Upstreams: []config.Upstream{
-			{Name: "gone", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "g"}},
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "gone", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "g"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -291,7 +402,7 @@ func TestReloadRetiredSupervisorDoesNotRestart(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: cfg.Restart,
 		Upstreams: []config.Upstream{
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -336,7 +447,7 @@ func TestReloadRemovedUpstreamNotResurrectedByRestart(t *testing.T) {
 			MaxAttempts:    0, // unlimited: a resurrecting supervisor would bring it back forever
 		},
 		Upstreams: []config.Upstream{
-			{Name: "gone", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "gone", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "g",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -345,7 +456,7 @@ func TestReloadRemovedUpstreamNotResurrectedByRestart(t *testing.T) {
 				// pinning the restart inside launch() while Reload runs.
 				"FAKE_INIT_DELAY": "500ms",
 			}},
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -369,7 +480,7 @@ func TestReloadRemovedUpstreamNotResurrectedByRestart(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: cfg.Restart,
 		Upstreams: []config.Upstream{
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -408,7 +519,7 @@ func TestReloadChangedUpstreamNotDoubledByRestart(t *testing.T) {
 			MaxAttempts:    0,
 		},
 		Upstreams: []config.Upstream{
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "old",
 				"FAKE_ECHO":       "1",
 				"FAKE_EXIT_AFTER": "1",
@@ -439,7 +550,7 @@ func TestReloadChangedUpstreamNotDoubledByRestart(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: cfg.Restart,
 		Upstreams: []config.Upstream{
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS": "new",
 				"FAKE_ECHO":  "1",
 			}},
@@ -487,7 +598,7 @@ func TestReloadUpdatesRestartPolicyForUnchangedUpstream(t *testing.T) {
 		t.Fatalf("write disposable binary: %v", err)
 	}
 
-	up := config.Upstream{Name: "phoenix", Command: bin, Enabled: true, Env: map[string]string{
+	up := config.Upstream{Name: "phoenix", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 		"FAKE_TOOLS":      "ping",
 		"FAKE_ECHO":       "1",
 		"FAKE_EXIT_AFTER": "1",
@@ -548,7 +659,7 @@ func TestReloadUpdatesRestartPolicyForUnchangedUpstream(t *testing.T) {
 // merge all 5 into the catalog, with the pre-existing upstream untouched.
 func TestReloadParallelBringUpManyUpstreams(t *testing.T) {
 	bin := buildFakeServer(t)
-	base := config.Upstream{Name: "base", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "b"}}
+	base := config.Upstream{Name: "base", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "b"}}
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base},
@@ -563,7 +674,7 @@ func TestReloadParallelBringUpManyUpstreams(t *testing.T) {
 	ups := []config.Upstream{base}
 	for i := 1; i <= 5; i++ {
 		ups = append(ups, config.Upstream{
-			Name: fmt.Sprintf("add%d", i), Command: bin, Enabled: true,
+			Name: fmt.Sprintf("add%d", i), Command: bin, Enabled: boolPtr(true),
 			Env: map[string]string{"FAKE_TOOLS": fmt.Sprintf("t%d", i)},
 		})
 	}
@@ -596,7 +707,7 @@ func TestReloadParallelBringUpManyUpstreams(t *testing.T) {
 func TestReloadRemovedFreedNameReusedByAdded(t *testing.T) {
 	bin := buildFakeServer(t)
 	first := config.Upstream{
-		Name: "first", Command: bin, Enabled: true,
+		Name: "first", Command: bin, Enabled: boolPtr(true),
 		Env:   map[string]string{"FAKE_TOOLS": "a"},
 		Tools: config.ToolFilter{Rename: map[string]string{"a": "shared_name"}},
 	}
@@ -612,7 +723,7 @@ func TestReloadRemovedFreedNameReusedByAdded(t *testing.T) {
 	waitForTool(t, r, "shared_name", 2*time.Second)
 
 	second := config.Upstream{
-		Name: "second", Command: bin, Enabled: true,
+		Name: "second", Command: bin, Enabled: boolPtr(true),
 		Env:   map[string]string{"FAKE_TOOLS": "b"},
 		Tools: config.ToolFilter{Rename: map[string]string{"b": "shared_name"}},
 	}
@@ -649,7 +760,7 @@ func TestReloadRemovedFreedNameReusedByAdded(t *testing.T) {
 // shared results slice.
 func TestReloadParallelMergeOrderDeterministic(t *testing.T) {
 	bin := buildFakeServer(t)
-	base := config.Upstream{Name: "base", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "b"}}
+	base := config.Upstream{Name: "base", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "b"}}
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{base},
@@ -661,14 +772,14 @@ func TestReloadParallelMergeOrderDeterministic(t *testing.T) {
 	defer r.Close()
 	waitForTool(t, r, "base__b", 2*time.Second)
 
-	one := config.Upstream{Name: "one", Command: bin, Enabled: true, Env: map[string]string{
+	one := config.Upstream{Name: "one", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 		"FAKE_TOOLS": "t",
 		// Slow launch: "one" reliably finishes AFTER "two", inverting the
 		// config order at the goroutine-completion level.
 		"FAKE_INIT_DELAY": "300ms",
 	}}
 	two := config.Upstream{
-		Name: "two", Command: bin, Enabled: true,
+		Name: "two", Command: bin, Enabled: boolPtr(true),
 		Env:   map[string]string{"FAKE_TOOLS": "z"},
 		Tools: config.ToolFilter{Rename: map[string]string{"z": "one__t"}},
 	}
@@ -717,7 +828,7 @@ func TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch(t *testing.T) 
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "old"}},
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "old"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -731,10 +842,10 @@ func TestReloadChangedUpstreamDroppedEarlyDuringSlowSiblingLaunch(t *testing.T) 
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
 			// Same name, different env → CHANGED; its own relaunch is instant.
-			{Name: "svc", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "new"}},
+			{Name: "svc", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "new"}},
 			// ADDED sibling whose 500ms initialize stall holds the whole
 			// errgroup — and with it the sequential merge pass — open.
-			{Name: "slow", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "slow", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS":      "s",
 				"FAKE_INIT_DELAY": "500ms",
 			}},
@@ -819,8 +930,8 @@ func TestRelistStaleResultDiscardedAfterReloadRemoved(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "dyn", Enabled: true},
-			{Name: "keep", Enabled: true},
+			{Name: "dyn", Enabled: boolPtr(true)},
+			{Name: "keep", Enabled: boolPtr(true)},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -853,7 +964,7 @@ func TestRelistStaleResultDiscardedAfterReloadRemoved(t *testing.T) {
 	// While it is in flight, a reload removes dyn entirely.
 	newCfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
-		Upstreams: []config.Upstream{{Name: "keep", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "keep", Enabled: boolPtr(true)}},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
 		t.Fatalf("Reload: %v", err)
@@ -891,7 +1002,7 @@ func TestRelistStaleResultDiscardedAfterReloadChanged(t *testing.T) {
 	dynNew := &fakeUpstream{name: "dyn", tools: []string{"b"}}
 	cfg := &config.Config{
 		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
-		Upstreams: []config.Upstream{{Name: "dyn", Enabled: true}},
+		Upstreams: []config.Upstream{{Name: "dyn", Enabled: boolPtr(true)}},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
 	var startMu sync.Mutex
@@ -928,7 +1039,7 @@ func TestRelistStaleResultDiscardedAfterReloadChanged(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "dyn", Enabled: true, Env: map[string]string{"V": "2"}},
+			{Name: "dyn", Enabled: boolPtr(true), Env: map[string]string{"V": "2"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -980,14 +1091,14 @@ func TestReloadRemovedUpstreamNotResurrectedByStaleRelist(t *testing.T) {
 	cfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "dyn", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "dyn", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_TOOLS_FILE":  toolsFile,
 				"FAKE_NOTIFY_FILE": notifyFile,
 				// Every tools/list from this upstream (including Start's initial
 				// one) takes 600ms — long enough to land a Reload mid-re-list.
 				"FAKE_LIST_DELAY": "600ms",
 			}},
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
@@ -1012,7 +1123,7 @@ func TestReloadRemovedUpstreamNotResurrectedByStaleRelist(t *testing.T) {
 	newCfg := &config.Config{
 		Restart: config.RestartPolicy{Enabled: boolPtr(false)},
 		Upstreams: []config.Upstream{
-			{Name: "kept", Command: bin, Enabled: true, Env: map[string]string{"FAKE_TOOLS": "k"}},
+			{Name: "kept", Command: bin, Enabled: boolPtr(true), Env: map[string]string{"FAKE_TOOLS": "k"}},
 		},
 	}
 	if err := r.Reload(context.Background(), newCfg); err != nil {
@@ -1052,7 +1163,7 @@ func TestReloadDisablesRunningSupervisor(t *testing.T) {
 		t.Fatalf("write disposable binary: %v", err)
 	}
 
-	up := config.Upstream{Name: "mayfly", Command: bin, Enabled: true, Env: map[string]string{
+	up := config.Upstream{Name: "mayfly", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 		"FAKE_TOOLS":      "ping",
 		"FAKE_ECHO":       "1",
 		"FAKE_EXIT_AFTER": "1",

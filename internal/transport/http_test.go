@@ -30,7 +30,7 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 	cfg := &config.Config{
 		Transport: config.TransportHTTP,
 		Upstreams: []config.Upstream{
-			{Name: "github", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "github", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":  "github",
 				"FAKE_TOOLS": "search,create_issue",
 				"FAKE_ECHO":  "1",
@@ -264,7 +264,7 @@ func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, fun
 		Transport: config.TransportHTTP,
 		AuthToken: token,
 		Upstreams: []config.Upstream{
-			{Name: "github", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "github", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":  "github",
 				"FAKE_TOOLS": "search",
 			}},

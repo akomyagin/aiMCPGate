@@ -25,7 +25,7 @@ func lazyTestConfig(t *testing.T, tools, catalogMode string, pageSize int) *conf
 		CatalogMode: catalogMode,
 		PageSize:    pageSize,
 		Upstreams: []config.Upstream{
-			{Name: "github", Command: bin, Enabled: true, Env: map[string]string{
+			{Name: "github", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 				"FAKE_NAME":  "github",
 				"FAKE_TOOLS": tools,
 				"FAKE_ECHO":  "1",

@@ -40,7 +40,7 @@ func buildFakeServer(t *testing.T) string {
 func TestRegistryStartDoesNotKillUpstreamsAfterReturning(t *testing.T) {
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "echoer", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "echoer", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_TOOLS": "ping",
 			"FAKE_ECHO":  "1",
 		}},

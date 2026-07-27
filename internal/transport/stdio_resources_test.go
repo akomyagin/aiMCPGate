@@ -22,7 +22,7 @@ func startResourceServer(t *testing.T) (*fakeClient, func()) {
 	t.Helper()
 	bin := buildFakeServer(t)
 	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "files", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "files", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":               "files",
 			"FAKE_TOOLS":              "read",
 			"FAKE_PROMPTS":            "summarize",
@@ -30,12 +30,12 @@ func startResourceServer(t *testing.T) (*fakeClient, func()) {
 			"FAKE_RESOURCE_TEMPLATES": "file:///logs/{name}.log",
 			"FAKE_COMPLETIONS":        "1",
 		}},
-		{Name: "web", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":      "web",
 			"FAKE_TOOLS":     "fetch",
 			"FAKE_RESOURCES": "file:///a.txt,https://example.com/page",
 		}},
-		{Name: "bare", Command: bin, Enabled: true, Env: map[string]string{
+		{Name: "bare", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
 			"FAKE_NAME":  "bare",
 			"FAKE_TOOLS": "ping",
 		}},

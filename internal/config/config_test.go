@@ -6,6 +6,10 @@ import (
 	"testing"
 )
 
+// boolPtr is a tiny helper for the *bool fields (Upstream.Enabled,
+// RestartPolicy.Enabled) whose nil means "key absent in YAML".
+func boolPtr(b bool) *bool { return &b }
+
 func TestValidateUpstreamTransport(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -425,7 +429,11 @@ func TestSameLaunch(t *testing.T) {
 		same bool
 	}{
 		{"identical", func(u Upstream) Upstream { return u }, true},
-		{"enabled differs only", func(u Upstream) Upstream { u.Enabled = !u.Enabled; return u }, true},
+		// base leaves Enabled unset (nil = enabled); all three states must be
+		// invisible to SameLaunch — enable/disable is add/remove for the reload
+		// diff, never a "changed launch".
+		{"enabled differs only (nil vs false)", func(u Upstream) Upstream { u.Enabled = boolPtr(false); return u }, true},
+		{"enabled differs only (nil vs true)", func(u Upstream) Upstream { u.Enabled = boolPtr(true); return u }, true},
 		{"command differs", func(u Upstream) Upstream { u.Command = "other"; return u }, false},
 		{"args differ", func(u Upstream) Upstream { u.Args = []string{"a"}; return u }, false},
 		{"env value differs", func(u Upstream) Upstream { u.Env = map[string]string{"K": "w"}; return u }, false},
@@ -600,6 +608,64 @@ func TestSameFilter(t *testing.T) {
 	}
 	if base.SameFilter(filterOnly) {
 		t.Error("changed deny list reported as same filter")
+	}
+}
+
+// TestLoadUpstreamEnabledDefaultsToEnabled pins the three states of the
+// `enabled:` key. The absent one is the point of the whole field being a
+// pointer: an upstream added by hand without `enabled:` used to be dropped
+// silently (no log line, no doctor row, no tools) — it must now come up.
+func TestLoadUpstreamEnabledDefaultsToEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: omitted
+    command: /bin/true
+  - name: off
+    command: /bin/true
+    enabled: false
+  - name: on
+    command: /bin/true
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Upstreams) != 3 {
+		t.Fatalf("parsed %d upstreams, want 3", len(cfg.Upstreams))
+	}
+
+	tests := []struct {
+		name    string
+		wantPtr *bool // nil = key must have been absent
+		want    bool
+	}{
+		{"omitted", nil, true},
+		{"off", boolPtr(false), false},
+		{"on", boolPtr(true), true},
+	}
+	for i, tt := range tests {
+		u := cfg.Upstreams[i]
+		if u.Name != tt.name {
+			t.Fatalf("upstreams[%d].Name = %q, want %q", i, u.Name, tt.name)
+		}
+		switch {
+		case tt.wantPtr == nil && u.Enabled != nil:
+			t.Errorf("%s: Enabled = %v, want nil (key absent in YAML)", tt.name, *u.Enabled)
+		case tt.wantPtr != nil && u.Enabled == nil:
+			t.Errorf("%s: Enabled = nil, want explicit %v", tt.name, *tt.wantPtr)
+		case tt.wantPtr != nil && *u.Enabled != *tt.wantPtr:
+			t.Errorf("%s: Enabled = %v, want %v", tt.name, *u.Enabled, *tt.wantPtr)
+		}
+		if got := u.IsEnabled(); got != tt.want {
+			t.Errorf("%s: IsEnabled() = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
