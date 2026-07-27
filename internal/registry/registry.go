@@ -348,10 +348,24 @@ type Registry struct {
 	// declared the elicitation capability in its initialize (Round 14). A
 	// single global flag is correct because stdio serves exactly ONE client per
 	// process (see stdioServer.Serve); the HTTP transport never sets it, so it
-	// stays false there and any upstream elicitation over HTTP is refused
+	// stays false there and any upstream elicitation over HTTP is declined
 	// immediately — the safe default. Atomic: written once per handshake,
 	// read on every upstream elicitation/create from a reader goroutine.
 	clientElicitationCapable atomic.Bool
+
+	// elicitationProxySupported records whether THIS process's client-facing
+	// transport can proxy an upstream's elicitation/create request to the
+	// client and route the answer back — today only the stdio transport,
+	// which calls SetElicitationProxySupported(true) before Start. It gates
+	// what the gateway DECLARES as its own client capabilities in the
+	// handshake with a stdio upstream (see startStdio); the false default
+	// keeps every path that never claims the ability — the HTTP transport,
+	// doctor/call/catalog (no MCP client at all), existing tests — declaring
+	// exactly {} as before. Deliberately NOT derived from config.Transport:
+	// those CLI paths load the same config with transport: stdio and would
+	// get a false "yes". Atomic because it is written before Start but read
+	// again by startStdio on supervisor-restart and reload goroutines later.
+	elicitationProxySupported atomic.Bool
 
 	// elicitMu guards pendingElicits — gateway-minted id → where the client's
 	// answer must be routed back — and elicitSubs, the transports subscribed
@@ -551,7 +565,29 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	// an HTTP upstream has no channel for server-initiated REQUESTS in this
 	// round, deliberately out of scope.
 	onElicit := func(id, params json.RawMessage) { r.onUpstreamElicit(name, id, params) }
-	return upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onElicit)
+	conn, err := upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onElicit)
+	if err != nil {
+		return nil, err
+	}
+	// Declare the gateway's own client capabilities for the handshake — only
+	// elicitation, and only when BOTH legs of the proxy chain exist: the
+	// client-facing transport can relay the request to a client (the flag),
+	// and this upstream is stdio, so RespondUpstreamRequest can carry the
+	// answer back (which is why this lives here and not in startHTTP — an
+	// HTTP upstream keeps receiving {}). The client's OWN capability is
+	// deliberately not consulted: it is unknown until its initialize, long
+	// after this handshake, so the gateway declares that it can SERVE the
+	// method and answers honestly per request when the client turns out
+	// incapable (onUpstreamElicit's immediate decline). sampling/roots are NOT
+	// declared — there is no implementation behind them (readLoop ignores
+	// those requests), and declaring them would be the same lie the old {}
+	// literal was, with the sign flipped. Setting the field on the concrete
+	// *Conn here is race-free: Initialize runs later on this same launch
+	// goroutine.
+	if r.elicitationProxySupported.Load() {
+		conn.DeclareClientCapabilities("elicitation")
+	}
+	return conn, nil
 }
 
 // startHTTP builds an HTTP (Streamable HTTP) upstream connection. Unlike
@@ -1621,9 +1657,23 @@ type ElicitationRequest struct {
 // the stdio transport's dispatcher only — stdio serves exactly one client per
 // process, so the flag is global to the registry. The HTTP transport never
 // calls it; the flag then stays false and every upstream elicitation/create is
-// refused immediately instead of hanging (see onUpstreamElicit).
+// declined immediately instead of hanging (see onUpstreamElicit).
 func (r *Registry) SetClientElicitationCapable(ok bool) {
 	r.clientElicitationCapable.Store(ok)
+}
+
+// SetElicitationProxySupported records whether this process's client-facing
+// transport can proxy upstream-initiated elicitation/create requests to its
+// client and route the answer back (Round 14). The stdio transport calls it
+// with true BEFORE Start, so the flag is already set when the upstream
+// handshakes fan out and startStdio decides which client capabilities to
+// declare; nobody else calls it and the zero value means "declare nothing".
+// Distinct from SetClientElicitationCapable on purpose: this is a property of
+// the TRANSPORT, known at process start — whether the CLIENT can actually
+// answer only becomes known at its own initialize, long after the upstream
+// handshakes, so it cannot gate the declaration (see startStdio).
+func (r *Registry) SetElicitationProxySupported(ok bool) {
+	r.elicitationProxySupported.Store(ok)
 }
 
 // SubscribeElicitations registers interest in upstream-initiated
@@ -1654,20 +1704,22 @@ func (r *Registry) SubscribeElicitations() (<-chan ElicitationRequest, func()) {
 // the connection synchronously.
 //
 // When the gateway's client never declared the elicitation capability, the
-// upstream is answered immediately with a method-not-found error instead of
-// being left to hang until its own timeout — the gateway, in its client role
-// toward the upstream, honestly reports it cannot serve the method. Otherwise
-// the request is parked in pendingElicits under a freshly minted gateway id
-// and published to the subscribed transport (non-blocking, like
-// forwardNotification). A publish that reached NO subscriber (none registered,
-// or every buffer full) rolls the parked entry back and answers the upstream
-// with an error immediately: RouteElicitationResponse is the entry's only
-// other remover, so an undeliverable request would otherwise leak in
-// pendingElicits forever (found by review).
+// upstream is answered immediately with {"action":"decline"} instead of being
+// left to hang until its own timeout — there is no human to ask, and per the
+// spec a decline is exactly that answer. Otherwise the request is parked in
+// pendingElicits under a freshly minted gateway id and published to the
+// subscribed transport (non-blocking, like forwardNotification). A publish
+// that reached NO subscriber (none registered, or every buffer full) rolls
+// the parked entry back and declines immediately too:
+// RouteElicitationResponse is the entry's only other remover, so an
+// undeliverable request would otherwise leak in pendingElicits forever
+// (found by review). Neither branch means "the request itself is invalid" —
+// the gateway never inspects the params — so no path here answers with a
+// JSON-RPC error (see respondElicitDecline for why an error would be wrong).
 func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMessage) {
 	if !r.clientElicitationCapable.Load() {
-		r.respondElicitError(name, originalID, mcp.CodeMethodNotFound,
-			"elicitation/create not supported: the gateway's client did not declare the elicitation capability")
+		r.respondElicitDecline(name, originalID,
+			"the gateway's client did not declare the elicitation capability")
 		return
 	}
 
@@ -1689,31 +1741,43 @@ func (r *Registry) onUpstreamElicit(name string, originalID, params json.RawMess
 	}
 	r.elicitMu.Unlock()
 	if !delivered {
-		r.respondElicitError(name, originalID, mcp.CodeInternalError,
-			"elicitation/create not delivered: no client transport accepted the request")
+		r.respondElicitDecline(name, originalID,
+			"no client transport accepted the request")
 		return
 	}
 	r.log.Debug("upstream elicitation proxied to client", "upstream", name, "id", gatewayID)
 }
 
-// respondElicitError answers an upstream's elicitation/create with a JSON-RPC
-// error under the upstream's OWN id — used when the request cannot reach the
-// client (incapable client, or no subscriber accepted the publish), so the
-// upstream gets an immediate honest answer instead of hanging until its own
-// timeout. The write runs off the caller's goroutine: a stdin write can block
-// on a stuck child, and the upstream reader publishing the callback must
-// never stall on it.
-func (r *Registry) respondElicitError(name string, originalID json.RawMessage, code int, text string) {
+// respondElicitDecline answers an upstream's elicitation/create with the
+// spec's {"action":"decline"} result under the upstream's OWN id — used when
+// no human can be asked (incapable client, or no subscriber accepted the
+// publish), so the upstream gets an immediate answer instead of hanging until
+// its own timeout. reason is Debug-logged only; it never travels to the
+// upstream — a decline result carries no message field.
+//
+// A RESULT, not a JSON-RPC error, by explicit user decision (2026-07-27): a
+// decline is one of the three documented ElicitResult actions every server
+// MUST handle (typically by proceeding without the extra input), whereas an
+// error both contradicts the elicitation capability the gateway declared in
+// this very session (startStdio) and is turned into an exception by server
+// SDKs, failing the whole tools/call — calls that succeeded before the
+// gateway declared anything. "cancel" was considered and rejected: some
+// servers treat it as "abort the whole operation", decline merely as "no
+// extra input". The write runs off the caller's goroutine: a stdin write can
+// block on a stuck child, and the upstream reader publishing the callback
+// must never stall on it.
+func (r *Registry) respondElicitDecline(name string, originalID json.RawMessage, reason string) {
 	r.mu.RLock()
 	conn := r.conns[name]
 	r.mu.RUnlock()
 	if conn == nil {
 		return // the upstream vanished between its write and this callback
 	}
-	reply := mcp.NewError(originalID, code, text, nil)
+	r.log.Debug("upstream elicitation declined", "upstream", name, "reason", reason)
+	reply := mcp.NewResult(originalID, json.RawMessage(`{"action":"decline"}`))
 	go func() {
 		if err := conn.RespondUpstreamRequest(reply); err != nil {
-			r.log.Warn("refuse upstream elicitation failed", "upstream", name, "err", err)
+			r.log.Warn("decline upstream elicitation failed", "upstream", name, "err", err)
 		}
 	}()
 }

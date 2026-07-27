@@ -85,14 +85,17 @@ func TestStdioElicitationRoundTrip(t *testing.T) {
 	}
 }
 
-// TestStdioElicitationRefusedWithoutClientCapability (Round 14): when the
-// client's initialize did NOT declare the elicitation capability, the gateway
-// must answer the upstream's elicitation/create immediately with a JSON-RPC
-// method-not-found error — the upstream must not hang until its own timeout,
-// and nothing may be pushed to the client. The fakeserver embeds the error it
-// received into the tool result ("|elicit-error=<code> <message>"), so the
-// call completing promptly with that marker proves both halves.
-func TestStdioElicitationRefusedWithoutClientCapability(t *testing.T) {
+// TestStdioElicitationDeclinedWithoutClientCapability (Round 14, semantics
+// fixed after review): when the client's initialize did NOT declare the
+// elicitation capability, the gateway must answer the upstream's
+// elicitation/create immediately with the spec's {"action":"decline"} RESULT
+// — never a JSON-RPC error, which SDKs turn into an exception that fails the
+// whole tools/call — the upstream must not hang until its own timeout, and
+// nothing may be pushed to the client. The fakeserver embeds any result it
+// received into the tool result ("|elicited=<raw result>") and turns an error
+// into a FAILED call (isError:true), so one prompt, successful reply carrying
+// the decline marker proves every property at once.
+func TestStdioElicitationDeclinedWithoutClientCapability(t *testing.T) {
 	c, cancel, done := startServerWithConfig(t, elicitTestConfig(t), nil)
 	defer func() { cancel(); <-done }()
 
@@ -116,16 +119,27 @@ func TestStdioElicitationRefusedWithoutClientCapability(t *testing.T) {
 		t.Fatalf("first message id=%s method=%q, want the call reply %s (elicitation pushed to an incapable client?)",
 			resp.ID, resp.Method, callID)
 	}
+	// The call SUCCEEDS: a declined elicitation is a normal answer the
+	// upstream handles, not a failure. An error-shaped gateway answer would
+	// surface here as the fakeserver's isError:true "elicit-error=" result.
 	if resp.Error != nil {
 		t.Fatalf("tools/call error: %v", resp.Error)
 	}
-	if !strings.Contains(string(resp.Result), "elicit-error=-32601") {
-		t.Errorf("upstream did not receive an immediate method-not-found refusal: %s", resp.Result)
+	if strings.Contains(string(resp.Result), "elicit-error") ||
+		strings.Contains(string(resp.Result), `"isError":true`) {
+		t.Fatalf("gateway answered the elicitation with an error, failing the call that used to succeed: %s", resp.Result)
 	}
-	// Well before the fakeserver's 10s elicitation timeout: the refusal was
+	// The upstream received exactly a decline — not a timeout, not a skip.
+	// The marker rides inside the result's text string, so the quotes of the
+	// embedded ElicitResult arrive JSON-escaped.
+	if !strings.Contains(string(resp.Result), "elicited=") ||
+		!strings.Contains(string(resp.Result), `\"action\":\"decline\"`) {
+		t.Errorf("upstream did not receive an immediate decline result: %s", resp.Result)
+	}
+	// Well before the fakeserver's 10s elicitation timeout: the decline was
 	// immediate, not a hang.
 	if elapsed > 5*time.Second {
-		t.Errorf("refusal took %v — the upstream waited instead of being answered immediately", elapsed)
+		t.Errorf("decline took %v — the upstream waited instead of being answered immediately", elapsed)
 	}
 }
 

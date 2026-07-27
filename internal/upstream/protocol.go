@@ -53,6 +53,50 @@ type Conn struct {
 	// see the real binary version instead of a hardcoded literal. Set by
 	// StartStdio/StartHTTP; empty falls back to the dev placeholder.
 	gatewayVersion string
+
+	// declaredCaps are the client-capability names the gateway declares to
+	// this upstream in the initialize handshake, each rendered as an empty
+	// object (e.g. "elicitation": {}). The REGISTRY decides the set — it
+	// alone knows whether the client-facing transport can relay a
+	// server-initiated request and whether this upstream's transport can
+	// carry the answer back; this package only puts the decision on the
+	// wire. Set once via DeclareClientCapabilities before Initialize (same
+	// no-lock rule as gatewayVersion); the zero value declares nothing and
+	// sends exactly {} — byte-identical to the pre-declaration handshake.
+	// Being a plain field, it is stable across repeated Initialize calls
+	// (the HTTP session-expiry re-init) by construction.
+	declaredCaps []string
+}
+
+// DeclareClientCapabilities records the client-capability names the gateway
+// will declare to this upstream in initialize. Must be called before
+// Initialize — capabilities are exchanged exactly once per session, so a
+// later declaration would never reach the upstream. Names only, no
+// sub-flags: every declared capability is rendered as an empty object, which
+// is all the 2025-06-18 spec defines for the capabilities the gateway can
+// actually serve today (elicitation).
+func (c *Conn) DeclareClientCapabilities(names ...string) {
+	c.declaredCaps = names
+}
+
+// declaredCapabilities renders the recorded client-capability set into the
+// wire object initialize carries. The empty set yields exactly {} — not null,
+// not an absent field — preserving the historical bytes for every path that
+// declares nothing (HTTP upstreams, doctor/call/catalog, tests).
+func (c *Conn) declaredCapabilities() json.RawMessage {
+	if len(c.declaredCaps) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	caps := make(map[string]struct{}, len(c.declaredCaps))
+	for _, name := range c.declaredCaps {
+		caps[name] = struct{}{} // struct{}{} marshals to the spec's empty object
+	}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		// Unreachable for a map of empty structs; keep the handshake alive anyway.
+		return json.RawMessage(`{}`)
+	}
+	return b
 }
 
 // Initialize performs the MCP handshake against this upstream: sends an
@@ -72,8 +116,14 @@ func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
 	}
 	params := mcp.MustParams(mcp.InitializeParams{
 		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    json.RawMessage(`{}`),
-		ClientInfo:      gatewayClientInfo,
+		// The capabilities the registry told this Conn to declare (see
+		// DeclareClientCapabilities) — {} when nothing was declared. A literal
+		// {} for everyone was a bug: per the spec both parties MUST only use
+		// negotiated capabilities, so an upstream honouring that MUST could
+		// never send elicitation/create and the gateway's proxying (Round 14)
+		// was dead against every spec-abiding server.
+		Capabilities: c.declaredCapabilities(),
+		ClientInfo:   gatewayClientInfo,
 	})
 
 	resp, err := c.transport.call(ctx, mcp.MethodInitialize, params)

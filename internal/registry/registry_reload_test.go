@@ -63,6 +63,57 @@ func TestReloadAddsAndRemovesUpstreams(t *testing.T) {
 	}
 }
 
+// TestReloadedUpstreamKeepsElicitationDeclaration is the hot-reload twin of
+// TestSupervisorRestartKeepsElicitationDeclaration: an upstream ADDED by
+// Reload handshakes through the same startStdio as the initial fan-out, so it
+// must see the same elicitation declaration. A flag that only the first
+// launch consumed (or that Reload's goroutine could not observe) would hand
+// the added upstream a bare {} while every existing test stayed green.
+func TestReloadedUpstreamKeepsElicitationDeclaration(t *testing.T) {
+	bin := buildFakeServer(t)
+	dir := t.TempDir()
+	capsAlpha := filepath.Join(dir, "caps-alpha")
+	capsBeta := filepath.Join(dir, "caps-beta")
+	withCaps := func(name, tools, capsFile string) config.Upstream {
+		return config.Upstream{Name: name, Command: bin, Enabled: true, Env: map[string]string{
+			"FAKE_TOOLS":     tools,
+			"FAKE_CAPS_FILE": capsFile,
+		}}
+	}
+
+	cfg := &config.Config{
+		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{withCaps("alpha", "a", capsAlpha)},
+	}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	// What the stdio client-facing transport does before Start (stdioServer.Serve).
+	r.SetElicitationProxySupported(true)
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	waitForTool(t, r, "alpha__a", 2*time.Second)
+
+	newCfg := &config.Config{
+		Restart:   config.RestartPolicy{Enabled: boolPtr(false)},
+		Upstreams: []config.Upstream{withCaps("alpha", "a", capsAlpha), withCaps("beta", "b", capsBeta)},
+	}
+	if err := r.Reload(context.Background(), newCfg); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	waitForTool(t, r, "beta__b", 2*time.Second)
+
+	for name, capsFile := range map[string]string{"alpha (initial Start)": capsAlpha, "beta (added by reload)": capsBeta} {
+		data, err := os.ReadFile(capsFile)
+		if err != nil {
+			t.Fatalf("read caps file for %s: %v", name, err)
+		}
+		if !strings.Contains(string(data), `"elicitation"`) {
+			t.Errorf("%s handshake did not declare elicitation: %s", name, data)
+		}
+	}
+}
+
 // TestReloadChangedUpstreamRelaunches verifies a CHANGED upstream (same name,
 // different launch — here a different tool set via env) is closed and relaunched
 // so the catalog reflects the new config.

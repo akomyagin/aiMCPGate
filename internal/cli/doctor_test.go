@@ -211,6 +211,57 @@ upstreams:
 	}
 }
 
+// TestCLIPathsDeclareNoClientCapabilities pins the negative half of the
+// truthful upstream handshake for the CLI commands: doctor, call and catalog
+// load the same config a serving gateway would — transport: stdio and all —
+// but have NO MCP client behind them, so nobody could ever answer an
+// upstream's elicitation/create and their handshakes must declare exactly {}.
+// This is precisely what deriving the declaration from config.Transport
+// (instead of the client-facing transport's explicit
+// SetElicitationProxySupported call) would break: every one of these paths
+// would start promising elicitation it cannot serve, and only the raw
+// FAKE_CAPS_FILE record of the initialize the upstream received catches it.
+func TestCLIPathsDeclareNoClientCapabilities(t *testing.T) {
+	bin := buildFakeServer(t)
+	tests := []struct {
+		name string
+		args func(cfgPath string) []string
+	}{
+		{"doctor", func(cfg string) []string { return []string{"doctor", "-c", cfg} }},
+		// call actually performs a tools/call — the path where a lying
+		// declaration would provoke a real elicitation with nobody to answer.
+		{"call", func(cfg string) []string { return []string{"call", "solo__ping", "{}", "-c", cfg} }},
+		{"catalog", func(cfg string) []string { return []string{"catalog", "-c", cfg} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capsFile := filepath.Join(t.TempDir(), "caps")
+			cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: solo
+    command: `+bin+`
+    enabled: true
+    env:
+      FAKE_TOOLS: "ping"
+      FAKE_CAPS_FILE: `+capsFile+`
+`)
+			out, err := execRoot(t, tt.args(cfgPath)...)
+			if err != nil {
+				t.Fatalf("%s failed: %v\noutput:\n%s", tt.name, err, out)
+			}
+			data, err := os.ReadFile(capsFile)
+			if err != nil {
+				t.Fatalf("read caps file (no handshake recorded?): %v", err)
+			}
+			if got := strings.TrimSpace(string(data)); got != "{}" {
+				t.Errorf("%s declared client capabilities %s to its upstream, want exactly {} (no MCP client to answer)", tt.name, got)
+			}
+		})
+	}
+}
+
 // TestDoctorAllFailedStillPrintsReport: when EVERY upstream fails, Start
 // itself errors — doctor must still print the full FAIL table (its whole
 // point) rather than bail with the bare Start error.

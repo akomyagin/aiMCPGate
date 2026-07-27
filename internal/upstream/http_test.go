@@ -36,6 +36,7 @@ type fakeHTTPServer struct {
 
 	mu           sync.Mutex
 	sawAuth      string // last Authorization header seen (for assertions)
+	sawInitCaps  string // raw capabilities object of the last initialize received
 	initialized  bool
 	sessionEchos int // count of requests that echoed the session id back
 }
@@ -91,6 +92,15 @@ func (f *fakeHTTPServer) handler() http.Handler {
 func (f *fakeHTTPServer) reply(req *mcp.Message) *mcp.Message {
 	switch req.Method {
 	case mcp.MethodInitialize:
+		// Record the CLIENT's declared capabilities verbatim, so tests can
+		// assert what the gateway put in its handshake (in particular that an
+		// HTTP upstream — no channel for server-initiated requests — is never
+		// promised elicitation).
+		var p mcp.InitializeParams
+		_ = json.Unmarshal(req.Params, &p)
+		f.mu.Lock()
+		f.sawInitCaps = string(p.Capabilities)
+		f.mu.Unlock()
 		res := fmt.Sprintf(`{"protocolVersion":%q,"capabilities":{"tools":{}},"serverInfo":{"name":"fakehttp","version":"1.0.0"}}`, mcp.ProtocolVersion)
 		return mcp.NewResult(req.ID, json.RawMessage(res))
 	case mcp.MethodToolsList:
@@ -213,6 +223,34 @@ func TestHTTPInitializeAndCatalog(t *testing.T) {
 	}
 	if !got["search"] || !got["fetch"] {
 		t.Errorf("catalog missing tools, got %v", got)
+	}
+}
+
+// TestHTTPConnDefaultDeclaresNoClientCapabilities pins the DEFAULT of a bare
+// HTTP Conn over the real net/http round-trip: nothing declared means exactly
+// {} on the wire — byte-identical to the pre-declaration handshake, not null,
+// not an absent field. Deliberately narrow: this package cannot see the
+// registry's policy (startHTTP never calling DeclareClientCapabilities is
+// what actually keeps an HTTP upstream undeclared — RespondUpstreamRequest
+// refuses the transport, so declaring would be an unkeepable promise); that
+// guarantee is pinned end-to-end by
+// registry.TestRegistryDoesNotDeclareElicitationToHTTPUpstream.
+func TestHTTPConnDefaultDeclaresNoClientCapabilities(t *testing.T) {
+	f := &fakeHTTPServer{tools: []string{"search"}}
+	conn, cleanup := newConn(t, f, nil)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	f.mu.Lock()
+	caps := f.sawInitCaps
+	f.mu.Unlock()
+	if caps != "{}" {
+		t.Errorf("HTTP upstream received capabilities %s, want exactly {} (nothing to declare)", caps)
 	}
 }
 
