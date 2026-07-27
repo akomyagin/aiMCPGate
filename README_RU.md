@@ -20,11 +20,14 @@
 > лимиты вызовов per-upstream (rate limit / конкурентность / усечение
 > результата / таймаут), lazy-каталог и пагинацию `tools/list`, SSE-стримы
 > server→client с обеих сторон и проксирование `elicitation/create` (только
-> stdio↔stdio).
+> stdio↔stdio). Смержено после v0.3.0, но ещё не выпущено: проксирование
+> `sampling/createMessage` и `roots/list` (тоже только stdio↔stdio) и честное
+> объявление capabilities upstream'ам — шлюз предлагает upstream'у ровно то,
+> что заявил его собственный клиент, а не безусловное `{}`.
 >
-> **Не реализовано:** проксирование `sampling`/`roots` от upstream к клиенту,
-> `elicitation` через HTTP-транспорт (ни с одной из сторон), политика доступа
-> per-client и терминация сессии `DELETE /mcp`.
+> **Не реализовано:** server→client-запросы через HTTP-транспорт — то есть
+> `elicitation`, `sampling` и `roots` одинаково, при HTTP с любой из сторон, —
+> политика доступа per-client и терминация сессии `DELETE /mcp`.
 
 ## Релизы
 
