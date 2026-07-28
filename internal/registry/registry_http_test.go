@@ -1,11 +1,9 @@
 package registry
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,61 +84,15 @@ func TestRegistryAggregatesHTTPUpstream(t *testing.T) {
 	}
 }
 
-// TestRegistryDoesNotDeclareElicitationToHTTPUpstream pins the second
-// transport gate of the truthful handshake (the fix after Round 14) at the
-// level where the policy actually lives: even when the client-facing
-// transport CAN proxy elicitation (the flag is set, as the stdio transport
-// does), an HTTP upstream must still receive exactly {} — its transport has
-// no channel to carry an answer back (RespondUpstreamRequest refuses non-
-// stdio), so declaring would be a promise the gateway physically cannot
-// keep. This is what a bare-Conn test in internal/upstream cannot see: a
-// declaration wrongly added to startHTTP (or to the shared launch path)
-// changes nothing there and only shows up on the initialize this real
-// registry-started upstream records.
-func TestRegistryDoesNotDeclareElicitationToHTTPUpstream(t *testing.T) {
-	var mu sync.Mutex
-	sawCaps := ""
-	inner := fakeHTTPUpstream()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// Peek at the initialize body, then replay it for the real handler.
-		body, _ := io.ReadAll(req.Body)
-		var msg mcp.Message
-		if json.Unmarshal(body, &msg) == nil && msg.Method == mcp.MethodInitialize {
-			var p mcp.InitializeParams
-			_ = json.Unmarshal(msg.Params, &p)
-			mu.Lock()
-			sawCaps = string(p.Capabilities)
-			mu.Unlock()
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		inner.ServeHTTP(w, req)
-	}))
-	defer srv.Close()
-
-	cfg := &config.Config{Upstreams: []config.Upstream{
-		{Name: "remote", URL: srv.URL, Enabled: boolPtr(true)},
-	}}
-	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	// What the stdio client-facing transport does before Start — the very
-	// setting that makes startStdio declare must NOT leak to the HTTP leg.
-	// (Stage 15: one honest setter replaced the two Round 14 flags; the HTTP
-	// leg's expectation is unchanged.)
-	r.SetClientServerRequestCaps(declaredCaps("elicitation"))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := r.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer func() { _ = r.Close() }()
-
-	mu.Lock()
-	got := sawCaps
-	mu.Unlock()
-	if got != "{}" {
-		t.Errorf("HTTP upstream received capabilities %s, want exactly {} even with the client caps set", got)
-	}
-}
+// The former TestRegistryDoesNotDeclareElicitationToHTTPUpstream lived here. It
+// pinned "an HTTP upstream always receives exactly {}", which was correct only
+// while the HTTP transport had no channel to carry an answer back; Stage 17b
+// gave it one (a plain response POST), so the gateway now declares to HTTP
+// upstreams the same honest set it declares to stdio ones. The two halves of
+// that guarantee — the honest set WITH client capabilities and byte-exact {}
+// WITHOUT them — are pinned in registry_http_serverreq_test.go by
+// TestRegistryDeclaresClientCapsToHTTPUpstreamBytes and
+// TestRegistryHTTPUpstreamUndeclaredWithoutClientCaps.
 
 // sseHTTPUpstream extends fakeHTTPUpstream with the two things the Round 13
 // e2e test needs: a MUTABLE tool catalog and the optional GET SSE stream on

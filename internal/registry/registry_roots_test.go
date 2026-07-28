@@ -360,3 +360,76 @@ func TestDropUpstreamClearsRootsWaiters(t *testing.T) {
 		t.Error("RouteUpstreamResponse = false for the pending roots fetch, want true")
 	}
 }
+
+// deadlineRecordingUpstream captures whether the context its
+// ForwardRootsListChanged received carries a deadline. It blocks until that
+// context is done, standing in for an upstream that has stopped reading.
+type deadlineRecordingUpstream struct {
+	fakeUpstreamBase
+	mu       sync.Mutex
+	hadLimit bool
+	returned bool
+}
+
+func (f *deadlineRecordingUpstream) ForwardRootsListChanged(ctx context.Context) error {
+	_, ok := ctx.Deadline()
+	f.mu.Lock()
+	f.hadLimit = ok
+	f.mu.Unlock()
+	<-ctx.Done() // a hung upstream: only the deadline can free this goroutine
+	f.mu.Lock()
+	f.returned = true
+	f.mu.Unlock()
+	return ctx.Err()
+}
+
+func (f *deadlineRecordingUpstream) state() (hadLimit, returned bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hadLimit, f.returned
+}
+
+// TestRootsFanOutIsBounded pins the fix for the leak Stage 17b would otherwise
+// have introduced: OnClientRootsListChanged used to hand ForwardRootsListChanged
+// the registry's bare process context. That was harmless while roots was never
+// declared to an HTTP upstream (the connection's own gate short-circuited
+// before any I/O), but Stage 17b declares to HTTP upstreams too — so a POST to
+// an upstream that has stopped reading would hold its goroutine and connection
+// until the gateway process stopped, once per client roots/list_changed.
+//
+// The assertion is on the CONTEXT, not on wall-clock time: the real bound is 30
+// seconds and no test should wait for it. A hung upstream must (a) be given a
+// context with a deadline and (b) actually be released by it — here forced by
+// cancelling the registry's process context, which the derived context must
+// inherit.
+func TestRootsFanOutIsBounded(t *testing.T) {
+	r, _ := newElicitTestRegistry("alpha")
+	hung := &deadlineRecordingUpstream{}
+	r.mu.Lock()
+	r.conns["hung"] = hung
+	r.mu.Unlock()
+
+	r.OnClientRootsListChanged()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hadLimit, _ := hung.state(); hadLimit {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hadLimit, _ := hung.state(); !hadLimit {
+		t.Fatal("ForwardRootsListChanged got a context with no deadline: a hung upstream would pin this goroutine for the life of the process")
+	}
+
+	// And the derived context must still unwind with the registry, not outlive it.
+	r.procCancel()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, returned := hung.state(); returned {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the fan-out goroutine did not unwind after the registry's process context was cancelled")
+}

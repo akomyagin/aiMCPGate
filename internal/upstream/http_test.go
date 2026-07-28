@@ -93,9 +93,10 @@ func (f *fakeHTTPServer) reply(req *mcp.Message) *mcp.Message {
 	switch req.Method {
 	case mcp.MethodInitialize:
 		// Record the CLIENT's declared capabilities verbatim, so tests can
-		// assert what the gateway put in its handshake (in particular that an
-		// HTTP upstream — no channel for server-initiated requests — is never
-		// promised elicitation).
+		// assert what the gateway put in its handshake — in particular that a
+		// Conn told to declare nothing still sends exactly {}. (Since Stage 17b
+		// an HTTP upstream CAN be declared to, like a stdio one; what it
+		// receives is the registry's decision, pinned in that package.)
 		var p mcp.InitializeParams
 		_ = json.Unmarshal(req.Params, &p)
 		f.mu.Lock()
@@ -163,7 +164,7 @@ func toolsListJSON(tools []string) string {
 // "xxxxx" marker.
 func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
 	// Port 1 on loopback: connection refused, immediately and deterministically.
-	conn := upstream.StartHTTP(quietLogger(), "leaky", "http://user:sup3rsecret@127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "leaky", "http://user:sup3rsecret@127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -183,7 +184,7 @@ func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
 func newConn(t *testing.T, f *fakeHTTPServer, headers map[string]string) (*upstream.Conn, func()) {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())
-	conn := upstream.StartHTTP(quietLogger(), "fakehttp", srv.URL, headers, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "fakehttp", srv.URL, headers, srv.Client(), "0.0.0-test", nil, nil)
 	return conn, func() { _ = conn.Close(); srv.Close() }
 }
 
@@ -230,11 +231,12 @@ func TestHTTPInitializeAndCatalog(t *testing.T) {
 // HTTP Conn over the real net/http round-trip: nothing declared means exactly
 // {} on the wire — byte-identical to the pre-declaration handshake, not null,
 // not an absent field. Deliberately narrow: this package cannot see the
-// registry's policy (startHTTP never calling DeclareClientCapabilities is
-// what actually keeps an HTTP upstream undeclared — RespondUpstreamRequest
-// refuses the transport, so declaring would be an unkeepable promise); that
-// guarantee is pinned end-to-end by
-// registry.TestRegistryDoesNotDeclareElicitationToHTTPUpstream.
+// registry's policy, which since Stage 17b declares to an HTTP upstream exactly
+// what it declares to a stdio one (the honest intersection with what the
+// gateway's OWN client declared). Which bytes an upstream really receives is
+// pinned end-to-end there — see registry's
+// TestRegistryDeclaresClientCapsToHTTPUpstreamBytes and
+// TestRegistryHTTPUpstreamUndeclaredWithoutClientCaps.
 func TestHTTPConnDefaultDeclaresNoClientCapabilities(t *testing.T) {
 	f := &fakeHTTPServer{tools: []string{"search"}}
 	conn, cleanup := newConn(t, f, nil)
@@ -338,7 +340,7 @@ func TestHTTPAuthHeaderSentNotLogged(t *testing.T) {
 
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(logger, "fakehttp", srv.URL, map[string]string{"Authorization": secret}, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(logger, "fakehttp", srv.URL, map[string]string{"Authorization": secret}, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx := context.Background()
@@ -379,7 +381,7 @@ func TestHTTPCallOversizedJSONResponseIsRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "oversized", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "oversized", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -400,7 +402,7 @@ func TestCallRejectsNonResponseBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.CallTool(context.Background(), "fetch", nil, nil); err == nil {
@@ -418,7 +420,7 @@ func TestCallRejectsMismatchedID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	_, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -445,7 +447,7 @@ func TestCallAcceptsNullResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -535,7 +537,7 @@ func TestHTTPSessionExpiry404ReinitializesAndRetries(t *testing.T) {
 	f := &sessionExpiringServer{}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -572,7 +574,7 @@ func TestHTTPSessionExpiryRetriesOnlyOnce(t *testing.T) {
 	f := &sessionExpiringServer{alwaysExpire: true}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -618,7 +620,7 @@ func TestHTTPSSEMultiLineDataConcatenated(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "multiline", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "multiline", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -658,7 +660,7 @@ func TestHTTPJSONBodyDrainedForKeepAlive(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "reuse", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "reuse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	const calls = 4
@@ -715,7 +717,7 @@ func TestHTTPNegotiatedProtocolVersionEchoed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "older", srv.URL, nil, srv.Client(), "0.0.0-test", nil)
+	conn := upstream.StartHTTP(quietLogger(), "older", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx := context.Background()
@@ -787,7 +789,7 @@ func TestHTTPSSEStreamNotificationsAndReconnect(t *testing.T) {
 	defer srv.Close()
 
 	onNotify := func(method string, _ json.RawMessage) { notifs <- method }
-	conn := upstream.StartHTTP(quietLogger(), "sse", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify)
+	conn := upstream.StartHTTP(quietLogger(), "sse", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -856,7 +858,7 @@ func TestHTTPSSEStreamNotOffered(t *testing.T) {
 	defer srv.Close()
 
 	conn := upstream.StartHTTP(quietLogger(), "nostream", srv.URL, nil, srv.Client(), "0.0.0-test",
-		func(string, json.RawMessage) {})
+		func(string, json.RawMessage) {}, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -914,7 +916,7 @@ func TestHTTPSSEStreamRetriesTransientFirstAttempt(t *testing.T) {
 	defer srv.Close()
 
 	onNotify := func(method string, _ json.RawMessage) { notifs <- method }
-	conn := upstream.StartHTTP(quietLogger(), "transient", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify)
+	conn := upstream.StartHTTP(quietLogger(), "transient", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -941,7 +943,7 @@ func TestHTTPSSEStreamRetriesTransientFirstAttempt(t *testing.T) {
 // ever ran) must not block waiting for a goroutine that does not exist.
 func TestHTTPCloseBeforeSSEStreamStarted(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "never", "http://127.0.0.1:1/mcp", nil, nil, "0.0.0-test",
-		func(string, json.RawMessage) {})
+		func(string, json.RawMessage) {}, nil)
 	closed := make(chan struct{})
 	go func() { _ = conn.Close(); close(closed) }()
 	select {
@@ -953,5 +955,569 @@ func TestHTTPCloseBeforeSSEStreamStarted(t *testing.T) {
 	// Close (idempotent) still returns promptly.
 	if err := conn.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// --- Stage 17b: server→client REQUESTS from an HTTP upstream ---
+
+// TestHTTPStreamOpensForOnRequestOnly pins the widened stream gate: a caller
+// that listens for server-initiated REQUESTS but not for notifications must
+// still get the GET stream opened. The old gate (onNotify == nil → no stream)
+// would have left such a connection deaf by accident of its call sites.
+func TestHTTPStreamOpensForOnRequestOnly(t *testing.T) {
+	f := &fakeHTTPServer{tools: []string{"t"}}
+	gets := make(chan struct{}, 4)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			f.handler().ServeHTTP(w, r)
+			return
+		}
+		select {
+		case gets <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	conn := upstream.StartHTTP(quietLogger(), "reqonly", srv.URL, nil, srv.Client(), "0.0.0-test",
+		nil, func(string, json.RawMessage, json.RawMessage) {})
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	select {
+	case <-gets:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no GET SSE stream was opened for a connection that only listens for requests")
+	}
+}
+
+// streamFrame is one classified frame the GET stream handed to a callback.
+type streamFrame struct {
+	method string
+	id     string
+	params string
+}
+
+// TestHTTPStreamClassifiesFrames pins that the GET stream classifies exactly as
+// stdio's readLoop: the notification reaches onNotify, the REQUEST reaches
+// onRequest with its method, original id and params byte-for-byte, and neither
+// a response frame (no waiter lives on this stream) nor a malformed hybrid
+// (method plus result) is delivered anywhere.
+//
+// The request is emitted LAST on purpose: waiting for it proves the three
+// frames before it were already processed, so the "nothing else arrived"
+// assertions are a bounded drain rather than a race.
+func TestHTTPStreamClassifiesFrames(t *testing.T) {
+	f := &fakeHTTPServer{tools: []string{"t"}}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			f.handler().ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		for _, frame := range []string{
+			`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`,
+			`{"jsonrpc":"2.0","id":99,"result":{"unexpected":true}}`,
+			`{"jsonrpc":"2.0","id":"hyb-1","method":"elicitation/create","result":{}}`,
+			`{"jsonrpc":"2.0","id":"ask-1","method":"elicitation/create","params":{"message":"need input"}}`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", frame)
+			fl.Flush()
+		}
+		<-r.Context().Done() // hold the stream: a drop would reconnect and replay
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	notifs := make(chan string, 8)
+	requests := make(chan streamFrame, 8)
+	conn := upstream.StartHTTP(quietLogger(), "classify", srv.URL, nil, srv.Client(), "0.0.0-test",
+		func(method string, _ json.RawMessage) { notifs <- method },
+		func(method string, id, params json.RawMessage) {
+			requests <- streamFrame{method: method, id: string(id), params: string(params)}
+		})
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	var got streamFrame
+	select {
+	case got = <-requests:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upstream's server-initiated request never reached onRequest")
+	}
+	if got.method != mcp.MethodElicitationCreate {
+		t.Errorf("request method = %q, want %q", got.method, mcp.MethodElicitationCreate)
+	}
+	if got.id != `"ask-1"` {
+		t.Errorf("request id = %s, want the upstream's own %q (a hybrid or a rewrite leaked through)", got.id, `"ask-1"`)
+	}
+	if got.params != `{"message":"need input"}` {
+		t.Errorf("request params = %s, want them verbatim", got.params)
+	}
+
+	select {
+	case n := <-notifs:
+		if n != mcp.NotifToolsListChanged {
+			t.Errorf("notification = %q, want %q", n, mcp.NotifToolsListChanged)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the notification frame never reached onNotify")
+	}
+
+	// Bounded drain: neither the response frame nor the hybrid may have been
+	// delivered to either callback.
+	select {
+	case extra := <-requests:
+		t.Errorf("a second frame was delivered as a request: %+v (response/hybrid must be dropped)", extra)
+	case extra := <-notifs:
+		t.Errorf("a second frame was delivered as a notification: %q", extra)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// respondingHTTPServer is the stand for the response-POST half of Stage 17b: it
+// records every JSON-RPC RESPONSE the gateway POSTs back (the answer to a
+// question the server itself asked), with the session id it carried, and can be
+// told to answer those POSTs with an arbitrary status.
+type respondingHTTPServer struct {
+	respondStatus int // status for a response body; 0 → 202 Accepted
+
+	mu           sync.Mutex
+	initCount    int
+	session      string
+	expired      bool           // the server has forgotten its session
+	responses    []*mcp.Message // response bodies received, in order
+	respSessions []string       // Mcp-Session-Id carried by each of them
+}
+
+// expire makes the server forget the session it handed out, as a real one may
+// at any time.
+func (s *respondingHTTPServer) expire() {
+	s.mu.Lock()
+	s.expired = true
+	s.mu.Unlock()
+}
+
+func (s *respondingHTTPServer) snapshot() (inits int, responses []*mcp.Message, sessions []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.initCount, append([]*mcp.Message(nil), s.responses...), append([]string(nil), s.respSessions...)
+}
+
+func (s *respondingHTTPServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "no stream here", http.StatusMethodNotAllowed)
+			return
+		}
+		var msg mcp.Message
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if msg.IsResponse() {
+			s.responses = append(s.responses, &msg)
+			s.respSessions = append(s.respSessions, r.Header.Get("Mcp-Session-Id"))
+			if s.respondStatus != 0 {
+				w.WriteHeader(s.respondStatus)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if msg.IsNotification() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if msg.Method == mcp.MethodInitialize {
+			s.initCount++
+			s.session = fmt.Sprintf("sess-%d", s.initCount)
+			s.expired = false // a fresh session is live again
+			w.Header().Set("Mcp-Session-Id", s.session)
+			w.Header().Set("Content-Type", "application/json")
+			res := fmt.Sprintf(`{"protocolVersion":%q,"capabilities":{},"serverInfo":{"name":"responder","version":"1.0.0"}}`, mcp.ProtocolVersion)
+			_ = json.NewEncoder(w).Encode(mcp.NewResult(msg.ID, json.RawMessage(res)))
+			return
+		}
+		if r.Header.Get("Mcp-Session-Id") != s.session || s.expired {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mcp.NewResult(msg.ID, json.RawMessage(`{"content":[{"type":"text","text":"ok"}]}`)))
+	})
+}
+
+// TestHTTPRespondPostsVerbatimWithSession is the transport-level half of the
+// stage's headline guarantee: the answer to a question the UPSTREAM asked
+// leaves as one ordinary POST whose body is that response verbatim — the
+// upstream's own id, the result untouched — and which carries the session id,
+// because a response belongs to the session that asked.
+func TestHTTPRespondPostsVerbatimWithSession(t *testing.T) {
+	f := &respondingHTTPServer{}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	const result = `{"action":"accept","content":{"name":"ada"}}`
+	if err := conn.RespondUpstreamRequest(mcp.NewResult(mcp.StringID("ask-1"), json.RawMessage(result))); err != nil {
+		t.Fatalf("RespondUpstreamRequest: %v", err)
+	}
+
+	_, responses, sessions := f.snapshot()
+	if len(responses) != 1 {
+		t.Fatalf("server received %d response POSTs, want exactly 1", len(responses))
+	}
+	if string(responses[0].ID) != `"ask-1"` {
+		t.Errorf("response carried id %s, want the upstream's own %q (a gateway id leaked)", responses[0].ID, `"ask-1"`)
+	}
+	if string(responses[0].Result) != result {
+		t.Errorf("response result = %s, want it verbatim: %s", responses[0].Result, result)
+	}
+	if sessions[0] != "sess-1" {
+		t.Errorf("response POST carried Mcp-Session-Id %q, want %q — it must go through the normal POST path", sessions[0], "sess-1")
+	}
+}
+
+// TestHTTPRespondErrorStatuses pins the error policy of the response POST: a
+// non-2xx is never swallowed, never retried, and a 404 does NOT trigger a
+// re-handshake — a fresh session would not know the request id being answered.
+// The stale session id is deliberately kept, which is what still lets the NEXT
+// tools/call recover through the existing expiry path.
+func TestHTTPRespondErrorStatuses(t *testing.T) {
+	t.Run("404 expired session", func(t *testing.T) {
+		f := &respondingHTTPServer{respondStatus: http.StatusNotFound}
+		srv := httptest.NewServer(f.handler())
+		defer srv.Close()
+		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+		defer func() { _ = conn.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := conn.Initialize(ctx); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		f.expire() // the server forgot sess-1 behind our back
+
+		err := conn.RespondUpstreamRequest(mcp.NewResult(mcp.StringID("ask-1"), json.RawMessage(`{"action":"decline"}`)))
+		if err == nil {
+			t.Fatal("a 404 on the response POST was swallowed, want an error")
+		}
+		if !strings.Contains(err.Error(), "session expired") {
+			t.Errorf("error should name the expired session, got: %v", err)
+		}
+		inits, responses, _ := f.snapshot()
+		if len(responses) != 1 {
+			t.Errorf("server received %d response POSTs, want exactly 1 (no retry)", len(responses))
+		}
+		if inits != 1 {
+			t.Errorf("server saw %d initialize requests after the 404, want 1 (respond must not re-handshake)", inits)
+		}
+
+		// The next call recovers on its own — only possible because respond
+		// left the (stale) session id in place for call's expiry path.
+		if _, err := conn.CallTool(ctx, "fetch", nil, nil); err != nil {
+			t.Fatalf("CallTool after a 404-ed response POST: want transparent recovery, got %v", err)
+		}
+		if inits, _, _ := f.snapshot(); inits != 2 {
+			t.Errorf("server saw %d initialize requests, want 2 (the call re-initialized)", inits)
+		}
+	})
+
+	t.Run("500 server error", func(t *testing.T) {
+		f := &respondingHTTPServer{respondStatus: http.StatusInternalServerError}
+		srv := httptest.NewServer(f.handler())
+		defer srv.Close()
+		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+		defer func() { _ = conn.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := conn.Initialize(ctx); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		err := conn.RespondUpstreamRequest(mcp.NewResult(mcp.StringID("ask-1"), json.RawMessage(`{}`)))
+		if err == nil {
+			t.Fatal("a 500 on the response POST was swallowed, want an error")
+		}
+		if strings.Contains(err.Error(), "session expired") {
+			t.Errorf("a 500 must not be reported as an expired session: %v", err)
+		}
+		inits, responses, _ := f.snapshot()
+		if len(responses) != 1 {
+			t.Errorf("server received %d response POSTs, want exactly 1 (no retry)", len(responses))
+		}
+		if inits != 1 {
+			t.Errorf("server saw %d initialize requests, want 1 (no re-handshake on 5xx)", inits)
+		}
+	})
+}
+
+// TestHTTPRespondAfterCloseFailsFast pins that the response POST is bounded by
+// the CONNECTION's lifetime, not by an independent context: after Close the
+// answer fails immediately instead of being delivered by a goroutine that
+// outlives the connection.
+func TestHTTPRespondAfterCloseFailsFast(t *testing.T) {
+	f := &respondingHTTPServer{}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- conn.RespondUpstreamRequest(mcp.NewResult(mcp.StringID("ask-1"), json.RawMessage(`{}`)))
+	}()
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("responding after Close succeeded, want an error (the POST must be tied to the connection)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("responding after Close did not fail promptly")
+	}
+	if _, responses, _ := f.snapshot(); len(responses) != 0 {
+		t.Errorf("server received %d response POSTs after Close, want 0", len(responses))
+	}
+}
+
+// TestHTTPInterleavedRequestOnPostStream pins the second SSE channel: per the
+// spec a server may interleave a request RELATED to the call in flight into the
+// SSE response stream of that very POST, and that is where real SDK servers
+// raise an elicitation/create from inside a tools/call. Such a frame must reach
+// onRequest, and the call itself must still return its own result.
+func TestHTTPInterleavedRequestOnPostStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req mcp.Message
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if req.IsNotification() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if req.Method != mcp.MethodToolsCall {
+			w.Header().Set("Content-Type", "application/json")
+			res := fmt.Sprintf(`{"protocolVersion":%q,"capabilities":{},"serverInfo":{"name":"interleaver","version":"1.0.0"}}`, mcp.ProtocolVersion)
+			_ = json.NewEncoder(w).Encode(mcp.NewResult(req.ID, json.RawMessage(res)))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"mid-1\",\"method\":\"elicitation/create\",\"params\":{\"message\":\"mid-call\"}}\n\n")
+		fl.Flush()
+		body, _ := mcp.Encode(mcp.NewResult(req.ID, json.RawMessage(`{"content":[{"type":"text","text":"call-finished"}]}`)))
+		fmt.Fprintf(w, "data: %s\n\n", strings.TrimSpace(string(body)))
+		fl.Flush()
+	}))
+	defer srv.Close()
+
+	requests := make(chan streamFrame, 4)
+	conn := upstream.StartHTTP(quietLogger(), "interleaver", srv.URL, nil, srv.Client(), "0.0.0-test", nil,
+		func(method string, id, params json.RawMessage) {
+			requests <- streamFrame{method: method, id: string(id), params: string(params)}
+		})
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	resp, err := conn.CallTool(ctx, "fetch", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !strings.Contains(string(resp.Result), "call-finished") {
+		t.Errorf("the call's own response was lost: %s", resp.Result)
+	}
+	select {
+	case got := <-requests:
+		if got.method != mcp.MethodElicitationCreate || got.id != `"mid-1"` {
+			t.Errorf("interleaved request = %+v, want elicitation/create under id \"mid-1\"", got)
+		}
+		if got.params != `{"message":"mid-call"}` {
+			t.Errorf("interleaved request params = %s, want them verbatim", got.params)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a request interleaved into the POST's SSE stream never reached onRequest")
+	}
+}
+
+// sessionExpiringStreamServer answers initialize with a rotating session id and
+// serves the GET SSE stream ONLY to the current one; a GET carrying a stale id
+// gets 404, exactly as the spec prescribes for an expired session. It counts
+// GET attempts so a test can tell "gave up" from "kept retrying".
+type sessionExpiringStreamServer struct {
+	mu      sync.Mutex
+	current string
+	inits   int
+	gets    int
+}
+
+func (s *sessionExpiringStreamServer) getCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets
+}
+
+func (s *sessionExpiringStreamServer) expire() {
+	s.mu.Lock()
+	s.current = ""
+	s.mu.Unlock()
+}
+
+func (s *sessionExpiringStreamServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.mu.Lock()
+			s.gets++
+			live := s.current != "" && r.Header.Get("Mcp-Session-Id") == s.current
+			s.mu.Unlock()
+			if !live {
+				// The session this GET names is gone. Per the spec that is a
+				// 404 telling the client to re-initialize — NOT "no stream
+				// here" (which would be 405).
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		var req mcp.Message
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == mcp.MethodInitialize {
+			s.mu.Lock()
+			s.inits++
+			s.current = fmt.Sprintf("sess-%d", s.inits)
+			sid := s.current
+			s.mu.Unlock()
+			w.Header().Set("Mcp-Session-Id", sid)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(mcp.NewResult(req.ID,
+				json.RawMessage(`{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}`)))
+			return
+		}
+		if !req.IsRequest() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		s.mu.Lock()
+		live := r.Header.Get("Mcp-Session-Id") == s.current
+		s.mu.Unlock()
+		if !live {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mcp.NewResult(req.ID, json.RawMessage(`{"content":[]}`)))
+	})
+}
+
+// TestSSEStreamSurvivesSessionExpiry pins the fix for a silent, permanent loss
+// of server push: a 404 to the GET stream was read as "this server offers no
+// SSE stream" and ended the reconnect loop FOREVER, even though the same 404 on
+// a POST is understood as "the session expired, re-initialize". Nothing looked
+// broken — tools/call kept recovering on its own — while every upstream-initiated
+// message from that connection was silently lost. Harmless while the stream only
+// carried notifications; since Stage 17b it is also the channel for
+// elicitation/sampling/roots, so the stage's whole feature died with it.
+//
+// The assertion is behavioural: after the session expires and a CallTool
+// re-initializes it, a notification pushed by the upstream must still reach
+// onNotify. With the bug there is exactly one GET and then permanent silence.
+func TestSSEStreamSurvivesSessionExpiry(t *testing.T) {
+	f := &sessionExpiringStreamServer{}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	notifs := make(chan string, 4)
+	onNotify := func(method string, _ json.RawMessage) {
+		select {
+		case notifs <- method:
+		default:
+		}
+	}
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// The server forgets the session before the stream goroutine's first GET,
+	// so that GET is answered 404 — the case that used to be fatal.
+	f.expire()
+
+	// Wait for the loop to have actually tried (and been refused) at least once,
+	// so the retry below is proven to be a RETRY.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && f.getCount() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if f.getCount() == 0 {
+		t.Fatal("the stream goroutine never issued a GET")
+	}
+
+	// A tool call re-initializes transparently (the existing 404 recovery),
+	// minting sess-2; the retrying stream must pick it up on its next attempt.
+	if _, err := conn.CallTool(ctx, "fetch", nil, nil); err != nil {
+		t.Fatalf("CallTool after session expiry: %v", err)
+	}
+
+	select {
+	case method := <-notifs:
+		if method != mcp.NotifToolsListChanged {
+			t.Errorf("forwarded notification = %q, want %q", method, mcp.NotifToolsListChanged)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("no notification after the session was renewed: the SSE stream never came back (GET attempts: %d)", f.getCount())
 	}
 }

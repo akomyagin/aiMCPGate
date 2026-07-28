@@ -192,9 +192,9 @@ type Upstream interface {
 	ForwardRootsListChanged(ctx context.Context) error
 	// RespondUpstreamRequest writes a response to a request the upstream
 	// itself initiated (elicitation/create, sampling/createMessage,
-	// roots/list) into its stdin; msg.ID must already carry the upstream's
-	// original request id. Errors for transports without server-initiated
-	// requests (HTTP).
+	// roots/list); msg.ID must already carry the upstream's original request
+	// id. Both transports carry it since Stage 17b — into the child's stdin
+	// for stdio, as one plain POST to the endpoint for HTTP.
 	RespondUpstreamRequest(msg *mcp.Message) error
 	Close() error
 	// Done reports the "process died" channel of an upstream backed by a
@@ -367,8 +367,8 @@ type Registry struct {
 	// (found by review).
 	//
 	// nil means "nothing was declared" and yields exactly {} on the wire — the
-	// historical bytes for every path with no MCP client behind it: the HTTP
-	// transport, doctor/call/catalog, tests. Gate 1 of the declaration model is
+	// historical bytes for every path with no MCP client behind it:
+	// doctor/call/catalog, tests. Gate 1 of the declaration model is
 	// expressed by WHO calls SetClientServerRequestCaps: only a client-facing
 	// transport able to relay a server→client request calls it at all, so no
 	// separate transport flag is kept here.
@@ -607,10 +607,10 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	}
 	name := u.Name
 	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
-	// onRequest is stdio-only (Round 14): StartHTTP takes no such callback —
-	// an HTTP upstream has no channel for server-initiated REQUESTS, still
-	// deliberately out of scope. WHICH methods are proxied is decided by the
-	// registry's spec table (serverreq.go), not by the transport.
+	// Server-initiated REQUESTS take the same route as notifications; since
+	// Stage 17b startHTTP wires an identical callback, so both transports feed
+	// one pipeline. WHICH methods are proxied is decided by the registry's spec
+	// table (serverreq.go), never by the transport.
 	onRequest := func(method string, id, params json.RawMessage) {
 		r.onUpstreamRequest(name, method, id, params)
 	}
@@ -618,12 +618,12 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	if err != nil {
 		return nil, err
 	}
-	// Declare the gateway's own client capabilities for the handshake. The set
-	// comes from declaredClientCaps (serverreq.go) and is applied ONLY here,
-	// never in startHTTP: an HTTP upstream has no channel for
-	// RespondUpstreamRequest to carry an answer back, so it keeps receiving
-	// exactly {}. Setting the field on the concrete *Conn here is race-free:
-	// Initialize runs later on this same launch goroutine.
+	// Declare the gateway's own client capabilities for the handshake — the
+	// honest intersection from declaredClientCaps (serverreq.go). startHTTP
+	// applies the very same gate (Stage 17b); an empty set skips the call
+	// entirely, so every non-declaring path keeps sending byte-identical {}.
+	// Setting the field on the concrete *Conn here is race-free: Initialize
+	// runs later on this same launch goroutine.
 	if caps := r.declaredClientCaps(); len(caps) > 0 {
 		conn.DeclareClientCapabilities(caps)
 	}
@@ -634,13 +634,32 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 // startStdio it does no network I/O here — the handshake runs in Initialize, so
 // StartHTTP never fails and a genuinely unreachable HTTP upstream is isolated at
 // the Initialize step in launch, exactly like a stdio upstream that fails its
-// handshake. The notification callback mirrors startStdio's: it feeds the GET
-// SSE stream the connection opens after its handshake (Round 13) — best-effort,
-// an upstream that does not offer the stream simply pushes no notifications.
+// handshake. Both callbacks mirror startStdio's and feed the SSE channels the
+// connection reads (Round 13 for notifications, Stage 17b for server-initiated
+// requests) — best-effort, an upstream that offers no stream simply pushes
+// nothing.
+//
+// The capability declaration is the same honest intersection stdio gets, and
+// that is the load-bearing half of Stage 17b: per the spec both parties MUST
+// use only NEGOTIATED capabilities, so an upstream that saw {} will never send
+// elicitation/create at all and every line of request plumbing would be dead
+// code against a well-behaved server. Withholding it here used to be right —
+// the HTTP transport had no way to carry an answer back — but respond (one POST
+// under the upstream's own request id) removed that reason.
 func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 	name := u.Name
 	onNotify := func(method string, params json.RawMessage) { r.onUpstreamNotification(name, method, params) }
-	return upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify), nil
+	onRequest := func(method string, id, params json.RawMessage) {
+		r.onUpstreamRequest(name, method, id, params)
+	}
+	conn := upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify, onRequest)
+	// Same race-free timing as startStdio: Initialize runs later, on this same
+	// launch goroutine. The len gate keeps doctor/call/catalog (no MCP client,
+	// so nothing declared) sending exactly {}.
+	if caps := r.declaredClientCaps(); len(caps) > 0 {
+		conn.DeclareClientCapabilities(caps)
+	}
+	return conn, nil
 }
 
 // Start launches every enabled upstream in parallel, runs the MCP handshake,

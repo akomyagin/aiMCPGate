@@ -35,6 +35,7 @@ func (p *pagingTransport) call(_ context.Context, _ string, _ json.RawMessage) (
 }
 
 func (p *pagingTransport) notify(context.Context, string, json.RawMessage) error { return nil }
+func (p *pagingTransport) respond(*mcp.Message) error                            { return nil }
 func (p *pagingTransport) Name() string                                          { return "paging" }
 func (p *pagingTransport) Close() error                                          { return nil }
 func (p *pagingTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
@@ -167,6 +168,7 @@ func (e *errorTransport) call(_ context.Context, _ string, _ json.RawMessage) (*
 	return mcp.NewError(mcp.IntID(1), e.code, "nope", nil), nil
 }
 func (e *errorTransport) notify(context.Context, string, json.RawMessage) error { return nil }
+func (e *errorTransport) respond(*mcp.Message) error                            { return nil }
 func (e *errorTransport) Name() string                                          { return "erroring" }
 func (e *errorTransport) Close() error                                          { return nil }
 func (e *errorTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
@@ -230,6 +232,7 @@ func (c *captureTransport) notify(_ context.Context, method string, _ json.RawMe
 	return c.notifyErr
 }
 
+func (c *captureTransport) respond(*mcp.Message) error    { return nil }
 func (c *captureTransport) Name() string                  { return "capture" }
 func (c *captureTransport) Close() error                  { return nil }
 func (c *captureTransport) Done() (<-chan struct{}, bool) { return nil, false }

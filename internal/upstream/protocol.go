@@ -24,6 +24,17 @@ const maxPaginationPages = 1000
 type transport interface {
 	call(ctx context.Context, method string, params json.RawMessage) (*mcp.Message, error)
 	notify(ctx context.Context, method string, params json.RawMessage) error
+	// respond writes a RESPONSE to a request the upstream itself initiated
+	// (elicitation/create, sampling/createMessage, roots/list). msg must
+	// already carry the upstream's ORIGINAL request id — nothing here mints
+	// or rewrites ids. stdio writes it into the child's stdin; HTTP POSTs it
+	// to the endpoint (bounded by respondPostTimeout and the connection's
+	// lifetime). Unlike call it waits for no answer: a response ends the
+	// exchange. It takes no ctx for the same reason notify's is unused on the
+	// stdio side — the sole caller (the registry's writeUpstreamResponse
+	// goroutine) has no meaningful request context to pass, so each transport
+	// bounds the write itself (Stage 17b §3.1).
+	respond(msg *mcp.Message) error
 	Name() string
 	Close() error
 	// Done reports the "process died" channel for transports backed by a
@@ -84,8 +95,10 @@ func (c *Conn) DeclareClientCapabilities(caps map[string]json.RawMessage) {
 // declaredCapabilities renders the recorded client-capability set into the
 // wire object initialize carries. The empty set yields exactly {} — not null,
 // not an absent field — preserving the historical bytes for every path that
-// declares nothing (HTTP upstreams, doctor/call/catalog, tests). json.Marshal
-// sorts map keys, so the output is deterministic for a given set.
+// declares nothing: doctor/call/catalog (no MCP client at all) and tests.
+// HTTP upstreams left that list in Stage 17b — they are now declared to on the
+// same honest gate as stdio ones. json.Marshal sorts map keys, so the output is
+// deterministic for a given set.
 func (c *Conn) declaredCapabilities() json.RawMessage {
 	if len(c.declaredCaps) == 0 {
 		return json.RawMessage(`{}`)
@@ -368,8 +381,13 @@ func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Messa
 // but only when the gateway actually declared roots to it in the handshake.
 // Per the spec both parties MUST only use negotiated capabilities, so pushing
 // this to an upstream that never saw a roots declaration would be protocol
-// noise; the no-op keeps every non-declaring path (HTTP upstreams,
-// doctor/call/catalog) byte-identical on the wire.
+// noise; the no-op keeps every non-declaring path (doctor/call/catalog)
+// byte-identical on the wire.
+//
+// Since Stage 17b an HTTP upstream CAN be declared to, so this may now issue a
+// real network POST rather than always short-circuiting — which is why the
+// caller bounds ctx (registry.forwardNotifyTimeout) instead of passing its
+// process context.
 func (c *Conn) ForwardRootsListChanged(ctx context.Context) error {
 	if _, ok := c.declaredCaps[mcp.CapRoots]; !ok {
 		return nil
@@ -379,23 +397,19 @@ func (c *Conn) ForwardRootsListChanged(ctx context.Context) error {
 
 // RespondUpstreamRequest writes msg — a response to a request the UPSTREAM
 // itself initiated (elicitation/create, sampling/createMessage, roots/list) —
-// into the upstream's stdin. msg.ID must already be the upstream's ORIGINAL
-// request id (the registry rewrites it back from the gateway-minted
-// client-facing id before calling).
+// back to that upstream: into the child's stdin for stdio, as one plain POST to
+// the endpoint for Streamable HTTP (Stage 17b). msg.ID must already be the
+// upstream's ORIGINAL request id (the registry rewrites it back from the
+// gateway-minted client-facing id before calling).
 //
-// Only the stdio transport supports server-initiated requests today; for an
-// HTTP upstream this returns an explicit error instead of silently dropping —
-// the caller logs it and the upstream simply times out on its own answer,
-// which is the documented out-of-scope behaviour (Round 14, Stage 15). A type assertion
-// rather than a transport-interface method, same rationale as
-// setNegotiatedVersion above: the shared interface is not widened for the need
-// of exactly one transport.
+// A transport-interface method rather than the type assertion used by
+// setNegotiatedVersion/startSSEStream above, because the project rule cuts the
+// other way here: those are needed by exactly ONE transport, whereas respond
+// now has two implementations with an identical signature. Asserting on both
+// concrete types would duplicate the dispatch Go already does and leave an
+// unreachable "transport not supported" branch behind.
 func (c *Conn) RespondUpstreamRequest(msg *mcp.Message) error {
-	st, ok := c.transport.(*stdioTransport)
-	if !ok {
-		return fmt.Errorf("upstream %q: responding to an upstream-initiated request is not supported for this transport", c.Name())
-	}
-	return st.respond(msg)
+	return c.transport.respond(msg)
 }
 
 // CallTool forwards a tools/call to the upstream. name is the ORIGINAL

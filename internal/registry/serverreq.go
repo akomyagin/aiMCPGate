@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -149,6 +150,14 @@ func specForMethod(method string) *serverReqSpec {
 // contract. Tests override Registry.serverReqTimeout directly.
 const defaultServerReqTimeout = 5 * time.Minute
 
+// forwardNotifyTimeout bounds ONE fire-and-forget notification the gateway
+// relays to an upstream (today notifications/roots/list_changed). Generous,
+// because nothing is waiting on it and a slow-but-alive upstream should still
+// receive it; finite, because the alternative is a goroutine and a connection
+// pinned for the life of the process on an upstream that has stopped reading.
+// Not a config knob, by the same reasoning as defaultServerReqTimeout.
+const forwardNotifyTimeout = 30 * time.Second
+
 // pendingServerReq records where the client's answer to one proxied
 // server→client request must go: which upstream asked, and under what id in
 // the UPSTREAM's own id space. deliver, when non-nil, takes over the whole
@@ -203,9 +212,11 @@ func (r *Registry) SubscribeUpstreamRequests() (<-chan UpstreamRequest, func()) 
 	}
 }
 
-// onUpstreamRequest handles any REQUEST pushed by a stdio upstream mid-call.
-// Like onUpstreamNotification it runs on that upstream's single reader
-// goroutine, so it must not block or re-enter the connection synchronously.
+// onUpstreamRequest handles any REQUEST pushed by an upstream mid-call — from
+// a stdio child (Round 14) or, since Stage 17b, from an HTTP one over its SSE
+// stream. Like onUpstreamNotification it runs on that upstream's reader
+// goroutine (the SSE stream's, or the in-flight call's, for HTTP), so it must
+// not block or re-enter the connection synchronously.
 //
 // A method with no spec is log-and-ignored (the pre-Round 14 behaviour for
 // every server→client request the gateway does not proxy). Otherwise:
@@ -513,7 +524,17 @@ func (r *Registry) OnClientRootsListChanged() {
 
 	for name, conn := range targets {
 		go func(name string, conn Upstream) {
-			if err := conn.ForwardRootsListChanged(r.procCtx); err != nil {
+			// Bounded, NOT the bare process context. Stage 17b made this
+			// reachable over HTTP for the first time (before it, roots was
+			// never declared to an HTTP upstream, so the connection's own gate
+			// short-circuited every such call): an unbounded POST to a hung
+			// upstream would hold this goroutine and its connection until the
+			// gateway stopped, one leak per client roots/list_changed. stdio
+			// gets the same bound — a write into a stuck child's stdin blocks
+			// just as indefinitely (found by review).
+			ctx, cancel := context.WithTimeout(r.procCtx, forwardNotifyTimeout)
+			defer cancel()
+			if err := conn.ForwardRootsListChanged(ctx); err != nil {
 				r.log.Warn("forward roots/list_changed failed", "upstream", name, "err", err)
 			}
 		}(name, conn)
@@ -555,9 +576,10 @@ func refuseMethodNotFound(r *Registry, name string, originalID json.RawMessage, 
 }
 
 // writeUpstreamResponse sends one gateway-authored response to the upstream
-// that asked. The write runs off the caller's goroutine: a stdin write can
-// block on a stuck child, and the upstream reader publishing the callback (or
-// the client transport's Serve loop) must never stall on it.
+// that asked. The write runs off the caller's goroutine: it can block on a
+// stuck child's stdin or on an HTTP POST to an unresponsive endpoint, and the
+// upstream reader publishing the callback (or the client transport's Serve
+// loop) must never stall on it.
 func (r *Registry) writeUpstreamResponse(name string, reply *mcp.Message) {
 	r.mu.RLock()
 	conn := r.conns[name]
@@ -624,13 +646,13 @@ func (r *Registry) ServerReqPending(gatewayID string) bool {
 // SetClientServerRequestCaps records which server→client capabilities the
 // gateway's OWN client declared in its initialize. It is the SINGLE setter
 // behind both roles the two Round 14 flags used to split: what the gateway
-// declares to a stdio upstream in its handshake (read by startStdio via
-// declaredClientCaps, before Initialize) and the runtime gate that decides
-// whether an upstream's request can be served at all (read by
-// onUpstreamRequest on a reader goroutine).
+// declares to an upstream in its handshake (read by startStdio and — since
+// Stage 17b — startHTTP, via declaredClientCaps, before Initialize) and the
+// runtime gate that decides whether an upstream's request can be served at all
+// (read by onUpstreamRequest on a reader goroutine).
 //
 // Only a client-facing transport that can actually relay a server→client
-// request calls it — today stdio alone. The HTTP transport and the CLI paths
+// request calls it: stdio (Stage 15) and HTTP (Stage 17a). The CLI paths
 // (doctor/call/catalog, no MCP client at all) never do, so the set stays nil
 // and their upstream handshakes declare exactly {}. nil (or an empty map)
 // means "the client declared nothing".
@@ -664,8 +686,9 @@ func (r *Registry) clientDeclared(capability string) bool {
 	return ok
 }
 
-// declaredClientCaps is the client-capability set the gateway declares to a
-// stdio upstream in its handshake: name → the spec's rendered value.
+// declaredClientCaps is the client-capability set the gateway declares to an
+// upstream in its handshake — stdio and, since Stage 17b, HTTP alike: name →
+// the spec's rendered value.
 //
 // This is the honest intersection Stage 15 introduced: a capability travels
 // only when the gateway's own client actually declared it. The optimistic

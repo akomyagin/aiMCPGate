@@ -25,11 +25,10 @@ one catalog, and **logs** every call.
 > upstreams — the gateway now offers an upstream exactly what its own client
 > declared, instead of a blanket `{}` — server-side `Mcp-Session-Id` sessions on
 > the HTTP transport, with `DELETE /mcp` termination, and server→client requests
-> for an HTTP-connected CLIENT (`elicitation`, `sampling`, `roots` — see below).
+> over HTTP on BOTH sides — for an HTTP-connected client and from an
+> HTTP-connected upstream (`elicitation`, `sampling`, `roots` — see below).
 >
-> **Not implemented:** server→client requests from an HTTP UPSTREAM (a remote
-> MCP server asking the gateway over its own SSE stream — the stdio upstream
-> side works), and a per-client access policy.
+> **Not implemented:** a per-client access policy.
 
 ## Releases
 
@@ -244,6 +243,19 @@ Three consequences worth knowing:
   wins; an upstream request carries nothing that says which caller it belongs
   to. With a single client (the normal case) this is invisible, but run two and
   a form raised by one client's `tools/call` can surface in the other's UI.
+
+The **upstream** side of the same exchange works over HTTP too: a remote MCP
+server reached with `url:` may ask its question as an SSE frame — either on its
+long-lived `GET` stream or interleaved into the stream answering one of the
+gateway's own POSTs, which is where SDK servers put an `elicitation/create`
+raised inside a `tools/call`. The gateway proxies it through the same pipeline
+and sends the client's answer back as one ordinary POST carrying a JSON-RPC
+response **under the server's own request id**. Such an upstream is told the
+gateway's client capabilities by the same honest policy as a stdio one — a
+capability is offered only when the gateway's own client declared it, and
+`doctor`/`call`/`catalog`, which have no client at all, keep declaring exactly
+`{}`. The answer POST is not retried: an upstream that does not get it falls
+back on its own timeout.
 
 ## Reloading config (SIGHUP)
 

@@ -42,6 +42,21 @@ const (
 	sseStreamBackoffFactor  = 2
 )
 
+// respondPostTimeout bounds the ONE POST that carries the gateway's answer to a
+// request the upstream itself asked (Stage 17b). respond gets no ctx from its
+// caller — the registry answers from a detached goroutine with no request
+// context to hand down — so the deadline is built here, on top of streamCtx, and
+// a Close therefore aborts an in-flight answer instead of letting the goroutine
+// outlive the connection.
+//
+// A local constant, deliberately unrelated to the operator's call_timeout: this
+// is a one-shot round-trip carrying an already-computed answer, not a tool
+// invocation, and reaching into the config package for a single number would
+// couple the same two layers the sseStream* constants above refuse to couple.
+// Without ANY deadline the POST would hang until TCP gave up, wedging the
+// answering goroutine for minutes.
+const respondPostTimeout = 30 * time.Second
+
 // errSessionExpired signals that the upstream answered HTTP 404 to a request
 // carrying an Mcp-Session-Id. Per the spec (Streamable HTTP, session
 // management) the server may expire a session at any time, and the client
@@ -74,11 +89,16 @@ var errSessionExpired = errors.New("upstream: session expired (HTTP 404), reinit
 // There IS, however, one long-lived goroutine per connection since Round 13:
 // after a successful handshake the transport opens a GET request to the same
 // endpoint with Accept: text/event-stream — the spec's server→client stream —
-// and forwards every notification arriving on it to onNotify, the same channel
-// stdio's readLoop uses. So notifications/tools/list_changed (and other
-// server-initiated notifications) from HTTP upstreams now reach the registry.
+// and forwards what arrives on it to the same two callbacks stdio's readLoop
+// feeds: notifications to onNotify (Round 13) and server-initiated REQUESTS,
+// which the upstream expects an answer to, to onRequest (Stage 17b). So
+// notifications/tools/list_changed as well as elicitation/create & co. from
+// HTTP upstreams reach the registry exactly as they do from stdio ones. Such an
+// answer travels back as one ordinary POST (respond) under the upstream's own
+// request id — HTTP has no persistent write channel to push it into.
 // Best-effort: an upstream that answers the GET with anything but an SSE
-// stream simply has no server-initiated notifications (see runSSEStream).
+// stream simply pushes nothing (see runSSEStream); requests related to a call
+// in flight may also arrive on that call's own POST stream (readSSEResponse).
 //
 // KNOWN LIMITATION (Round 2): cancellation is NOT forwarded to HTTP upstreams.
 // stdioTransport.call sends a best-effort notifications/cancelled down the
@@ -109,6 +129,21 @@ type httpTransport struct {
 	// exists (no lock needed), must be cheap and non-blocking, must not call
 	// back into the connection synchronously.
 	onNotify func(method string, params json.RawMessage)
+
+	// onRequest, when set, is invoked for every server-initiated REQUEST the
+	// upstream pushes — its method, ORIGINAL id and raw params (Stage 17b,
+	// the HTTP half of what stdio has had since Round 14). Two SSE channels
+	// feed it: the long-lived GET stream (dispatchStreamEvent) and the
+	// response stream of one of our own POSTs, where the spec explicitly
+	// allows a server to interleave requests RELATED to the call in flight —
+	// which is exactly where real SDK servers put an elicitation/create
+	// raised inside a tools/call (readSSEResponse). WHICH methods are
+	// actually proxied is the registry's policy (its spec table), never this
+	// transport's — here a frame is only classified. Same contract as
+	// onNotify: set once in StartHTTP before any goroutine exists, cheap,
+	// non-blocking, no synchronous call back into the connection (the
+	// registry answers from its own goroutine).
+	onRequest func(method string, id, params json.RawMessage)
 
 	// streamCtx/streamCancel bound the lifetime of the GET SSE stream
 	// goroutine, independent of any per-call ctx: Close cancels it and then
@@ -148,10 +183,19 @@ type httpTransport struct {
 //
 // onNotify, when non-nil, receives every notification the upstream pushes on
 // its server→client GET SSE stream (opened after a successful handshake, see
-// startSSEStream) — the HTTP counterpart of StartStdio's onNotify. nil means
-// the caller does not care about server-initiated notifications and no stream
-// is opened at all.
-func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client, gatewayVersion string, onNotify func(method string, params json.RawMessage)) *Conn {
+// startSSEStream) — the HTTP counterpart of StartStdio's onNotify.
+//
+// onRequest, when non-nil, receives every server-initiated REQUEST the upstream
+// sends, with the method, the upstream's ORIGINAL id and raw params — from the
+// GET stream or interleaved into the SSE response of one of our POSTs (Stage
+// 17b). nil means such requests are log-and-dropped, the pre-Stage-17b
+// behaviour. Both callbacks must be passed here rather than installed later:
+// the stream goroutine may see a frame the instant the handshake completes, and
+// writing the fields into the struct literal before any goroutine exists is
+// what makes them lock-free.
+//
+// With BOTH nil nobody listens to the GET stream, so it is never opened at all.
+func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage)) *Conn {
 	if client == nil {
 		// Each connection gets its OWN client with its own cloned transport.
 		// Sharing one package-level client (the previous design) meant Close on
@@ -183,7 +227,8 @@ func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]strin
 			log:          log,
 			client:       client,
 			headers:      headers,
-			onNotify:     onNotify,
+			onNotify:     onNotify,  // must be set before any goroutine exists
+			onRequest:    onRequest, // same rule — see the doc comment
 			streamCtx:    streamCtx,
 			streamCancel: streamCancel,
 			streamDone:   streamDone,
@@ -238,9 +283,16 @@ func (c *httpTransport) Close() error {
 // known by then, and the spec keys the stream to it. Idempotent: repeated
 // Initialize calls (session-expiry re-init) and a racing Close are both
 // handled under mu — at most one goroutine ever runs, and never after Close.
-// A nil onNotify means nobody listens, so no stream is opened at all.
+//
+// The stream is opened when ANY consumer listens to it — notifications or
+// server-initiated requests (Stage 17b); with both callbacks nil nobody listens
+// and no stream is opened at all. Gating on onNotify alone would leave a
+// request-only caller without a stream. That combination is test-only today
+// (the registry always passes both), but a gate that is correct only because of
+// what its call sites happen to pass is not a gate — and for the same reason
+// each branch of dispatchStreamEvent guards its OWN callback.
 func (c *httpTransport) startSSEStream() {
-	if c.onNotify == nil {
+	if c.onNotify == nil && c.onRequest == nil {
 		return
 	}
 	c.mu.Lock()
@@ -357,12 +409,29 @@ func (c *httpTransport) streamSSEOnce(ctx context.Context, lastEventID string) (
 	defer func() { _ = resp.Body.Close() }()
 
 	switch {
+	case resp.StatusCode == http.StatusNotFound && sid != "":
+		// 404 to a request that CARRIED a session id is not "no stream here" —
+		// per the spec it means that session is gone and the client must
+		// re-initialize (same reading as call's hadSession branch). Reported as
+		// an ERROR so runSSEStream backs off and retries instead of giving up
+		// forever: the next attempt re-reads the session id, which a
+		// CallTool-triggered re-initialize will have refreshed by then.
+		//
+		// Lumping this in with 405 below meant server push died permanently
+		// after any session expiry, and died INVISIBLY — tools/call kept
+		// recovering on its own, so nothing looked broken while
+		// elicitation/sampling/roots from this upstream could never arrive
+		// again (found by review; harmless before Stage 17b, when the stream
+		// only carried notifications).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return newLastID, false, fmt.Errorf("upstream %q: GET %s: %w",
+			c.name, redactedEndpoint(c.endpoint), errSessionExpired)
 	case resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound:
 		// The explicit "I do not offer the GET stream" answer (the spec says
-		// MUST be 405; 404 is the same statement from servers that route the
-		// method away entirely). Drain a small bounded remainder so the
-		// connection returns to the keep-alive pool. opened=false with nil err
-		// is the caller's "the server said no" signal.
+		// MUST be 405; a 404 with no session id in play is the same statement
+		// from servers that route the method away entirely). Drain a small
+		// bounded remainder so the connection returns to the keep-alive pool.
+		// opened=false with nil err is the caller's "the server said no" signal.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return newLastID, false, nil
 	case resp.StatusCode != http.StatusOK:
@@ -395,23 +464,48 @@ func (c *httpTransport) streamSSEOnce(ctx context.Context, lastEventID string) (
 }
 
 // dispatchStreamEvent decodes one event payload from the long-lived GET stream
-// and hands a notification to onNotify — the same channel stdio's readLoop
-// feeds (its IsNotification branch), so the registry sees identical input from
-// both transports. Anything else is ignored, matching readLoop: responses to
-// our POSTs arrive on the POST's own body per the spec, and server→client
-// REQUESTS (sampling etc.) are not handled in the MVP.
+// and classifies it EXACTLY as stdio's readLoop classifies a line from the
+// child's stdout — same mcp.Message predicates, same order — so the registry
+// receives identical input from both transports and no policy lives in either
+// one. The order is load-bearing: a malformed hybrid must be rejected before
+// the response branch, or a {method, id, result} frame would pass as a response.
+//
+// Notifications go to onNotify (Round 13); server-initiated REQUESTS go to
+// onRequest (Stage 17b). RESPONSES are dropped: per the spec an answer to one
+// of our POSTs comes back on that POST's own body, so a response frame here has
+// no waiter to deliver it to — the mirror of stdio's "response with no waiter".
+// Each branch guards its own callback, because the stream may have been opened
+// for the other consumer alone (see startSSEStream).
 func (c *httpTransport) dispatchStreamEvent(payload []byte) {
 	var msg mcp.Message
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		c.log.Debug("upstream SSE stream frame not JSON-RPC (ignored)", "upstream", c.name, "err", err)
 		return
 	}
-	if !msg.IsNotification() {
-		c.log.Debug("upstream SSE stream message ignored", "upstream", c.name, "method", msg.Method, "id", string(msg.ID))
-		return
+	switch {
+	case msg.IsMalformedHybrid():
+		// Both a method and a result/error — a shape JSON-RPC 2.0 does not
+		// allow. Every classifier in the project (client dispatcher, demo stub,
+		// stdio reader) rejects it; this one must not disagree.
+		c.log.Warn("upstream sent malformed hybrid message (method and result/error together), dropping",
+			"upstream", c.name, "method", msg.Method, "id", string(msg.ID))
+	case msg.IsResponse():
+		c.log.Debug("upstream SSE stream carried a response with no waiter (ignored)",
+			"upstream", c.name, "id", string(msg.ID))
+	case msg.IsNotification():
+		c.log.Debug("upstream notification", "upstream", c.name, "method", msg.Method)
+		if c.onNotify != nil {
+			c.onNotify(msg.Method, msg.Params)
+		}
+	default:
+		// A request FROM the upstream (method plus a non-null id). Forwarded
+		// verbatim; the registry decides whether it proxies that method at all.
+		if c.onRequest != nil {
+			c.onRequest(msg.Method, msg.ID, msg.Params)
+		} else {
+			c.log.Debug("upstream request ignored", "upstream", c.name, "method", msg.Method)
+		}
 	}
-	c.log.Debug("upstream notification", "upstream", c.name, "method", msg.Method)
-	c.onNotify(msg.Method, msg.Params)
 }
 
 // call POSTs one JSON-RPC request and returns the matching response. It handles
@@ -510,6 +604,66 @@ func (c *httpTransport) notify(ctx context.Context, method string, params json.R
 	return nil
 }
 
+// respond POSTs one gateway-authored RESPONSE to a request this upstream itself
+// initiated (Stage 17b). It goes through post like call and notify, so it
+// carries the same session id, negotiated protocol version and static auth
+// headers — a response belongs to the session that asked, and stripping any of
+// those would make the server unable to correlate it. Per the spec the server
+// answers a response body with 202 and no content; any 2xx is accepted, matching
+// notify.
+//
+// There are deliberately NO retries of any kind:
+//
+//   - 404 with a live session means the server forgot the session that asked.
+//     errSessionExpired is reported, but — unlike CallTool — nothing is
+//     re-initialized or re-sent: a fresh Initialize opens a NEW session in
+//     which this request id was never asked, so the retry would deliver an
+//     answer to a question nobody posed. CallTool may retry because it repeats
+//     OUR request, which a 404 proves never ran. The session id itself is left
+//     alone, see below;
+//   - everything else (5xx, timeouts, network errors, a cancelled streamCtx)
+//     is returned as-is. The only caller — the registry's
+//     writeUpstreamResponse — already Warn-logs the failure, and an upstream
+//     left without an answer falls back on its own timeout, exactly as it does
+//     when a stdio gateway dies mid-answer.
+func (c *httpTransport) respond(msg *mcp.Message) error {
+	ctx, cancel := context.WithTimeout(c.streamCtx, respondPostTimeout)
+	defer cancel()
+
+	resp, err := c.post(ctx, msg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Bounded drain before Close so net/http can reuse the connection: a
+		// 202 body is empty or tiny, and reading an unbounded one from an
+		// upstream that decided to stream here would only burn the deadline.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		c.mu.Lock()
+		hadSession := c.sessionID != ""
+		c.mu.Unlock()
+		if hadSession {
+			// The session that asked the question is gone. Reported
+			// distinctively for the log, but — unlike call — the stale id is
+			// deliberately KEPT (Stage 17b §13, correcting the plan): call's
+			// recovery only fires for a request that CARRIED a session id, so
+			// clearing it here would turn the next tools/call into a plain 404
+			// with no re-initialize and brick the upstream until a gateway
+			// restart. Leaving the id in place lets that next call take the
+			// existing expiry path and recover on its own.
+			return fmt.Errorf("upstream %q: respond to request id %s: %w", c.name, msg.ID, errSessionExpired)
+		}
+	}
+	return fmt.Errorf("upstream %q: respond to request id %s: HTTP %d", c.name, msg.ID, resp.StatusCode)
+}
+
 // post marshals msg and POSTs it to the MCP endpoint with the headers the spec
 // requires (Accept for both content types, the negotiated protocol version, the
 // session id once known) plus any static per-upstream headers (auth).
@@ -605,10 +759,30 @@ func (c *httpTransport) readSSEResponse(body io.Reader, want json.RawMessage) (*
 			found = &msg
 			return false // stop scanning; the stream is abandoned by call's deferred Close
 		}
-		// Interleaved server->client traffic on a POST response stream is
-		// related to the in-flight request (progress etc.) — not handled in
-		// the MVP, MCP_NOTES §7 — or an unrelated frame; either way skipped.
-		c.log.Debug("upstream SSE interleaved message ignored", "upstream", c.name, "method", msg.Method)
+		switch {
+		case msg.IsMalformedHybrid():
+			// Rejected here too, so all four classifiers agree (see
+			// dispatchStreamEvent). Checked before the request branch: a
+			// {method, id, result} frame is not a request either.
+			c.log.Warn("upstream sent malformed hybrid message (method and result/error together), dropping",
+				"upstream", c.name, "method", msg.Method, "id", string(msg.ID))
+		case msg.IsRequest() && c.onRequest != nil:
+			// A server-initiated REQUEST interleaved before our response — per
+			// the spec the stream of a POST is precisely where a server puts
+			// requests RELATED to the call in flight, and that is where real
+			// SDK servers raise an elicitation/create from inside a tools/call
+			// (Stage 17b). Forward it and keep scanning: our own response is
+			// still to come, and the answer travels back as a SEPARATE POST
+			// from the registry's goroutine — concurrent requests are normal
+			// for net/http, and the server needs that answer to finish the
+			// very call this stream belongs to.
+			c.onRequest(msg.Method, msg.ID, msg.Params)
+		default:
+			// Notifications tied to the in-flight call (progress etc.) are
+			// deliberately not proxied (Round 13 / MCP_NOTES §7), and a
+			// response to somebody else's id has no waiter here.
+			c.log.Debug("upstream SSE interleaved message ignored", "upstream", c.name, "method", msg.Method)
+		}
 		return true
 	})
 	if err != nil {
