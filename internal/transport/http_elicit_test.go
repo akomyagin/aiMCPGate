@@ -1,89 +1,86 @@
 package transport
 
 import (
-	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
-	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
 
-// TestHTTPGatewayDoesNotDeclareElicitationToUpstream pins the negative half of
-// the truthful upstream handshake (the fix after Round 14): the HTTP
-// client-facing transport has no channel for gateway→client requests, never
-// calls SetClientServerRequestCaps, and so the gateway must NOT declare the
-// elicitation capability to its stdio upstreams — declaring would promise a
-// proxy chain that does not exist. Asserted from both ends: the fakeserver's
-// FAKE_CAPS_FILE records the raw capabilities the handshake actually carried,
-// and — because the fakeserver respects negotiation — its armed FAKE_ELICIT
-// hook answers the call directly with the distinct |elicit-skipped marker
-// instead of asking. The client here even declares elicitation itself: that
-// must change nothing, since the upstream handshakes completed before any
-// client connected and the transport still cannot relay the request.
-func TestHTTPGatewayDoesNotDeclareElicitationToUpstream(t *testing.T) {
-	bin := buildFakeServer(t)
-	capsFile := filepath.Join(t.TempDir(), "caps")
-	cfg := &config.Config{
-		Transport: config.TransportHTTP,
-		Upstreams: []config.Upstream{
-			{Name: "web", Command: bin, Enabled: boolPtr(true), Env: map[string]string{
-				"FAKE_NAME":      "web",
-				"FAKE_TOOLS":     "ask",
-				"FAKE_ELICIT":    "1",
-				"FAKE_CAPS_FILE": capsFile,
-			}},
-		},
-	}
-	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	if err := reg.Start(context.Background()); err != nil {
-		t.Fatalf("registry Start: %v", err)
-	}
-	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
-	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", hs.handleMCP)
-	srv := httptest.NewServer(mux)
-	defer func() { srv.Close(); _ = reg.Close() }()
+// Stage 17a REPLACED the test that used to live here.
+//
+// TestHTTPGatewayDoesNotDeclareElicitationToUpstream pinned the Round 14
+// limitation: the HTTP transport had no channel for gateway→client requests,
+// so it never called SetClientServerRequestCaps and the gateway declared
+// nothing to its upstreams even when the HTTP client itself declared
+// elicitation. That behaviour is exactly what this stage removes, so the test
+// is gone rather than weakened — see http_serverreq_test.go for the round trip
+// that replaces it (E1) and TestHTTPLazyStartPinsFirstClientCaps for the
+// handshake bytes it used to assert the negative of.
+//
+// What remains here is the half of that assertion which is still TRUE and
+// still worth pinning: a client that declares NOTHING must still see no
+// elicitation declared upstream, and the upstream must skip asking. It is the
+// negative control for the whole stage — the pinning in ensureRegistry takes
+// the first client's set, whatever that set is, including empty.
 
-	resp := post(t, srv, mcp.NewRequest(mcp.IntID(1), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    json.RawMessage(`{"elicitation":{}}`),
-		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
-	})))
-	sid := resp.Header.Get(sessionHeader)
-	if sid == "" {
-		t.Fatalf("initialize response carries no %s header", sessionHeader)
-	}
-	if msg := decodeBody(t, resp); msg.Error != nil {
-		t.Fatalf("initialize error: %v", msg.Error)
-	}
+// TestHTTPUndeclaringClientGetsNoElicitation drives a full gateway whose first
+// (and only) client declares no capabilities at all: the upstream handshake
+// must carry an empty capabilities object, and the negotiation-respecting
+// fakeserver must answer its tools/call with the |elicit-skipped marker rather
+// than asking anyone.
+func TestHTTPUndeclaringClientGetsNoElicitation(t *testing.T) {
+	gw := startServerReqGateway(t, serverReqCfg(t, map[string]string{"FAKE_ELICIT": "1"}))
+	defer gw.stop()
 
-	callID := mcp.IntID(2)
-	resp = postSession(t, srv, mcp.NewRequest(callID, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__ask"})), sid)
-	msg := decodeBody(t, resp)
-	if string(msg.ID) != string(callID) {
-		t.Fatalf("tools/call response id = %s, want %s", msg.ID, callID)
-	}
+	sid := gw.initialize(t, `{}`) // no elicitation key
+	open := gw.openStream(t, sid)
+	defer open.close()
+
+	msg := gw.call(t, sid, "web__ask")
 	if msg.Error != nil {
 		t.Fatalf("tools/call error: %v", msg.Error)
 	}
 	if !strings.Contains(string(msg.Result), "elicit-skipped") {
-		t.Errorf("upstream should have skipped elicitation against an undeclaring gateway, got: %s", msg.Result)
+		t.Errorf("upstream asked (or the hook broke) although the client declared nothing: %s", msg.Result)
 	}
 
-	// The direct record: the handshake's capabilities object must not carry
-	// the elicitation key at all (today it is exactly {}).
-	data, err := os.ReadFile(capsFile)
+	// The direct record: the handshake's capabilities object must not carry the
+	// elicitation key at all (today it is exactly {}).
+	data, err := os.ReadFile(gw.capsFile)
 	if err != nil {
 		t.Fatalf("read caps file: %v", err)
 	}
 	if strings.Contains(string(data), "elicitation") {
-		t.Errorf("gateway declared elicitation to a stdio upstream over an HTTP client transport: %s", data)
+		t.Errorf("gateway declared elicitation on behalf of a client that declared none: %s", data)
+	}
+}
+
+// TestHTTPRootsListChangedReachesUpstreams pins the side effect of turning the
+// dispatcher's serverRequests flag on for HTTP: a client's
+// notifications/roots/list_changed is now relayed to every upstream the gateway
+// declared roots to, exactly as over stdio. Before Stage 17a the HTTP
+// dispatcher dropped it on the floor.
+func TestHTTPRootsListChangedReachesUpstreams(t *testing.T) {
+	cfg, changedFile := rootsChangedCfg(t)
+	gw := startServerReqGateway(t, cfg)
+	defer gw.stop()
+
+	sid := gw.initialize(t, `{"roots":{"listChanged":true}}`)
+	resp := gw.post(t, mcp.NewNotification(mcp.NotifRootsListChanged, nil), sid)
+	_ = resp.Body.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile(changedFile)
+		if err == nil && strings.Contains(string(data), "roots-changed") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("upstream never received the client's notifications/roots/list_changed")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

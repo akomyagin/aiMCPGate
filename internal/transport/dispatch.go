@@ -106,13 +106,32 @@ type dispatcher struct {
 
 	// serverRequests is whether this transport can proxy an upstream's
 	// server→client REQUEST (elicitation/create, sampling/createMessage,
-	// roots/list) to the client and route the answer back: true only for
-	// stdio. Gates handleInitialize's capability recording — over HTTP the
-	// registry must keep declaring nothing even for a client that declares
-	// the capabilities, because the HTTP transport has no channel for
-	// gateway→client requests and never subscribes to
-	// SubscribeUpstreamRequests.
+	// roots/list) to the client and route the answer back — true for stdio
+	// (the pipe) and, since Stage 17a, for HTTP too (the GET SSE stream of a
+	// specific session). It gates the roots-cache invalidation on initialize
+	// and the notifications/roots/list_changed relay: a transport that can
+	// never relay roots/list has no cache to drop and declared roots to
+	// nobody.
 	serverRequests bool
+
+	// recordCaps is whether handleInitialize may write the client's declared
+	// server→client capabilities into the REGISTRY (the process-wide gate
+	// that also decides what upstream handshakes declare). It is split off
+	// from serverRequests because the two transports differ here and nowhere
+	// else:
+	//
+	//   - stdio serves exactly ONE client per process, so a re-initialize
+	//     genuinely restates that one client's capabilities — true;
+	//   - HTTP serves several sessions concurrently, and handleInitialize runs
+	//     for EVERY session's handshake. Writing there would let the last
+	//     client to connect redefine what the gateway already declared to its
+	//     upstreams (declaration happens once, at bring-up, and MCP
+	//     2025-06-18 has no re-negotiation) — false. The HTTP transport pins
+	//     the set once, in ensureRegistry, from the FIRST initialize; honesty
+	//     per session is then enforced by the transport's own delivery gate,
+	//     which only hands a request to a session that declared its
+	//     capability.
+	recordCaps bool
 
 	// cancelMu guards cancels: client request id (raw bytes) → the CancelFunc
 	// that aborts that in-flight tools/call's context (Round 2). Entries live
@@ -127,15 +146,19 @@ type dispatcher struct {
 // which tools capability to advertise: true only for a transport that can push
 // a server→client notifications/tools/list_changed — today both stdio (the
 // pipe) and HTTP (the GET SSE stream, Round 12). See buildCapabilities.
-// serverRequests is true only for a transport that proxies upstream-initiated
-// requests to the client (Round 14, Stage 15) — today stdio only.
-func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, serverRequests bool) *dispatcher {
+// serverRequests is true for a transport that proxies upstream-initiated
+// requests to the client (Round 14, Stage 15; HTTP since Stage 17a).
+// recordCaps additionally lets handleInitialize write those capabilities into
+// the registry — stdio only; see the field comments for why HTTP pins them
+// elsewhere.
+func newDispatcher(reg *registry.Registry, log *slog.Logger, version string, listChanged, serverRequests, recordCaps bool) *dispatcher {
 	return &dispatcher{
 		reg:            reg,
 		log:            log,
 		version:        version,
 		listChanged:    listChanged,
 		serverRequests: serverRequests,
+		recordCaps:     recordCaps,
 		cancels:        map[string]context.CancelFunc{},
 	}
 }
@@ -242,19 +265,26 @@ func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
 	if client := clientString(req.Params); client != "" {
 		d.log.Debug("client initialize", "client", client)
 	}
-	// Record which server→client requests this client can answer — stdio only
-	// (see the serverRequests field). On the FIRST initialize the stdio Serve
-	// loop has already recorded the same set BEFORE starting the registry, so
-	// this call is a no-op restatement; on a RE-initialize it genuinely
-	// updates two things: the runtime refusal gate, and what will be declared
-	// to connections created LATER (a supervisor restart, a reload). Existing
-	// handshakes are NOT re-negotiated — MCP 2025-06-18 has no re-negotiation,
-	// so a capability withdrawn by a second initialize keeps travelling in the
-	// handshakes that already happened; the refusal path is what stays honest.
 	if d.serverRequests {
-		d.reg.SetClientServerRequestCaps(clientServerRequestCaps(req.Params))
+		// Record which server→client requests this client can answer — under
+		// recordCaps, i.e. stdio only (see the field). On stdio's FIRST
+		// initialize the Serve loop has already recorded the same set BEFORE
+		// starting the registry, so this call is a no-op restatement; on a
+		// RE-initialize it genuinely updates two things: the runtime refusal
+		// gate, and what will be declared to connections created LATER (a
+		// supervisor restart, a reload). Existing handshakes are NOT
+		// re-negotiated — MCP 2025-06-18 has no re-negotiation, so a capability
+		// withdrawn by a second initialize keeps travelling in the handshakes
+		// that already happened; the refusal path is what stays honest.
+		if d.recordCaps {
+			d.reg.SetClientServerRequestCaps(clientServerRequestCaps(req.Params))
+		}
 		// A fresh handshake may well be a different client with different
-		// roots, so anything cached from the previous one is dropped.
+		// roots, so anything cached from the previous one is dropped. This runs
+		// for HTTP too, on every session's initialize: conservative and right —
+		// a new session may be a different client with different roots, and the
+		// next asker simply goes back to the client instead of being served a
+		// stale list.
 		d.reg.InvalidateRootsCache()
 	}
 	result := mcp.InitializeResult{

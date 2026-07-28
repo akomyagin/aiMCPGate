@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"testing"
 	"time"
+
+	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
 // testStore returns a store with a controllable clock. The returned advance
@@ -243,5 +245,253 @@ func TestSessionStoreIDsUniqueAndWellFormed(t *testing.T) {
 			t.Fatalf("duplicate session id %q after %d creates", sess.id, i)
 		}
 		seen[sess.id] = true
+	}
+}
+
+// Stage 17a — the unicast delivery layer for upstream-initiated requests
+// (deliverServerReq / takeServerReq / the orphan hand-off). Driven through the
+// store directly for the same reason as everything above: the e2e behaviour is
+// in http_serverreq_test.go, here the point is the decision table itself.
+
+// capsOf builds the declared-capability map a session is created with.
+func capsOf(names ...string) map[string]json.RawMessage {
+	caps := map[string]json.RawMessage{}
+	for _, n := range names {
+		caps[n] = json.RawMessage(`{}`)
+	}
+	return caps
+}
+
+// serverReq is the message shape the router delivers — only its id matters to
+// the store, which never looks inside.
+func serverReq(gatewayID string) *mcp.Message {
+	return mcp.NewRequest(mcp.StringID(gatewayID), mcp.MethodElicitationCreate, nil)
+}
+
+// TestSessionStoreDeliverServerReq is the whole target-selection contract in
+// one place: who is eligible, what happens when nobody is, and that the
+// ownership record is written in the same breath as the send.
+func TestSessionStoreDeliverServerReq(t *testing.T) {
+	t.Run("delivered to a capable session with a stream", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		sess, _ := st.create("cli/1", capsOf(mcp.CapElicitation))
+		ch := make(chan *mcp.Message, 1)
+		st.addReqStream(sess, ch)
+
+		if !st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("deliverServerReq = false for a capable session with an open stream")
+		}
+		select {
+		case got := <-ch:
+			if string(got.ID) != `"elicit-1"` {
+				t.Errorf("delivered message id = %s, want \"elicit-1\"", got.ID)
+			}
+		default:
+			t.Fatal("deliverServerReq reported success but nothing reached the stream")
+		}
+		// The ownership record must exist ALREADY — a client answering the
+		// instant it reads the event depends on it (that is why the record and
+		// the send share one critical section).
+		if !st.takeServerReq(sess, "elicit-1") {
+			t.Fatal("the delivering session does not own the request it was handed")
+		}
+		if st.takeServerReq(sess, "elicit-1") {
+			t.Error("the ownership record survived being taken: one answer per request")
+		}
+	})
+
+	t.Run("session without the capability is not a candidate", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		sess, _ := st.create("cli/1", capsOf(mcp.CapSampling)) // declares something else
+		ch := make(chan *mcp.Message, 1)
+		st.addReqStream(sess, ch)
+
+		if st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("delivered an elicitation to a session that never declared it")
+		}
+		if len(ch) != 0 {
+			t.Error("a message reached the stream of an incapable session")
+		}
+	})
+
+	t.Run("capability without an open stream is not a candidate", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		st.create("cli/1", capsOf(mcp.CapElicitation)) // no addReqStream
+
+		if st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("delivered a request to a session with no open SSE stream")
+		}
+	})
+
+	t.Run("full buffer falls through to the next stream, then gives up", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		sess, _ := st.create("cli/1", capsOf(mcp.CapElicitation))
+		older := make(chan *mcp.Message, 1)
+		newer := make(chan *mcp.Message, 1)
+		st.addReqStream(sess, older)
+		st.addReqStream(sess, newer)
+		newer <- serverReq("filler") // the preferred (newest) stream is backed up
+
+		if !st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("deliverServerReq gave up although a second stream had room")
+		}
+		if len(older) != 1 {
+			t.Errorf("older stream received %d messages, want 1 (the fall-through target)", len(older))
+		}
+
+		// Now every stream is full: the send must NOT block — a blocking send
+		// here would hold sessionStore.mu and stall every handler.
+		if st.deliverServerReq(mcp.CapElicitation, "elicit-2", serverReq("elicit-2")) {
+			t.Fatal("deliverServerReq = true with every stream buffer full")
+		}
+		if st.takeServerReq(sess, "elicit-2") {
+			t.Error("an undelivered request left an ownership record behind")
+		}
+	})
+
+	t.Run("the capable session wins over a more recent incapable one", func(t *testing.T) {
+		st, advance := testStore(t, time.Hour, 8)
+		capable, _ := st.create("capable/1", capsOf(mcp.CapElicitation))
+		capableCh := make(chan *mcp.Message, 1)
+		st.addReqStream(capable, capableCh)
+
+		advance(time.Minute) // the second session is strictly the fresher one
+		other, _ := st.create("other/1", nil)
+		otherCh := make(chan *mcp.Message, 1)
+		st.addReqStream(other, otherCh)
+
+		if !st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("deliverServerReq = false although one session declared elicitation")
+		}
+		if len(capableCh) != 1 {
+			t.Errorf("capable session received %d messages, want 1", len(capableCh))
+		}
+		if len(otherCh) != 0 {
+			t.Errorf("incapable session received %d messages, want 0 (unicast, and gated on caps)", len(otherCh))
+		}
+	})
+
+	t.Run("a foreign session cannot claim the answer", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		owner, _ := st.create("owner/1", capsOf(mcp.CapElicitation))
+		st.addReqStream(owner, make(chan *mcp.Message, 1))
+		stranger, _ := st.create("stranger/1", capsOf(mcp.CapElicitation))
+
+		if !st.deliverServerReq(mcp.CapElicitation, "elicit-1", serverReq("elicit-1")) {
+			t.Fatal("deliverServerReq = false for a capable session with an open stream")
+		}
+		if st.takeServerReq(stranger, "elicit-1") {
+			t.Fatal("a session that was never asked claimed somebody else's elicitation")
+		}
+		if !st.takeServerReq(owner, "elicit-1") {
+			t.Error("the rejected foreign claim consumed the real owner's record")
+		}
+	})
+}
+
+// TestSessionStoreOrphanedServerReqOnRemove pins the give-up path: a session
+// that dies with a request outstanding must have that request refused AT ONCE
+// (both ways a session can die), not left to the registry's five-minute
+// deadline — an upstream is sitting inside tools/call waiting for it. The hook
+// must also be called with the store's mutex released, which -race plus the
+// re-entrant call below (touch inside the hook) is what actually checks.
+func TestSessionStoreOrphanedServerReqOnRemove(t *testing.T) {
+	deliver := func(st *sessionStore, gatewayID string) *httpSession {
+		t.Helper()
+		sess, _ := st.create("cli/1", capsOf(mcp.CapElicitation))
+		st.addReqStream(sess, make(chan *mcp.Message, 1))
+		if !st.deliverServerReq(mcp.CapElicitation, gatewayID, serverReq(gatewayID)) {
+			t.Fatalf("deliverServerReq(%q) = false", gatewayID)
+		}
+		return sess
+	}
+
+	t.Run("terminate", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		var refused []string
+		st.onServerReqOrphaned = func(id string) {
+			// Re-enter the store from inside the callback: legal only because
+			// it is invoked with mu released.
+			st.trackedServerReqIDs()
+			refused = append(refused, id)
+		}
+		sess := deliver(st, "elicit-1")
+
+		if !st.terminate(sess.id) {
+			t.Fatal("terminate of a live session returned false")
+		}
+		if len(refused) != 1 || refused[0] != "elicit-1" {
+			t.Fatalf("refused = %v, want exactly [elicit-1] on session termination", refused)
+		}
+		if ids := st.trackedServerReqIDs(); len(ids) != 0 {
+			t.Errorf("ownership records %v survived the session", ids)
+		}
+	})
+
+	t.Run("idle expiry via touch", func(t *testing.T) {
+		const ttl = 10 * time.Minute
+		st, advance := testStore(t, ttl, 8)
+		var refused []string
+		st.onServerReqOrphaned = func(id string) { refused = append(refused, id) }
+		sess := deliver(st, "elicit-7")
+
+		advance(ttl + time.Second) // streams tally is 0 here, so the session dies
+		if _, _, ok := st.touch(sess.id); ok {
+			t.Fatal("touch past the idle TTL returned ok=true")
+		}
+		if len(refused) != 1 || refused[0] != "elicit-7" {
+			t.Fatalf("refused = %v, want exactly [elicit-7] on idle expiry", refused)
+		}
+	})
+
+	t.Run("answered requests are not refused afterwards", func(t *testing.T) {
+		st, _ := testStore(t, time.Minute, 8)
+		var refused []string
+		st.onServerReqOrphaned = func(id string) { refused = append(refused, id) }
+		sess := deliver(st, "elicit-9")
+
+		if !st.takeServerReq(sess, "elicit-9") {
+			t.Fatal("takeServerReq = false for the owning session")
+		}
+		if !st.terminate(sess.id) {
+			t.Fatal("terminate of a live session returned false")
+		}
+		if len(refused) != 0 {
+			t.Errorf("refused = %v, want none: the client had already answered", refused)
+		}
+	})
+}
+
+// TestSessionStoreSweepsRequestsTheRegistryGaveUpOn covers the lazy cleanup of
+// ownership records whose registry entry expired on its own deadline: the ids
+// are forgotten silently (the registry already refused the upstream), and a
+// later session death must not re-refuse them.
+func TestSessionStoreSweepsRequestsTheRegistryGaveUpOn(t *testing.T) {
+	st, _ := testStore(t, time.Minute, 8)
+	var refused []string
+	st.onServerReqOrphaned = func(id string) { refused = append(refused, id) }
+
+	sess, _ := st.create("cli/1", capsOf(mcp.CapElicitation))
+	st.addReqStream(sess, make(chan *mcp.Message, 4))
+	for _, id := range []string{"elicit-1", "elicit-2"} {
+		if !st.deliverServerReq(mcp.CapElicitation, id, serverReq(id)) {
+			t.Fatalf("deliverServerReq(%q) = false", id)
+		}
+	}
+
+	ids := st.trackedServerReqIDs()
+	if len(ids) != 2 {
+		t.Fatalf("trackedServerReqIDs = %v, want both delivered ids", ids)
+	}
+	st.dropServerReqs([]string{"elicit-1"})
+	if got := st.trackedServerReqIDs(); len(got) != 1 || got[0] != "elicit-2" {
+		t.Fatalf("after dropping elicit-1, tracked = %v, want [elicit-2]", got)
+	}
+
+	if !st.terminate(sess.id) {
+		t.Fatal("terminate of a live session returned false")
+	}
+	if len(refused) != 1 || refused[0] != "elicit-2" {
+		t.Fatalf("refused = %v, want only the still-tracked [elicit-2]", refused)
 	}
 }

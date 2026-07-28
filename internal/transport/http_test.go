@@ -2,7 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -18,12 +17,17 @@ import (
 
 // startHTTPGateway builds a gateway with one stdio fakeserver upstream and wires
 // its httpServer.handleMCP handler into an httptest.Server, so tests drive the
-// client-facing HTTP transport with REAL HTTP round-trips. The registry is
-// started once up front (as Serve would) and torn down via the returned cleanup.
+// client-facing HTTP transport with REAL HTTP round-trips. The registry starts
+// itself on the first request that needs it (Stage 17a) and is torn down via the
+// returned cleanup — Close is correct for a registry that never started, so a
+// test failing before its first POST cleans up fine.
 //
 // It deliberately exercises the handler directly rather than httpServer.Serve so
 // the test needs no ephemeral-port bookkeeping; Serve's own bind/shutdown path
-// is thin plumbing over this handler.
+// is thin plumbing over this handler. Note what that costs: a handler mounted
+// this way has no server→client request router (Serve's prologue subscribes it),
+// which is exactly today's behaviour for these tests — the ones that need the
+// router run the real Serve, in http_serverreq_test.go.
 func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 	t.Helper()
 	bin := buildFakeServer(t)
@@ -38,9 +42,10 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 		},
 	}
 	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	if err := reg.Start(context.Background()); err != nil {
-		t.Fatalf("registry Start: %v", err)
-	}
+	// No reg.Start here (Stage 17a): the HTTP transport starts the registry
+	// lazily, on the first request that needs it, so that the capabilities its
+	// client declares can still be declared to the upstreams. Starting it here
+	// too would launch every upstream twice.
 
 	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
 	mux := http.NewServeMux()
@@ -357,9 +362,10 @@ func startHTTPGatewayWithAuth(t *testing.T, token string) (*httptest.Server, fun
 		},
 	}
 	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	if err := reg.Start(context.Background()); err != nil {
-		t.Fatalf("registry Start: %v", err)
-	}
+	// No reg.Start here (Stage 17a): the HTTP transport starts the registry
+	// lazily, on the first request that needs it, so that the capabilities its
+	// client declares can still be declared to the upstreams. Starting it here
+	// too would launch every upstream twice.
 	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", hs.authMiddleware(http.HandlerFunc(hs.handleMCP)))

@@ -23,12 +23,13 @@ one catalog, and **logs** every call.
 > since v0.3.0 but not yet released: `sampling/createMessage` and `roots/list`
 > proxying (stdio↔stdio as well), honest capability declaration to
 > upstreams — the gateway now offers an upstream exactly what its own client
-> declared, instead of a blanket `{}` — and server-side `Mcp-Session-Id`
-> sessions on the HTTP transport, with `DELETE /mcp` termination.
+> declared, instead of a blanket `{}` — server-side `Mcp-Session-Id` sessions on
+> the HTTP transport, with `DELETE /mcp` termination, and server→client requests
+> for an HTTP-connected CLIENT (`elicitation`, `sampling`, `roots` — see below).
 >
-> **Not implemented:** server→client requests over the HTTP transport — that is
-> `elicitation`, `sampling` and `roots` alike, with HTTP on either side — and a
-> per-client access policy.
+> **Not implemented:** server→client requests from an HTTP UPSTREAM (a remote
+> MCP server asking the gateway over its own SSE stream — the stdio upstream
+> side works), and a per-client access policy.
 
 ## Releases
 
@@ -211,6 +212,38 @@ curl -s -X DELETE http://127.0.0.1:28080/mcp -H "Mcp-Session-Id: $SID"
 The session also makes the call log honest: every call is audited under the
 `clientInfo` of the session that made it, so several HTTP clients are told apart
 in `calls.jsonl` instead of sharing one blank `client` field.
+
+### Server→client requests over HTTP (`elicitation`, `sampling`, `roots`)
+
+When an upstream asks something mid-call — `elicitation/create`,
+`sampling/createMessage`, `roots/list` — the question is delivered as an SSE
+event on the **GET `/mcp` stream of one session**, and the client answers with
+an ordinary POST carrying a JSON-RPC response with the same id and the same
+`Mcp-Session-Id`. Only the session the question was put to may answer it; an
+answer from any other session is ignored. If nobody has declared the capability
+with a stream open, the upstream is refused right away in the shape the spec
+prescribes (`{"action":"decline"}` for elicitation, `-32601` for the other two)
+rather than being left to time out — and the same happens if the session is
+terminated while a question is outstanding.
+
+Three consequences worth knowing:
+
+- **The upstreams are told about the capabilities of the FIRST client that
+  initializes**, and that set is fixed for the life of the process. MCP
+  2025-06-18 has no re-negotiation, so a second client declaring more cannot
+  change handshakes that already happened — an upstream is never promised a
+  capability on behalf of a client it was not told about.
+- **The upstreams start on the first request that needs them**, not when the
+  gateway binds its port. That is what makes the declaration above possible at
+  all: the handshake has to happen after a client has said what it supports. If
+  the upstreams cannot start, the client gets a JSON-RPC `-32603` and the
+  gateway exits with the error, as it did when it started them eagerly.
+- **The question goes to a client that declared the capability — not
+  necessarily to the one whose call provoked it.** Routing is by declared
+  capability, and among the matching sessions the most recently active one
+  wins; an upstream request carries nothing that says which caller it belongs
+  to. With a single client (the normal case) this is invisible, but run two and
+  a form raised by one client's `tools/call` can surface in the other's UI.
 
 ## Reloading config (SIGHUP)
 

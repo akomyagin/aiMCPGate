@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
@@ -80,6 +81,29 @@ type httpServer struct {
 	// transport keeps; everything else (registry, dispatcher) is per-process.
 	sessions *sessionStore
 
+	// baseCtx is the context the LAZY registry bring-up runs under (Stage 17a).
+	// Serve overwrites it with its own ctx before binding the listener — i.e.
+	// before any request can exist, so there is no race. It is deliberately NOT
+	// the request context: a client that hangs up mid-bring-up would otherwise
+	// poison startErr with context.Canceled for every later client, forever.
+	// The default keeps tests that mount handleMCP without running Serve
+	// working.
+	baseCtx context.Context
+
+	// startOnce/startErr make the bring-up happen exactly once across
+	// concurrent handlers, with every latecomer observing the same outcome
+	// (see ensureRegistry).
+	startOnce sync.Once
+	startErr  error
+
+	// startFailed carries a bring-up failure from the handler that hit it to
+	// Serve, which then shuts the whole server down with that error — the same
+	// operational contract as before the start became lazy (a failed Start used
+	// to return from Serve directly). Buffered so the handler never blocks;
+	// only the first failure can be reported, and after one there are no others
+	// (startOnce).
+	startFailed chan error
+
 	// onListen, when non-nil, is invoked with the bound listener address just
 	// before Serve starts accepting. Test hook only (the graceful-shutdown
 	// test needs the ephemeral port Serve bound); nil in production wiring.
@@ -87,20 +111,31 @@ type httpServer struct {
 }
 
 func newHTTPServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger, version string) *httpServer {
-	return &httpServer{
+	s := &httpServer{
 		reg: reg,
 		log: log,
-		// HTTP pushes list_changed over the GET SSE stream (Round 12) but has
-		// no channel for gateway→client REQUESTS, so no elicitation (Round 14).
-		// Stage 16 built the session layer that such a channel needs (a
-		// server→client request must be addressed to a specific session's SSE
-		// stream, and its answer arrives on a POST carrying that session id),
-		// but deliberately stops there: the flag flips in Stage 17.
-		d:        newDispatcher(reg, log, version, true, false), // HTTP: list_changed over SSE, but no server→client requests
-		addr:     cfg.EffectiveListenAddr(),
-		cfg:      reg.ConfigSnapshot,
-		sessions: newSessionStore(),
+		// HTTP pushes list_changed over the GET SSE stream (Round 12) and,
+		// since Stage 17a, proxies gateway→client REQUESTS as well: the SSE
+		// stream of a specific session carries the request, a POST with the
+		// same Mcp-Session-Id brings the answer back (http_serverreq.go).
+		// recordCaps stays FALSE — the capability set the upstreams are told
+		// about is pinned once by the first session in ensureRegistry, never
+		// rewritten by a later client's initialize (see dispatcher.recordCaps).
+		d:           newDispatcher(reg, log, version, true, true, false),
+		addr:        cfg.EffectiveListenAddr(),
+		cfg:         reg.ConfigSnapshot,
+		sessions:    newSessionStore(),
+		baseCtx:     context.Background(),
+		startFailed: make(chan error, 1),
 	}
+	// A session dying with a request outstanding refuses it immediately rather
+	// than leaving an upstream inside tools/call until the registry's deadline.
+	// Wired here, before anything can serve, and always called with the session
+	// store's mutex released (sessionStore.drainOrphaned).
+	s.sessions.onServerReqOrphaned = func(gatewayID string) {
+		s.reg.RefusePendingServerReq(gatewayID, "the client's session was terminated")
+	}
+	return s
 }
 
 // buildServer assembles the *http.Server Serve runs, wired to mux. Split out
@@ -122,14 +157,47 @@ func (s *httpServer) buildServer(mux http.Handler) *http.Server {
 	}
 }
 
-// Serve starts the registry (upstream fan-out), then runs the HTTP server until
-// ctx is cancelled, at which point it shuts the server down gracefully and tears
-// the registry down so upstream child processes exit cleanly.
+// Serve runs the HTTP server until ctx is cancelled, at which point it shuts
+// the server down gracefully and tears the registry down so upstream child
+// processes exit cleanly.
+//
+// The registry starts LAZILY, on the first request that needs it (handlePost →
+// ensureRegistry), exactly like the stdio transport since Stage 15 and for the
+// same reason: what the gateway may declare to its upstreams is what its client
+// declared, capabilities are exchanged once, and a declaration made after Start
+// could never catch up. Starting in this prologue — as Round 12 did — happens
+// before any client exists, so there is nothing to declare.
+//
+// A failed lazy start still ends Serve with that error (via startFailed): the
+// operational contract does not change just because the start moved. A gateway
+// whose upstreams all failed is a misconfiguration, not a degraded mode, and a
+// process that stays up answering -32603 forever would hide it from whatever
+// supervises it.
 func (s *httpServer) Serve(ctx context.Context) error {
-	if err := s.reg.Start(ctx); err != nil {
-		return err
-	}
+	// The lazy bring-up runs under Serve's context, not a request's. Assigned
+	// before net.Listen below, so no handler can observe the default.
+	s.baseCtx = ctx
 	defer func() { _ = s.reg.Close() }()
+
+	// Subscribed BEFORE anything can start the registry — the Round 14
+	// invariant, unchanged: once the handshakes fan out, an upstream that saw a
+	// declared capability may ask at any moment, and the registry's "publish
+	// reached no subscriber" fallback must stay unreachable BY CONSTRUCTION for
+	// a running Serve. ONE subscription serves the whole server (not one per
+	// SSE stream like Subscribe/SubscribeNotifications): a server→client
+	// request is unicast, so it must be routed to a single session rather than
+	// broadcast to every listener — see routeServerRequests.
+	serverReqs, unsubscribeServerReqs := s.reg.SubscribeUpstreamRequests()
+	defer unsubscribeServerReqs()
+	// The router dies with Serve on EVERY exit, not just ctx cancellation:
+	// unsubscribing does not close the channel, so a router still selecting on
+	// the caller's ctx would block forever after Serve returned because the
+	// listener failed or the lazy start did (found by review). Harmless in
+	// production, where Serve returning means the process is going down, but a
+	// test that runs Serve repeatedly leaks one goroutine per run.
+	routerCtx, stopRouter := context.WithCancel(ctx)
+	defer stopRouter()
+	go s.routeServerRequests(routerCtx, serverReqs)
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", s.authMiddleware(http.HandlerFunc(s.handleMCP)))
@@ -155,7 +223,11 @@ func (s *httpServer) Serve(ctx context.Context) error {
 		s.onListen(ln.Addr())
 	}
 
-	s.log.Info("http transport ready", "addr", ln.Addr().String(), "tools", s.reg.ToolCount())
+	// Split from the old single "ready" line: the tool count only exists once
+	// the registry has started, which now happens on the first request. This is
+	// the bind fact; ensureRegistry logs "http transport ready" with the
+	// catalog size, mirroring "stdio transport ready".
+	s.log.Info("http transport listening", "addr", ln.Addr().String())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -167,6 +239,17 @@ func (s *httpServer) Serve(ctx context.Context) error {
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 		return nil
+	case err := <-s.startFailed:
+		// The lazy bring-up failed inside a handler. Shut down gracefully all
+		// the same — the handler that hit it is still writing its -32603 to the
+		// client, and Shutdown waits for it — but return the real cause, so the
+		// process exits non-zero exactly as it did when Start ran in the
+		// prologue.
+		s.log.Info("shutting down after a failed registry start")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		return err
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -231,20 +314,25 @@ func (s *httpServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 // notifications/message — Round 3) is serialized whole, jsonrpc/method/params
 // untouched.
 //
-// Broadcast semantics: every open GET stream receives every event. The
+// Broadcast semantics: every open GET stream receives every NOTIFICATION. The
 // registry's Subscribe/SubscribeNotifications already support any number of
 // concurrent subscribers, so several simultaneous clients (or browser tabs)
 // each hold their own subscription — nothing extra is needed here; the gateway
 // is single-user by design but not single-stream.
 //
+// Server→client REQUESTS (Stage 17a) are the exception: they are unicast, one
+// question to one stream, so they do NOT come from a per-stream subscription
+// but from the server-wide router (routeServerRequests), which pushes into the
+// per-stream channel registered below. See http_serverreq.go for why.
+//
 // The stream sits behind the session gate (Stage 16): GET without
 // Mcp-Session-Id is 400, with an unknown or expired one 404. A valid session
 // exists only after initialize, so this IS the handshake gate stdio has — and
-// it is what lets Stage 17 address a server→client request to the streams of
-// ONE session instead of broadcasting it to whoever happens to be listening.
-// While the stream is open it counts in the session's stream tally, which
-// holds off idle expiry; terminating the session (DELETE, or expiry once the
-// last stream is gone) closes done and ends the stream here.
+// it is what lets a server→client request be addressed to the streams of ONE
+// session instead of broadcast to whoever happens to be listening. While the
+// stream is open it counts in the session's stream tally, which holds off idle
+// expiry; terminating the session (DELETE, or expiry once the last stream is
+// gone) closes done and ends the stream here.
 //
 // Stream resumption (Last-Event-ID) is deliberately NOT implemented — the
 // spec makes resumability optional, and replaying missed events has little
@@ -277,6 +365,19 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	upstreamNotifs, unsubscribeNotifs := s.reg.SubscribeNotifications()
 	defer unsubscribeNotifs()
 
+	// The unicast channel for server→client requests routed to THIS stream,
+	// registered before the headers go out for the same reason as the
+	// subscriptions above. On the way out it is deregistered FIRST (so the
+	// router can no longer pick it) and only then drained: anything the router
+	// handed over but this loop never wrote must be refused, or an upstream
+	// would sit inside tools/call until the registry's deadline.
+	reqCh := make(chan *mcp.Message, serverReqStreamBuffer)
+	s.sessions.addReqStream(sess, reqCh)
+	defer func() {
+		s.sessions.removeReqStream(sess, reqCh)
+		s.refuseQueued(sess, reqCh)
+	}()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -301,11 +402,19 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// eventID is the monotonic per-connection SSE event id (see the resumption
 	// note in the doc comment).
 	var eventID uint64
-	writeEvent := func(msg *mcp.Message) bool {
+	// writeEvent reports two DIFFERENT facts, and Stage 17a is why they had to be
+	// split: sent says the message reached the wire, alive says the stream may
+	// carry more. For a notification only alive matters — an unencodable one is
+	// skipped and forgotten. A server→client REQUEST has an upstream waiting on
+	// it, so "not sent" must reach the refusal path whether the cause was the
+	// encoder or a dead client; collapsing both into one bool silently reported
+	// an unencodable question as asked, leaving that upstream inside its
+	// tools/call until the registry's five-minute deadline (found by review).
+	writeEvent := func(msg *mcp.Message) (sent, alive bool) {
 		body, err := mcp.Encode(msg)
 		if err != nil {
 			s.log.Warn("encode SSE event", "method", msg.Method, "err", err)
-			return true // skip this event, keep the stream alive
+			return false, true // skip this event, keep the stream alive
 		}
 		eventID++
 		// Finite deadline for THIS write only — the live config is consulted
@@ -315,13 +424,13 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		// the event. mcp.Encode appends the stdio '\n' framing; trim it so the
 		// data line stays a single line.
 		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", eventID, bytes.TrimRight(body, "\n")); err != nil {
-			return false // client gone or write timed out — end the stream
+			return false, false // client gone or write timed out — end the stream
 		}
 		flusher.Flush()
 		// Disarm again immediately, while the per-write deadline is still
 		// live, so the idle gap until the NEXT event can be arbitrarily long.
 		_ = rc.SetWriteDeadline(time.Time{})
-		return true
+		return true, true
 	}
 
 	for {
@@ -335,13 +444,36 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 			// its streams must not outlive it.
 			return
 		case <-catalogChanged:
-			if !writeEvent(mcp.NewNotification(mcp.NotifToolsListChanged, nil)) {
+			if _, alive := writeEvent(mcp.NewNotification(mcp.NotifToolsListChanged, nil)); !alive {
 				return
 			}
 		case n := <-upstreamNotifs:
 			// Forwarded verbatim — the registry already carries the whole
 			// upstream message (method + params untouched).
-			if !writeEvent(&n) {
+			if _, alive := writeEvent(&n); !alive {
+				return
+			}
+		case m := <-reqCh:
+			// One upstream's server→client request, addressed to this session
+			// (Stage 17a). Method-agnostic, exactly like stdio's own branch:
+			// elicitation/create, sampling/createMessage and roots/list all
+			// take this same write, under the gateway-minted string id the
+			// client must echo back on its answering POST.
+			sent, alive := writeEvent(m)
+			if !sent {
+				// The bytes did not reach the client (or only partly did), so
+				// the question was never really asked: refuse it explicitly
+				// instead of letting the upstream wait out the deadline. If the
+				// client somehow did see it and answers anyway, the registry's
+				// pending map still guarantees the upstream gets exactly one
+				// response — this is not a second arbiter.
+				reason := "the client's SSE stream died mid-delivery"
+				if alive {
+					reason = "the gateway could not encode the request for this client"
+				}
+				s.refuseServerReq(sess, m, reason)
+			}
+			if !alive {
 				return
 			}
 		}
@@ -480,6 +612,75 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		// Must be set before any WriteHeader below.
 		w.Header().Set(sessionHeader, sess.id)
 	}
+
+	// Lazy registry bring-up (Stage 17a), stated in stdio's exact words: the
+	// first REQUEST that needs the catalog starts the upstreams, ping excluded.
+	// Over HTTP the rule nearly degenerates — everything but initialize is
+	// already behind the session gate, and only initialize can create a
+	// session, so in practice initialize is always the trigger — but it is kept
+	// in the general form so the two transports read alike, so a post-handshake
+	// ping cannot spend itself on a pointless call, and so notifications and
+	// responses (which need no catalog, and in the latter case follow a request
+	// that already started it) do not trigger one.
+	//
+	// The capabilities to declare upstream are taken ONLY from an initialize;
+	// any other trigger passes nil, the same "a non-conformant client declared
+	// nothing" degradation stdio has.
+	if msg.IsRequest() && msg.Method != mcp.MethodPing {
+		var caps map[string]json.RawMessage
+		if isInit {
+			caps = clientServerRequestCaps(msg.Params)
+		}
+		if err := s.ensureRegistry(caps); err != nil {
+			// Same sanitized text as stdio: no upstream names, no paths — the
+			// details are in the operational log. Answered as a JSON-RPC error
+			// under the client's own id (HTTP 200, like every other
+			// protocol-level error on this transport) rather than as an abrupt
+			// connection drop, so the client can diagnose it. Serve is
+			// meanwhile shutting the server down with the real error.
+			writeJSON(w, http.StatusOK, mcp.NewError(msg.ID, mcp.CodeInternalError,
+				"gateway failed to start its upstreams", nil))
+			return
+		}
+	}
+
+	// A RESPONSE from the client: the only ones the gateway ever expects are
+	// answers to its own proxied server→client requests, carrying the
+	// gateway-minted string id (Stage 17a). Recognized here, before dispatch —
+	// the same point in the flow as stdio's frames branch.
+	//
+	// The answer is accepted only from the session the question was actually
+	// put to: otherwise anyone holding a valid session could answer a stranger's
+	// elicitation just by guessing the short, predictable id ("elicit-1"). A
+	// rejected claim — unknown id, already answered, or somebody else's — is
+	// logged and falls through to the dispatcher, which drops it exactly as it
+	// always did. Both cases end in the same 202: a 4xx for a "foreign" id would
+	// tell a stranger that the id exists.
+	if msg.IsResponse() && !msg.IsMalformedHybrid() {
+		var gatewayID string
+		if json.Unmarshal(msg.ID, &gatewayID) == nil {
+			switch {
+			case !s.sessions.takeServerReq(sess, gatewayID):
+				// Deliberately not phrased as "this session was never asked":
+				// the same false covers a LEGITIMATE owner answering after
+				// sweepServerReqs already dropped the record (the registry's
+				// deadline had fired), and accusing that client of answering a
+				// stranger's question would be untrue (found by review).
+				s.log.Warn("client response matches no request this session is still waiting for, ignoring")
+			case s.reg.RouteUpstreamResponse(gatewayID, &msg):
+				// Delivered to the upstream that asked. A response gets no
+				// response of its own — 202, like a notification.
+				w.WriteHeader(http.StatusAccepted)
+				return
+			default:
+				// The transport owned it but the registry no longer does: the
+				// deadline fired, or the request was already given up on. The
+				// registry arbitrates, so this answer is simply too late.
+				s.log.Debug("client answer arrived after the gateway gave up on the request")
+			}
+		}
+	}
+
 	reply := s.d.dispatch(ctx, &msg)
 	if reply == nil {
 		// A notification (or response) the gateway accepts but need not answer.

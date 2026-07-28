@@ -18,7 +18,6 @@ package transport
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -69,9 +68,10 @@ func startHTTPGatewayMulti(t *testing.T, n int) (*httptest.Server, func()) {
 	}
 	cfg := &config.Config{Transport: config.TransportHTTP, Upstreams: ups}
 	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	if err := reg.Start(context.Background()); err != nil {
-		t.Fatalf("registry Start: %v", err)
-	}
+	// No reg.Start here (Stage 17a): the HTTP transport starts the registry
+	// lazily, on the first request that needs it, so that the capabilities its
+	// client declares can still be declared to the upstreams. Starting it here
+	// too would launch every upstream twice.
 
 	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
 	mux := http.NewServeMux()

@@ -281,3 +281,84 @@ func TestNoServerReqTimeoutInConfig(t *testing.T) {
 		t.Errorf("serverReqTimeout = %s, want the %s default", r.serverReqTimeout, defaultServerReqTimeout)
 	}
 }
+
+// TestCapabilityForMethod (Stage 17a, U3) pins the exported method→capability
+// mapping the HTTP transport picks its delivery target with. The point is that
+// it READS THE SPEC TABLE rather than restating it: a hand-written copy would
+// answer "elicitation" for everything (or drift the moment a fourth method is
+// added), which is exactly what the sampling/roots rows below catch.
+func TestCapabilityForMethod(t *testing.T) {
+	tests := []struct {
+		method string
+		want   string
+		wantOK bool
+	}{
+		{mcp.MethodElicitationCreate, mcp.CapElicitation, true},
+		{mcp.MethodSamplingCreateMessage, mcp.CapSampling, true},
+		{mcp.MethodRootsList, mcp.CapRoots, true},
+		{mcp.MethodToolsCall, "", false}, // a real method, but client→server
+		{"ping", "", false},              // never proxied server→client
+		{"", "", false},                  // degenerate input must not match
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			got, ok := CapabilityForMethod(tt.method)
+			if ok != tt.wantOK || got != tt.want {
+				t.Errorf("CapabilityForMethod(%q) = (%q, %v), want (%q, %v)",
+					tt.method, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestCapabilityForMethodCoversEveryProxiedMethod is the drift guard the table
+// above cannot be: it walks serverReqSpecs itself, so a method added there
+// without a working lookup fails here rather than silently becoming
+// undeliverable over HTTP (the transport refuses whatever it cannot map).
+func TestCapabilityForMethodCoversEveryProxiedMethod(t *testing.T) {
+	for i := range serverReqSpecs {
+		spec := &serverReqSpecs[i]
+		got, ok := CapabilityForMethod(spec.method)
+		if !ok {
+			t.Errorf("CapabilityForMethod(%q) reports the method is not proxied, but it has a spec entry", spec.method)
+			continue
+		}
+		if got != spec.capability {
+			t.Errorf("CapabilityForMethod(%q) = %q, want the spec's %q", spec.method, got, spec.capability)
+		}
+	}
+}
+
+// TestServerReqPendingTracksTheParkedEntry (Stage 17a) pins the read-only
+// probe a client transport sweeps its own gatewayID bookkeeping with: true
+// exactly while the request is parked, false before it is published, after the
+// answer is routed, and after the registry's deadline gave up on it — which is
+// the case the transport actually needs (the registry drops the entry on its
+// own timer and nothing else would ever tell the transport).
+func TestServerReqPendingTracksTheParkedEntry(t *testing.T) {
+	r, _ := newElicitTestRegistry("web")
+	r.serverReqTimeout = testServerReqTimeout
+	r.SetClientServerRequestCaps(declaredCaps(mcp.CapElicitation))
+	ch, unsubscribe := r.SubscribeUpstreamRequests()
+	defer unsubscribe()
+
+	if r.ServerReqPending("elicit-nope") {
+		t.Error("ServerReqPending reports an id that was never minted as pending")
+	}
+
+	r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(7), json.RawMessage(`{"message":"?"}`))
+	req := awaitPublished(t, ch, "the elicitation request")
+	if !r.ServerReqPending(req.GatewayID) {
+		t.Fatalf("ServerReqPending(%q) = false while the request is parked", req.GatewayID)
+	}
+
+	// The deadline is the whole reason this exists: nobody answers, the registry
+	// gives up on its own, and the transport must be able to notice.
+	deadline := time.Now().Add(2 * time.Second)
+	for r.ServerReqPending(req.GatewayID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("ServerReqPending(%q) still true long after the %s deadline", req.GatewayID, r.serverReqTimeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
