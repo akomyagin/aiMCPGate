@@ -50,9 +50,11 @@ func startHTTPGateway(t *testing.T) (*httptest.Server, func()) {
 	return srv, func() { srv.Close(); _ = reg.Close() }
 }
 
-// post sends one JSON-RPC message to the gateway's /mcp endpoint and returns the
-// HTTP response for the caller to inspect (status + body).
-func post(t *testing.T, srv *httptest.Server, msg *mcp.Message) *http.Response {
+// postHeaders sends one JSON-RPC message to the gateway's /mcp endpoint with
+// arbitrary extra headers and returns the HTTP response for the caller to
+// inspect (status + body). It is the single place tests build a POST, so the
+// Stage 16 session header is added the same way everywhere.
+func postHeaders(t *testing.T, srv *httptest.Server, msg *mcp.Message, headers map[string]string) *http.Response {
 	t.Helper()
 	body, err := mcp.Encode(msg)
 	if err != nil {
@@ -64,11 +66,86 @@ func post(t *testing.T, srv *httptest.Server, msg *mcp.Message) *http.Response {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
 	return resp
+}
+
+// post sends one JSON-RPC message with NO session header. Since Stage 16 that
+// is only legal for initialize (and for the malformed-body cases, which never
+// reach the session gate) — everything else must use postSession.
+func post(t *testing.T, srv *httptest.Server, msg *mcp.Message) *http.Response {
+	t.Helper()
+	return postHeaders(t, srv, msg, nil)
+}
+
+// postSession sends one JSON-RPC message carrying the session id issued by
+// initialize — the normal shape of every post-handshake HTTP request.
+func postSession(t *testing.T, srv *httptest.Server, msg *mcp.Message, sid string) *http.Response {
+	t.Helper()
+	return postHeaders(t, srv, msg, map[string]string{sessionHeader: sid})
+}
+
+// withSession returns a copy of headers plus the session header — copy, not
+// mutation, so a shared table-driven header map is never altered in place.
+func withSession(headers map[string]string, sid string) map[string]string {
+	out := make(map[string]string, len(headers)+1)
+	for k, v := range headers {
+		out[k] = v
+	}
+	out[sessionHeader] = sid
+	return out
+}
+
+// sessionHeaders is withSession for the common case of no other headers.
+func sessionHeaders(sid string) map[string]string { return withSession(nil, sid) }
+
+// initSessionAt runs the initialize handshake against baseURL and returns the
+// Mcp-Session-Id the gateway issued (Stage 16). headers carry whatever else
+// the endpoint demands (Authorization, Origin). It fails the test if no id
+// comes back — every later request depends on it.
+func initSessionAt(t *testing.T, client *http.Client, baseURL string, headers map[string]string) string {
+	t.Helper()
+	body, err := mcp.Encode(mcp.NewRequest(mcp.IntID(nextTestID()), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    json.RawMessage(`{}`),
+		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+	})))
+	if err != nil {
+		t.Fatalf("encode initialize: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/mcp", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build initialize request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("initialize POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initialize status = %d, want 200", resp.StatusCode)
+	}
+	sid := resp.Header.Get(sessionHeader)
+	if sid == "" {
+		t.Fatalf("initialize response carries no %s header", sessionHeader)
+	}
+	return sid
+}
+
+// initSession is initSessionAt against an httptest.Server.
+func initSession(t *testing.T, srv *httptest.Server, headers map[string]string) string {
+	t.Helper()
+	return initSessionAt(t, srv.Client(), srv.URL, headers)
 }
 
 // decodeBody reads and JSON-decodes a single MCP message from an HTTP response.
@@ -115,7 +192,8 @@ func TestHTTPServerNotificationReturns202(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
-	resp := post(t, srv, mcp.NewNotification(mcp.NotifInitialized, nil))
+	sid := initSession(t, srv, nil)
+	resp := postSession(t, srv, mcp.NewNotification(mcp.NotifInitialized, nil), sid)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("notification HTTP status = %d, want 202", resp.StatusCode)
@@ -130,7 +208,8 @@ func TestHTTPServerToolsList(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
-	resp := post(t, srv, mcp.NewRequest(mcp.IntID(2), mcp.MethodToolsList, nil))
+	sid := initSession(t, srv, nil)
+	resp := postSession(t, srv, mcp.NewRequest(mcp.IntID(2), mcp.MethodToolsList, nil), sid)
 	msg := decodeBody(t, resp)
 	if msg.Error != nil {
 		t.Fatalf("tools/list error: %v", msg.Error)
@@ -154,11 +233,12 @@ func TestHTTPServerToolsCallKeepsClientID(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
+	sid := initSession(t, srv, nil)
 	id := mcp.IntID(3)
-	resp := post(t, srv, mcp.NewRequest(id, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
+	resp := postSession(t, srv, mcp.NewRequest(id, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
 		Name:      "github__search",
 		Arguments: json.RawMessage(`{"q":"golang"}`),
-	})))
+	})), sid)
 	msg := decodeBody(t, resp)
 	if string(msg.ID) != string(id) {
 		t.Fatalf("tools/call response id = %s, want client id %s (upstream id leaked?)", msg.ID, id)
@@ -175,7 +255,8 @@ func TestHTTPServerUnknownMethod(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
-	resp := post(t, srv, mcp.NewRequest(mcp.IntID(4), "does/not/exist", nil))
+	sid := initSession(t, srv, nil)
+	resp := postSession(t, srv, mcp.NewRequest(mcp.IntID(4), "does/not/exist", nil), sid)
 	msg := decodeBody(t, resp)
 	if msg.Error == nil || msg.Error.Code != mcp.CodeMethodNotFound {
 		t.Fatalf("want method-not-found error, got %+v", msg.Error)
@@ -225,6 +306,10 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
+	// A hybrid is not initialize, so it needs a session like any other POST
+	// (Stage 16); the hybrid gate itself is what is under test here.
+	sid := initSession(t, srv, nil)
+
 	cases := []struct {
 		name   string
 		raw    string
@@ -238,6 +323,7 @@ func TestHTTPServerHybridRequestResponseRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/mcp", strings.NewReader(tc.raw))
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(sessionHeader, sid)
 			resp, err := srv.Client().Do(req)
 			if err != nil {
 				t.Fatalf("POST: %v", err)
@@ -310,7 +396,9 @@ func TestHTTPServerAuthTokenRequired(t *testing.T) {
 
 	msg := mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil)
 
-	// No header → 401.
+	// No header → 401. Auth runs before the session gate, so this stays 401
+	// (not the 400 an unauthenticated-but-sessionless request would get if the
+	// order were reversed) — that ordering is the point of these two cases.
 	resp := postWithAuth(t, srv, msg, "")
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -324,8 +412,15 @@ func TestHTTPServerAuthTokenRequired(t *testing.T) {
 		t.Fatalf("wrong token: status = %d, want 401", resp.StatusCode)
 	}
 
-	// Correct token → 200.
-	resp = postWithAuth(t, srv, msg, token)
+	// Correct token → served: handshake, then a real request over the session
+	// it issued. (tools/list with the right token but NO session would now be
+	// 400 — Stage 16 — so the success case carries both credentials.)
+	auth := map[string]string{"Authorization": "Bearer " + token}
+	sid := initSession(t, srv, auth)
+	resp = postHeaders(t, srv, msg, map[string]string{
+		"Authorization": "Bearer " + token,
+		sessionHeader:   sid,
+	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("correct token: status = %d, want 200", resp.StatusCode)
 	}
@@ -337,7 +432,8 @@ func TestHTTPServerNoAuthTokenAllowsAll(t *testing.T) {
 	defer cleanup()
 
 	// Any request (even without Authorization header) must succeed.
-	resp := post(t, srv, mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil))
+	sid := initSession(t, srv, nil)
+	resp := postSession(t, srv, mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil), sid)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("no-auth gateway: status = %d, want 200", resp.StatusCode)
 	}
@@ -345,24 +441,26 @@ func TestHTTPServerNoAuthTokenAllowsAll(t *testing.T) {
 }
 
 // TestHTTPServerMethodNotAllowed pins the method gate for everything that is
-// neither POST (one JSON-RPC message) nor GET (the server→client SSE stream,
-// Round 12 — exercised in http_sse_test.go). GET used to be the 405 here; it
-// is a legitimate method now.
+// none of the three legitimate verbs: POST (one JSON-RPC message), GET (the
+// server→client SSE stream, Round 12 — exercised in http_sse_test.go) and
+// DELETE (session termination, Stage 16 — exercised in
+// http_session_test.go). GET was the 405 case originally and DELETE was the
+// 405 case until Stage 16; PUT is the one that is still nobody's method.
 func TestHTTPServerMethodNotAllowed(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/mcp", nil)
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/mcp", nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
-		t.Fatalf("DELETE: %v", err)
+		t.Fatalf("PUT: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("DELETE /mcp status = %d, want 405", resp.StatusCode)
+		t.Fatalf("PUT /mcp status = %d, want 405", resp.StatusCode)
 	}
 }
 
@@ -374,9 +472,16 @@ func TestHTTPServerOriginCheck(t *testing.T) {
 	srv, cleanup := startHTTPGateway(t)
 	defer cleanup()
 
+	// The payload is initialize on purpose: the Origin gate runs BEFORE the
+	// Stage 16 session gate, so the accepted cases must be served 200 without
+	// any session header — which is exactly what this pins.
 	postWithOrigin := func(origin string) *http.Response {
 		t.Helper()
-		body, err := mcp.Encode(mcp.NewRequest(mcp.IntID(1), mcp.MethodToolsList, nil))
+		body, err := mcp.Encode(mcp.NewRequest(mcp.IntID(nextTestID()), mcp.MethodInitialize, mcp.MustParams(mcp.InitializeParams{
+			ProtocolVersion: mcp.ProtocolVersion,
+			Capabilities:    json.RawMessage(`{}`),
+			ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
+		})))
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}

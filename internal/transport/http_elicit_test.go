@@ -56,12 +56,16 @@ func TestHTTPGatewayDoesNotDeclareElicitationToUpstream(t *testing.T) {
 		Capabilities:    json.RawMessage(`{"elicitation":{}}`),
 		ClientInfo:      mcp.Implementation{Name: "test-client", Version: "9.9.9"},
 	})))
+	sid := resp.Header.Get(sessionHeader)
+	if sid == "" {
+		t.Fatalf("initialize response carries no %s header", sessionHeader)
+	}
 	if msg := decodeBody(t, resp); msg.Error != nil {
 		t.Fatalf("initialize error: %v", msg.Error)
 	}
 
 	callID := mcp.IntID(2)
-	resp = post(t, srv, mcp.NewRequest(callID, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__ask"})))
+	resp = postSession(t, srv, mcp.NewRequest(callID, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{Name: "web__ask"})), sid)
 	msg := decodeBody(t, resp)
 	if string(msg.ID) != string(callID) {
 		t.Fatalf("tools/call response id = %s, want %s", msg.ID, callID)

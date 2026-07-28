@@ -182,7 +182,7 @@ func TestHTTPSSEPushesListChangedOnCatalogChange(t *testing.T) {
 	srv, cleanup := startSSEGateway(t, cfg, nil)
 	defer cleanup()
 
-	resp := openSSE(t, srv.URL, nil)
+	resp := openSSE(t, srv.URL, sessionHeaders(initSession(t, srv, nil)))
 	defer func() { _ = resp.Body.Close() }()
 	requireSSEOpen(t, resp)
 	events := sseEvents(resp.Body)
@@ -223,7 +223,8 @@ func TestHTTPSSEForwardsProgressDuringToolsCall(t *testing.T) {
 	srv, cleanup := startSSEGateway(t, cfg, nil)
 	defer cleanup()
 
-	resp := openSSE(t, srv.URL, nil)
+	sid := initSession(t, srv, nil)
+	resp := openSSE(t, srv.URL, sessionHeaders(sid))
 	defer func() { _ = resp.Body.Close() }()
 	requireSSEOpen(t, resp)
 	events := sseEvents(resp.Body)
@@ -232,10 +233,10 @@ func TestHTTPSSEForwardsProgressDuringToolsCall(t *testing.T) {
 	// before answering, and the two travel independent paths (SSE stream vs
 	// POST response).
 	id := mcp.IntID(7)
-	callResp := post(t, srv, mcp.NewRequest(id, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
+	callResp := postSession(t, srv, mcp.NewRequest(id, mcp.MethodToolsCall, mcp.MustParams(mcp.ToolsCallParams{
 		Name: "web__fetch",
 		Meta: json.RawMessage(`{"progressToken":42}`),
-	})))
+	})), sid)
 	reply := decodeBody(t, callResp)
 	if reply.Error != nil {
 		t.Fatalf("tools/call error: %v", reply.Error)
@@ -290,9 +291,20 @@ func TestHTTPSSEAuthAndOriginEnforced(t *testing.T) {
 			"Origin":        "http://localhost:3000",
 		}, http.StatusOK},
 	}
+	// The accepted cases need a session as well (Stage 16): the valid token
+	// plus the id issued by an initialize made with that same token. The
+	// rejected cases deliberately carry NO session — proof that auth (401) and
+	// origin (403) are decided before the session gate runs at all, so an
+	// unauthenticated caller never learns anything about session state.
+	sid := initSession(t, srv, map[string]string{"Authorization": "Bearer " + token})
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := openSSE(t, srv.URL, tc.headers)
+			headers := tc.headers
+			if tc.want == http.StatusOK {
+				headers = withSession(headers, sid)
+			}
+			resp := openSSE(t, srv.URL, headers)
 			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != tc.want {
 				t.Fatalf("GET /mcp status = %d, want %d", resp.StatusCode, tc.want)
@@ -318,7 +330,7 @@ func TestHTTPSSEStreamOutlivesCallTimeout(t *testing.T) {
 	srv, cleanup := startSSEGateway(t, cfg, nil)
 	defer cleanup()
 
-	resp := openSSE(t, srv.URL, nil)
+	resp := openSSE(t, srv.URL, sessionHeaders(initSession(t, srv, nil)))
 	defer func() { _ = resp.Body.Close() }()
 	requireSSEOpen(t, resp)
 	events := sseEvents(resp.Body)
@@ -368,7 +380,7 @@ func TestHTTPSSESurvivesExpiredWriteDeadline(t *testing.T) {
 	srv, cleanup := startSSEGateway(t, cfg, shortDeadline)
 	defer cleanup()
 
-	resp := openSSE(t, srv.URL, nil)
+	resp := openSSE(t, srv.URL, sessionHeaders(initSession(t, srv, nil)))
 	defer func() { _ = resp.Body.Close() }()
 	requireSSEOpen(t, resp)
 	events := sseEvents(resp.Body)
@@ -422,7 +434,9 @@ func TestHTTPSSEGracefulShutdownClosesStream(t *testing.T) {
 		t.Fatal("Serve never bound its listener")
 	}
 
-	resp := openSSE(t, "http://"+addr.String(), nil)
+	base := "http://" + addr.String()
+	sid := initSessionAt(t, &http.Client{}, base, nil)
+	resp := openSSE(t, base, sessionHeaders(sid))
 	defer func() { _ = resp.Body.Close() }()
 	requireSSEOpen(t, resp)
 	events := sseEvents(resp.Body)

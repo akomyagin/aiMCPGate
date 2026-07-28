@@ -183,10 +183,17 @@ func startHTTPGateway(t *testing.T) string {
 // connect dials the gateway with the official SDK client over Streamable HTTP
 // and returns an initialized session.
 //
-// DisableStandaloneSSE: the gateway answers GET /mcp with 405 — it has no
-// server-initiated messages in the MVP, which the spec explicitly allows
-// (docs/MCP_NOTES.md §8) — so the SDK's optional standalone SSE stream is
-// switched off rather than left to retry against a permanent 405.
+// DisableStandaloneSSE: GET /mcp is a real server→client SSE stream since
+// Round 12, but this test has nothing server-initiated to observe, so the SDK's
+// optional standalone stream is switched off to keep the exchange down to the
+// request/response path under test (the stream itself is covered by
+// internal/transport/http_sse_test.go).
+//
+// No session bookkeeping appears here on purpose: the gateway issues a
+// server-side Mcp-Session-Id on initialize and requires it on every later
+// request (Stage 16), and the SDK's StreamableClientTransport captures and
+// echoes it by itself. That this test still passes UNTOUCHED is the external
+// evidence that the strict session gate is spec-conformant.
 func connect(t *testing.T, ctx context.Context, endpoint string) *sdk.ClientSession {
 	t.Helper()
 	client := sdk.NewClient(&sdk.Implementation{Name: "interop-test-client", Version: "1.0.0"}, nil)
