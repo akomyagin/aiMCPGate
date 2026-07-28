@@ -8,8 +8,8 @@ MCP server, while under the hood it **multiplexes** calls across several
 upstream MCP servers, **aggregates** their tools, prompts and resources into
 one catalog, and **logs** every call.
 
-> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–12 and 14 further
-> rounds shipped in v0.3.0.** Phase 1 — multiplexing stdio upstreams behind a
+> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–17b shipped, latest
+> release v0.4.0.** Phase 1 — multiplexing stdio upstreams behind a
 > stdio endpoint with a call log; Phase 2 — HTTP/SSE client-facing transport,
 > HTTP upstreams, a CLI log viewer (`mcp-gate logs`); release pipeline
 > (`goreleaser`, cross-compiled for linux/darwin/windows × amd64/arm64, no
@@ -18,15 +18,20 @@ one catalog, and **logs** every call.
 > `resources/templates`/`completion` aggregation, `ping`, progress forwarding
 > and real cancellation, `logging/setLevel` fan-out, per-upstream call limits
 > (rate limit / concurrency / result truncation / timeout), a lazy catalog and
-> `tools/list` pagination, SSE server→client streams on both the client and the
-> upstream side, and `elicitation/create` proxying (stdio↔stdio only). Merged
-> since v0.3.0 but not yet released: `sampling/createMessage` and `roots/list`
-> proxying (stdio↔stdio as well), honest capability declaration to
-> upstreams — the gateway now offers an upstream exactly what its own client
-> declared, instead of a blanket `{}` — server-side `Mcp-Session-Id` sessions on
-> the HTTP transport, with `DELETE /mcp` termination, and server→client requests
-> over HTTP on BOTH sides — for an HTTP-connected client and from an
-> HTTP-connected upstream (`elicitation`, `sampling`, `roots` — see below).
+> `tools/list` pagination, and SSE server→client streams on both the client and
+> the upstream side. **v0.4.0** completed the server→client direction: all three
+> server-initiated methods — `elicitation/create`, `sampling/createMessage` and
+> `roots/list` — are proxied in **all four transport combinations** (stdio or
+> HTTP on the client side × stdio or HTTP on the upstream side); the gateway now
+> declares to an upstream exactly the capabilities its own client declared
+> instead of a blanket `{}`; the HTTP transport gained server-side
+> `Mcp-Session-Id` sessions with `DELETE /mcp` termination.
+>
+> **Upgrading to v0.4.0:** no config-file change, but two observable HTTP-mode
+> behaviour changes — a session id is now mandatory on `POST /mcp` after
+> `initialize` (the header is returned by the `initialize` response), and the
+> upstream registry starts lazily on the first real MCP request instead of at
+> process start.
 >
 > **Not implemented:** a per-client access policy.
 
