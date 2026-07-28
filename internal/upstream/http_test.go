@@ -1379,3 +1379,145 @@ func TestHTTPInterleavedRequestOnPostStream(t *testing.T) {
 		t.Fatal("a request interleaved into the POST's SSE stream never reached onRequest")
 	}
 }
+
+// sessionExpiringStreamServer answers initialize with a rotating session id and
+// serves the GET SSE stream ONLY to the current one; a GET carrying a stale id
+// gets 404, exactly as the spec prescribes for an expired session. It counts
+// GET attempts so a test can tell "gave up" from "kept retrying".
+type sessionExpiringStreamServer struct {
+	mu      sync.Mutex
+	current string
+	inits   int
+	gets    int
+}
+
+func (s *sessionExpiringStreamServer) getCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets
+}
+
+func (s *sessionExpiringStreamServer) expire() {
+	s.mu.Lock()
+	s.current = ""
+	s.mu.Unlock()
+}
+
+func (s *sessionExpiringStreamServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.mu.Lock()
+			s.gets++
+			live := s.current != "" && r.Header.Get("Mcp-Session-Id") == s.current
+			s.mu.Unlock()
+			if !live {
+				// The session this GET names is gone. Per the spec that is a
+				// 404 telling the client to re-initialize — NOT "no stream
+				// here" (which would be 405).
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		var req mcp.Message
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == mcp.MethodInitialize {
+			s.mu.Lock()
+			s.inits++
+			s.current = fmt.Sprintf("sess-%d", s.inits)
+			sid := s.current
+			s.mu.Unlock()
+			w.Header().Set("Mcp-Session-Id", sid)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(mcp.NewResult(req.ID,
+				json.RawMessage(`{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}`)))
+			return
+		}
+		if !req.IsRequest() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		s.mu.Lock()
+		live := r.Header.Get("Mcp-Session-Id") == s.current
+		s.mu.Unlock()
+		if !live {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mcp.NewResult(req.ID, json.RawMessage(`{"content":[]}`)))
+	})
+}
+
+// TestSSEStreamSurvivesSessionExpiry pins the fix for a silent, permanent loss
+// of server push: a 404 to the GET stream was read as "this server offers no
+// SSE stream" and ended the reconnect loop FOREVER, even though the same 404 on
+// a POST is understood as "the session expired, re-initialize". Nothing looked
+// broken — tools/call kept recovering on its own — while every upstream-initiated
+// message from that connection was silently lost. Harmless while the stream only
+// carried notifications; since Stage 17b it is also the channel for
+// elicitation/sampling/roots, so the stage's whole feature died with it.
+//
+// The assertion is behavioural: after the session expires and a CallTool
+// re-initializes it, a notification pushed by the upstream must still reach
+// onNotify. With the bug there is exactly one GET and then permanent silence.
+func TestSSEStreamSurvivesSessionExpiry(t *testing.T) {
+	f := &sessionExpiringStreamServer{}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	notifs := make(chan string, 4)
+	onNotify := func(method string, _ json.RawMessage) {
+		select {
+		case notifs <- method:
+		default:
+		}
+	}
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := conn.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// The server forgets the session before the stream goroutine's first GET,
+	// so that GET is answered 404 — the case that used to be fatal.
+	f.expire()
+
+	// Wait for the loop to have actually tried (and been refused) at least once,
+	// so the retry below is proven to be a RETRY.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && f.getCount() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if f.getCount() == 0 {
+		t.Fatal("the stream goroutine never issued a GET")
+	}
+
+	// A tool call re-initializes transparently (the existing 404 recovery),
+	// minting sess-2; the retrying stream must pick it up on its next attempt.
+	if _, err := conn.CallTool(ctx, "fetch", nil, nil); err != nil {
+		t.Fatalf("CallTool after session expiry: %v", err)
+	}
+
+	select {
+	case method := <-notifs:
+		if method != mcp.NotifToolsListChanged {
+			t.Errorf("forwarded notification = %q, want %q", method, mcp.NotifToolsListChanged)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("no notification after the session was renewed: the SSE stream never came back (GET attempts: %d)", f.getCount())
+	}
+}

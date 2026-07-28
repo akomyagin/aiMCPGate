@@ -409,12 +409,29 @@ func (c *httpTransport) streamSSEOnce(ctx context.Context, lastEventID string) (
 	defer func() { _ = resp.Body.Close() }()
 
 	switch {
+	case resp.StatusCode == http.StatusNotFound && sid != "":
+		// 404 to a request that CARRIED a session id is not "no stream here" —
+		// per the spec it means that session is gone and the client must
+		// re-initialize (same reading as call's hadSession branch). Reported as
+		// an ERROR so runSSEStream backs off and retries instead of giving up
+		// forever: the next attempt re-reads the session id, which a
+		// CallTool-triggered re-initialize will have refreshed by then.
+		//
+		// Lumping this in with 405 below meant server push died permanently
+		// after any session expiry, and died INVISIBLY — tools/call kept
+		// recovering on its own, so nothing looked broken while
+		// elicitation/sampling/roots from this upstream could never arrive
+		// again (found by review; harmless before Stage 17b, when the stream
+		// only carried notifications).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return newLastID, false, fmt.Errorf("upstream %q: GET %s: %w",
+			c.name, redactedEndpoint(c.endpoint), errSessionExpired)
 	case resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound:
 		// The explicit "I do not offer the GET stream" answer (the spec says
-		// MUST be 405; 404 is the same statement from servers that route the
-		// method away entirely). Drain a small bounded remainder so the
-		// connection returns to the keep-alive pool. opened=false with nil err
-		// is the caller's "the server said no" signal.
+		// MUST be 405; a 404 with no session id in play is the same statement
+		// from servers that route the method away entirely). Drain a small
+		// bounded remainder so the connection returns to the keep-alive pool.
+		// opened=false with nil err is the caller's "the server said no" signal.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return newLastID, false, nil
 	case resp.StatusCode != http.StatusOK:

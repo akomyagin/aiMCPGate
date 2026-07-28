@@ -95,8 +95,10 @@ func (c *Conn) DeclareClientCapabilities(caps map[string]json.RawMessage) {
 // declaredCapabilities renders the recorded client-capability set into the
 // wire object initialize carries. The empty set yields exactly {} — not null,
 // not an absent field — preserving the historical bytes for every path that
-// declares nothing (HTTP upstreams, doctor/call/catalog, tests). json.Marshal
-// sorts map keys, so the output is deterministic for a given set.
+// declares nothing: doctor/call/catalog (no MCP client at all) and tests.
+// HTTP upstreams left that list in Stage 17b — they are now declared to on the
+// same honest gate as stdio ones. json.Marshal sorts map keys, so the output is
+// deterministic for a given set.
 func (c *Conn) declaredCapabilities() json.RawMessage {
 	if len(c.declaredCaps) == 0 {
 		return json.RawMessage(`{}`)
@@ -379,8 +381,13 @@ func (c *Conn) Complete(ctx context.Context, params json.RawMessage) (*mcp.Messa
 // but only when the gateway actually declared roots to it in the handshake.
 // Per the spec both parties MUST only use negotiated capabilities, so pushing
 // this to an upstream that never saw a roots declaration would be protocol
-// noise; the no-op keeps every non-declaring path (HTTP upstreams,
-// doctor/call/catalog) byte-identical on the wire.
+// noise; the no-op keeps every non-declaring path (doctor/call/catalog)
+// byte-identical on the wire.
+//
+// Since Stage 17b an HTTP upstream CAN be declared to, so this may now issue a
+// real network POST rather than always short-circuiting — which is why the
+// caller bounds ctx (registry.forwardNotifyTimeout) instead of passing its
+// process context.
 func (c *Conn) ForwardRootsListChanged(ctx context.Context) error {
 	if _, ok := c.declaredCaps[mcp.CapRoots]; !ok {
 		return nil

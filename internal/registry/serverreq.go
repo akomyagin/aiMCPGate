@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -148,6 +149,14 @@ func specForMethod(method string) *serverReqSpec {
 // Not a config knob on purpose — Stage 15 does not touch the public config
 // contract. Tests override Registry.serverReqTimeout directly.
 const defaultServerReqTimeout = 5 * time.Minute
+
+// forwardNotifyTimeout bounds ONE fire-and-forget notification the gateway
+// relays to an upstream (today notifications/roots/list_changed). Generous,
+// because nothing is waiting on it and a slow-but-alive upstream should still
+// receive it; finite, because the alternative is a goroutine and a connection
+// pinned for the life of the process on an upstream that has stopped reading.
+// Not a config knob, by the same reasoning as defaultServerReqTimeout.
+const forwardNotifyTimeout = 30 * time.Second
 
 // pendingServerReq records where the client's answer to one proxied
 // server→client request must go: which upstream asked, and under what id in
@@ -515,7 +524,17 @@ func (r *Registry) OnClientRootsListChanged() {
 
 	for name, conn := range targets {
 		go func(name string, conn Upstream) {
-			if err := conn.ForwardRootsListChanged(r.procCtx); err != nil {
+			// Bounded, NOT the bare process context. Stage 17b made this
+			// reachable over HTTP for the first time (before it, roots was
+			// never declared to an HTTP upstream, so the connection's own gate
+			// short-circuited every such call): an unbounded POST to a hung
+			// upstream would hold this goroutine and its connection until the
+			// gateway stopped, one leak per client roots/list_changed. stdio
+			// gets the same bound — a write into a stuck child's stdin blocks
+			// just as indefinitely (found by review).
+			ctx, cancel := context.WithTimeout(r.procCtx, forwardNotifyTimeout)
+			defer cancel()
+			if err := conn.ForwardRootsListChanged(ctx); err != nil {
 				r.log.Warn("forward roots/list_changed failed", "upstream", name, "err", err)
 			}
 		}(name, conn)
