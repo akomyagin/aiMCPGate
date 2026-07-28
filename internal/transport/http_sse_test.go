@@ -34,9 +34,10 @@ import (
 func startSSEGateway(t *testing.T, cfg *config.Config, extraMW func(http.Handler) http.Handler) (*httptest.Server, func()) {
 	t.Helper()
 	reg := registry.New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
-	if err := reg.Start(context.Background()); err != nil {
-		t.Fatalf("registry Start: %v", err)
-	}
+	// No reg.Start here (Stage 17a): the HTTP transport starts the registry
+	// lazily, on the first request that needs it, so that the capabilities its
+	// client declares can still be declared to the upstreams. Starting it here
+	// too would launch every upstream twice.
 	hs := newHTTPServer(cfg, reg, quietLogger(), "test-1.2.3")
 	var h http.Handler = http.HandlerFunc(hs.handleMCP)
 	if extraMW != nil {

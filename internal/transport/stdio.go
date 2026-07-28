@@ -42,9 +42,13 @@ func newStdioServer(cfg *config.Config, reg *registry.Registry, log *slog.Logger
 	return &stdioServer{
 		reg: reg,
 		log: log,
-		d:   newDispatcher(reg, log, version, true, true), // stdio can push server→client list_changed AND proxy server→client requests
-		r:   mcp.NewReader(in),
-		w:   mcp.NewWriter(out),
+		// stdio can push server→client list_changed AND proxy server→client
+		// requests; recordCaps is true because there is exactly ONE client per
+		// process, so a re-initialize restating its capabilities into the
+		// registry is that same client speaking (unlike HTTP — see recordCaps).
+		d: newDispatcher(reg, log, version, true, true, true),
+		r: mcp.NewReader(in),
+		w: mcp.NewWriter(out),
 	}
 }
 

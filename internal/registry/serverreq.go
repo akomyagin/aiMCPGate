@@ -584,6 +584,43 @@ func ServerRequestCapabilities() []string {
 	return names
 }
 
+// CapabilityForMethod maps an upstream-initiated method to the client
+// capability that must be declared for it to be servable, read from the SAME
+// spec table everything else derives from. ok=false means the gateway does not
+// proxy that method at all.
+//
+// Exported for the HTTP transport (Stage 17a), which must pick WHICH session
+// a server→client request may be delivered to: the registry's own gate is
+// process-wide (clientDeclared), while over HTTP several sessions coexist and
+// only the ones that declared the capability may be handed the request. Keeping
+// the mapping here rather than copying "method → capability" into
+// internal/transport is what makes "adding a method = one entry in
+// serverReqSpecs" still true.
+func CapabilityForMethod(method string) (capability string, ok bool) {
+	if spec := specForMethod(method); spec != nil {
+		return spec.capability, true
+	}
+	return "", false
+}
+
+// ServerReqPending reports whether gatewayID is still parked awaiting the
+// client's answer. Read-only, and deliberately NOT an arbiter: it says nothing
+// about who may answer (that is takePendingServerReq's job alone) — it exists
+// so a client transport that keeps its own gatewayID→destination bookkeeping
+// can sweep entries the registry has already given up on.
+//
+// Stage 17a's HTTP router uses it exactly that way: the registry drops a
+// pending request on its own five-minute deadline, and without this the
+// transport's ownership record for that id would live until the session died.
+// The alternative — exporting the timeout so the transport could age its own
+// entries — would be a second copy of a constant, i.e. drift.
+func (r *Registry) ServerReqPending(gatewayID string) bool {
+	r.serverReqMu.Lock()
+	_, ok := r.pendingServerReqs[gatewayID]
+	r.serverReqMu.Unlock()
+	return ok
+}
+
 // SetClientServerRequestCaps records which server→client capabilities the
 // gateway's OWN client declared in its initialize. It is the SINGLE setter
 // behind both roles the two Round 14 flags used to split: what the gateway
