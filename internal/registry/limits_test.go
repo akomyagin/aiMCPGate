@@ -392,7 +392,7 @@ func TestTruncateResultLeavesErrorsAlone(t *testing.T) {
 		Result: json.RawMessage(strings.Repeat("y", 500)), // pathological, but must not be touched either
 	}
 	orig := string(resp.Result)
-	r.truncateResult(resp, "a", 10)
+	r.truncateResult(resp, "a", "x", 10)
 	if string(resp.Result) != orig {
 		t.Error("truncateResult modified a response that carries an error")
 	}

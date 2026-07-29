@@ -215,3 +215,132 @@ func TestPayloadLogDisabled(t *testing.T) {
 		t.Errorf("Close on no-op payload log = %v, want nil", err)
 	}
 }
+
+// TestReadEntriesSplitsCallsAndEvents (Stage 18, L1) pins the journal's two-kind
+// read: a pre-Stage-18 call line (no "kind"), a current call line, an event line
+// and a broken trailing line. ReadEntries must return the three good lines in
+// file order with the right kind each; ReadRecords on the same stream must see
+// exactly the two calls.
+func TestReadEntriesSplitsCallsAndEvents(t *testing.T) {
+	data := `{"time":"2026-07-29T10:00:00Z","upstream":"old","method":"tools/call","tool":"old__x","ok":true}` + "\n" +
+		`{"time":"2026-07-29T10:00:01Z","upstream":"new","method":"tools/call","tool":"new__y","ok":false,"error":"boom"}` + "\n" +
+		`{"time":"2026-07-29T10:00:02Z","kind":"event","event":"upstream_start_failed","upstream":"broken","detail":"exec: no such file"}` + "\n" +
+		`{"time":"2026-07-29T10:00:03Z","upstream":"trunc`
+
+	entries, err := ReadEntries(strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("got %d entries, want 3: %+v", len(entries), entries)
+	}
+	if entries[0].Call == nil || entries[0].Call.Upstream != "old" {
+		t.Errorf("entry[0] = %+v, want call for upstream old", entries[0])
+	}
+	if entries[1].Call == nil || entries[1].Call.Upstream != "new" {
+		t.Errorf("entry[1] = %+v, want call for upstream new", entries[1])
+	}
+	if entries[2].Event == nil {
+		t.Fatalf("entry[2] = %+v, want an event", entries[2])
+	}
+	if entries[2].Call != nil {
+		t.Errorf("entry[2] carries both a call and an event: %+v", entries[2])
+	}
+	ev := entries[2].Event
+	if ev.Event != EventUpstreamStartFailed || ev.Upstream != "broken" || ev.Detail == "" {
+		t.Errorf("event = %+v, want start-failed for broken with a detail", ev)
+	}
+
+	recs, err := ReadRecords(strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadRecords: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("ReadRecords got %d records, want exactly the 2 calls: %+v", len(recs), recs)
+	}
+	if recs[0].Upstream != "old" || recs[1].Upstream != "new" {
+		t.Errorf("ReadRecords = %+v, want [old new] in file order", recs)
+	}
+}
+
+// TestReadEntriesSkipsUnknownKind (Stage 18, L2) pins the forward-compat rule: a
+// line with a THIRD kind this binary does not know is skipped by both readers
+// rather than guessed at as a call.
+func TestReadEntriesSkipsUnknownKind(t *testing.T) {
+	data := `{"time":"2026-07-29T10:00:00Z","kind":"metrics","upstream":"a","value":42}` + "\n" +
+		`{"time":"2026-07-29T10:00:01Z","upstream":"a","method":"tools/call","tool":"a__x","ok":true}` + "\n"
+
+	entries, err := ReadEntries(strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Call == nil || entries[0].Call.Tool != "a__x" {
+		t.Fatalf("entries = %+v, want only the one call line", entries)
+	}
+	recs, err := ReadRecords(strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadRecords: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Tool != "a__x" {
+		t.Fatalf("records = %+v, want only the one call line", recs)
+	}
+}
+
+// TestCallLogRecordEventWritesJSONLine (Stage 18, L3) pins the write side of
+// events: one JSON line carrying the discriminator, an omitted count at 1, and
+// the same post-Close drop semantics Record has.
+func TestCallLogRecordEventWritesJSONLine(t *testing.T) {
+	var buf bytes.Buffer
+	cl := NewCallLogWriter(&buf)
+	cl.RecordEvent(EventRecord{
+		Time:    time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC),
+		Kind:    KindEvent,
+		Event:   EventNotificationDropped,
+		Subject: "notifications/tools/list_changed",
+		Detail:  "subscriber buffer full",
+		// A single occurrence leaves Count at zero: on the wire "absent == 1".
+		// registry.emitEvent normalizes an explicit 1 down to zero, so this is
+		// what a real single-occurrence event looks like.
+	})
+
+	line := strings.TrimSpace(buf.String())
+	if strings.Count(buf.String(), "\n") != 1 {
+		t.Fatalf("want exactly one line, got %q", buf.String())
+	}
+	if strings.Contains(line, `"count"`) {
+		t.Errorf("a single occurrence must omit count, got %q", line)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		t.Fatalf("unmarshal event line: %v (line=%q)", err, line)
+	}
+	if raw["kind"] != KindEvent {
+		t.Errorf("kind = %v, want %q", raw["kind"], KindEvent)
+	}
+	if raw["event"] != EventNotificationDropped {
+		t.Errorf("event = %v, want %q", raw["event"], EventNotificationDropped)
+	}
+
+	if err := cl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	cl.RecordEvent(EventRecord{Kind: KindEvent, Event: EventUpstreamGaveUp})
+	if got := strings.Count(buf.String(), "\n"); got != 1 {
+		t.Fatalf("journal has %d lines after post-Close RecordEvent, want 1", got)
+	}
+}
+
+// TestEventRecordCountIsWrittenWhenAboveOne guards the other half of the
+// omitempty rule: a coalesced event must carry its count.
+func TestEventRecordCountIsWrittenWhenAboveOne(t *testing.T) {
+	var buf bytes.Buffer
+	cl := NewCallLogWriter(&buf)
+	cl.RecordEvent(EventRecord{Kind: KindEvent, Event: EventNotificationDropped, Count: 7})
+	entries, err := ReadEntries(&buf)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Event == nil || entries[0].Event.Count != 7 {
+		t.Fatalf("entries = %+v, want one event with count 7", entries)
+	}
+}

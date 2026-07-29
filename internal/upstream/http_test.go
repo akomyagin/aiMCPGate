@@ -164,7 +164,7 @@ func toolsListJSON(tools []string) string {
 // "xxxxx" marker.
 func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
 	// Port 1 on loopback: connection refused, immediately and deterministically.
-	conn := upstream.StartHTTP(quietLogger(), "leaky", "http://user:sup3rsecret@127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "leaky", "http://user:sup3rsecret@127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -184,7 +184,7 @@ func TestHTTPEndpointCredentialsRedactedInErrors(t *testing.T) {
 func newConn(t *testing.T, f *fakeHTTPServer, headers map[string]string) (*upstream.Conn, func()) {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())
-	conn := upstream.StartHTTP(quietLogger(), "fakehttp", srv.URL, headers, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "fakehttp", srv.URL, headers, srv.Client(), "0.0.0-test", nil, nil, nil)
 	return conn, func() { _ = conn.Close(); srv.Close() }
 }
 
@@ -340,7 +340,7 @@ func TestHTTPAuthHeaderSentNotLogged(t *testing.T) {
 
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(logger, "fakehttp", srv.URL, map[string]string{"Authorization": secret}, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(logger, "fakehttp", srv.URL, map[string]string{"Authorization": secret}, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx := context.Background()
@@ -381,7 +381,7 @@ func TestHTTPCallOversizedJSONResponseIsRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "oversized", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "oversized", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -402,7 +402,7 @@ func TestCallRejectsNonResponseBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "nonresponse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.CallTool(context.Background(), "fetch", nil, nil); err == nil {
@@ -420,7 +420,7 @@ func TestCallRejectsMismatchedID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "wrongid", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	_, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -447,7 +447,7 @@ func TestCallAcceptsNullResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "nullresult", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -537,7 +537,7 @@ func TestHTTPSessionExpiry404ReinitializesAndRetries(t *testing.T) {
 	f := &sessionExpiringServer{}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -574,7 +574,7 @@ func TestHTTPSessionExpiryRetriesOnlyOnce(t *testing.T) {
 	f := &sessionExpiringServer{alwaysExpire: true}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -620,7 +620,7 @@ func TestHTTPSSEMultiLineDataConcatenated(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "multiline", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "multiline", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	resp, err := conn.CallTool(context.Background(), "fetch", nil, nil)
@@ -660,7 +660,7 @@ func TestHTTPJSONBodyDrainedForKeepAlive(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "reuse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "reuse", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	const calls = 4
@@ -717,7 +717,7 @@ func TestHTTPNegotiatedProtocolVersionEchoed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	conn := upstream.StartHTTP(quietLogger(), "older", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "older", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx := context.Background()
@@ -789,7 +789,7 @@ func TestHTTPSSEStreamNotificationsAndReconnect(t *testing.T) {
 	defer srv.Close()
 
 	onNotify := func(method string, _ json.RawMessage) { notifs <- method }
-	conn := upstream.StartHTTP(quietLogger(), "sse", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
+	conn := upstream.StartHTTP(quietLogger(), "sse", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -858,7 +858,7 @@ func TestHTTPSSEStreamNotOffered(t *testing.T) {
 	defer srv.Close()
 
 	conn := upstream.StartHTTP(quietLogger(), "nostream", srv.URL, nil, srv.Client(), "0.0.0-test",
-		func(string, json.RawMessage) {}, nil)
+		func(string, json.RawMessage) {}, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -916,7 +916,7 @@ func TestHTTPSSEStreamRetriesTransientFirstAttempt(t *testing.T) {
 	defer srv.Close()
 
 	onNotify := func(method string, _ json.RawMessage) { notifs <- method }
-	conn := upstream.StartHTTP(quietLogger(), "transient", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
+	conn := upstream.StartHTTP(quietLogger(), "transient", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -943,7 +943,7 @@ func TestHTTPSSEStreamRetriesTransientFirstAttempt(t *testing.T) {
 // ever ran) must not block waiting for a goroutine that does not exist.
 func TestHTTPCloseBeforeSSEStreamStarted(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "never", "http://127.0.0.1:1/mcp", nil, nil, "0.0.0-test",
-		func(string, json.RawMessage) {}, nil)
+		func(string, json.RawMessage) {}, nil, nil)
 	closed := make(chan struct{})
 	go func() { _ = conn.Close(); close(closed) }()
 	select {
@@ -985,7 +985,7 @@ func TestHTTPStreamOpensForOnRequestOnly(t *testing.T) {
 	defer srv.Close()
 
 	conn := upstream.StartHTTP(quietLogger(), "reqonly", srv.URL, nil, srv.Client(), "0.0.0-test",
-		nil, func(string, json.RawMessage, json.RawMessage) {})
+		nil, func(string, json.RawMessage, json.RawMessage) {}, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1046,7 +1046,7 @@ func TestHTTPStreamClassifiesFrames(t *testing.T) {
 		func(method string, _ json.RawMessage) { notifs <- method },
 		func(method string, id, params json.RawMessage) {
 			requests <- streamFrame{method: method, id: string(id), params: string(params)}
-		})
+		}, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1176,7 +1176,7 @@ func TestHTTPRespondPostsVerbatimWithSession(t *testing.T) {
 	f := &respondingHTTPServer{}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1215,7 +1215,7 @@ func TestHTTPRespondErrorStatuses(t *testing.T) {
 		f := &respondingHTTPServer{respondStatus: http.StatusNotFound}
 		srv := httptest.NewServer(f.handler())
 		defer srv.Close()
-		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 		defer func() { _ = conn.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1254,7 +1254,7 @@ func TestHTTPRespondErrorStatuses(t *testing.T) {
 		f := &respondingHTTPServer{respondStatus: http.StatusInternalServerError}
 		srv := httptest.NewServer(f.handler())
 		defer srv.Close()
-		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+		conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 		defer func() { _ = conn.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1287,7 +1287,7 @@ func TestHTTPRespondAfterCloseFailsFast(t *testing.T) {
 	f := &respondingHTTPServer{}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
-	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil)
+	conn := upstream.StartHTTP(quietLogger(), "responder", srv.URL, nil, srv.Client(), "0.0.0-test", nil, nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1352,7 +1352,7 @@ func TestHTTPInterleavedRequestOnPostStream(t *testing.T) {
 	conn := upstream.StartHTTP(quietLogger(), "interleaver", srv.URL, nil, srv.Client(), "0.0.0-test", nil,
 		func(method string, id, params json.RawMessage) {
 			requests <- streamFrame{method: method, id: string(id), params: string(params)}
-		})
+		}, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1483,7 +1483,7 @@ func TestSSEStreamSurvivesSessionExpiry(t *testing.T) {
 		default:
 		}
 	}
-	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil)
+	conn := upstream.StartHTTP(quietLogger(), "expiring", srv.URL, nil, srv.Client(), "0.0.0-test", onNotify, nil, nil)
 	defer func() { _ = conn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1520,4 +1520,77 @@ func TestSSEStreamSurvivesSessionExpiry(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatalf("no notification after the session was renewed: the SSE stream never came back (GET attempts: %d)", f.getCount())
 	}
+}
+
+// TestStreamUnavailableCallbackFires (Stage 18, U-H1) pins the onStreamUnavailable
+// callback: an upstream that answers 405 to the optional GET must notify the
+// caller exactly once (the registry turns that into an operator event), and a nil
+// callback must stay harmless.
+func TestStreamUnavailableCallbackFires(t *testing.T) {
+	newRefusingServer := func(t *testing.T) *httptest.Server {
+		t.Helper()
+		f := &fakeHTTPServer{tools: []string{"t"}}
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				http.Error(w, "no stream here", http.StatusMethodNotAllowed)
+				return
+			}
+			f.handler().ServeHTTP(w, r)
+		})
+		srv := httptest.NewServer(handler)
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	t.Run("fires once", func(t *testing.T) {
+		srv := newRefusingServer(t)
+		var calls atomic.Int32
+		fired := make(chan struct{}, 4)
+		conn := upstream.StartHTTP(quietLogger(), "nostream", srv.URL, nil, srv.Client(), "0.0.0-test",
+			func(string, json.RawMessage) {}, nil,
+			func() {
+				calls.Add(1)
+				select {
+				case fired <- struct{}{}:
+				default:
+				}
+			})
+		defer func() { _ = conn.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := conn.Initialize(ctx); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		select {
+		case <-fired:
+		case <-time.After(10 * time.Second):
+			t.Fatal("onStreamUnavailable never fired for an upstream that refused the GET stream")
+		}
+		// Past the would-be first reconnect backoff: the branch is terminal, so
+		// no second call may appear.
+		time.Sleep(1500 * time.Millisecond)
+		if n := calls.Load(); n != 1 {
+			t.Fatalf("onStreamUnavailable fired %d times, want exactly 1", n)
+		}
+	})
+
+	t.Run("nil callback is safe", func(t *testing.T) {
+		srv := newRefusingServer(t)
+		conn := upstream.StartHTTP(quietLogger(), "nostream", srv.URL, nil, srv.Client(), "0.0.0-test",
+			func(string, json.RawMessage) {}, nil, nil)
+		defer func() { _ = conn.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := conn.Initialize(ctx); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		time.Sleep(1500 * time.Millisecond)
+		// A panic on the stream goroutine would have taken the test binary down;
+		// reaching here with a working connection is the assertion.
+		if _, err := conn.ListTools(ctx); err != nil {
+			t.Fatalf("ListTools after refused SSE stream with nil callback: %v", err)
+		}
+	})
 }

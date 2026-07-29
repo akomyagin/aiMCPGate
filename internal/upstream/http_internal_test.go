@@ -21,15 +21,15 @@ import (
 // from the registry's context, see StartHTTP).
 func TestStartHTTPNilClientGetsDedicatedTransport(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	connA := StartHTTP(log, "a", "http://127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil, nil)
-	connB := StartHTTP(log, "b", "http://127.0.0.2:1/mcp", nil, nil, "0.0.0-test", nil, nil)
+	connA := StartHTTP(log, "a", "http://127.0.0.1:1/mcp", nil, nil, "0.0.0-test", nil, nil, nil)
+	connB := StartHTTP(log, "b", "http://127.0.0.2:1/mcp", nil, nil, "0.0.0-test", nil, nil, nil)
 	defer func() { _ = connA.Close(); _ = connB.Close() }()
 
 	clientA := connA.transport.(*httpTransport).client
 	clientB := connB.transport.(*httpTransport).client
 
 	if clientA == clientB {
-		t.Fatal("two StartHTTP(nil) connections share one http.Client")
+		t.Fatal("two StartHTTP(nil, nil) connections share one http.Client")
 	}
 	for name, cl := range map[string]*http.Client{"a": clientA, "b": clientB} {
 		if cl.Timeout != 0 {
@@ -43,6 +43,6 @@ func TestStartHTTPNilClientGetsDedicatedTransport(t *testing.T) {
 		}
 	}
 	if clientA.Transport == clientB.Transport {
-		t.Error("two StartHTTP(nil) connections share one *http.Transport; Close on one would idle the other's connections")
+		t.Error("two StartHTTP(nil, nil) connections share one *http.Transport; Close on one would idle the other's connections")
 	}
 }

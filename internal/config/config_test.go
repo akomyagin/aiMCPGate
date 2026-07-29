@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -778,5 +779,106 @@ func TestLazyCatalogHelper(t *testing.T) {
 	}
 	if !(&Config{CatalogMode: CatalogModeLazy}).LazyCatalog() {
 		t.Error("catalog_mode lazy must report LazyCatalog")
+	}
+}
+
+// TestLoadRejectsUnknownKey (Stage 18, K1): a misspelled key is a startup error
+// naming both the key and its line — the whole point of KnownFields(true). The
+// motivating case is exactly this one: `enabld` used to be ignored, leaving the
+// upstream ENABLED with nothing anywhere explaining why.
+func TestLoadRejectsUnknownKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+log_file: ./calls.jsonl
+upstreams:
+  - name: github
+    command: /bin/true
+    enabld: false
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a misspelled key; unknown keys must be fatal")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "enabld") {
+		t.Errorf("error does not name the offending key: %v", err)
+	}
+	if !strings.Contains(msg, "line") {
+		t.Errorf("error does not give a line number: %v", err)
+	}
+}
+
+// TestLoadAcceptsAnchorsAndMergeKeys (K2) is the regression guard against
+// RE-implementing strictness by hand: YAML anchors and merge keys (<<:) must
+// keep working, both inside a map field and across struct elements of the
+// upstreams list.
+func TestLoadAcceptsAnchorsAndMergeKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+log_file: ./calls.jsonl
+upstreams:
+  - name: first
+    command: /bin/true
+    env: &common
+      SHARED: yes
+      REGION: eu
+  - name: second
+    command: /bin/true
+    env:
+      <<: *common
+      REGION: us
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load rejected anchors/merge keys: %v", err)
+	}
+	if len(cfg.Upstreams) != 2 {
+		t.Fatalf("got %d upstreams, want 2", len(cfg.Upstreams))
+	}
+	env := cfg.Upstreams[1].Env
+	if env["SHARED"] != "yes" {
+		t.Errorf("merged key SHARED = %q, want the anchor's value", env["SHARED"])
+	}
+	if env["REGION"] != "us" {
+		t.Errorf("REGION = %q, want the local override to win over the merge", env["REGION"])
+	}
+}
+
+// TestLoadEmptyFileKeepsOldBehaviour (K3) closes the one behavioural gap between
+// yaml.Unmarshal and a strict Decoder: an empty file makes Decode return io.EOF
+// where Unmarshal quietly produced a zero Config. Pre-Stage-18, an empty config
+// LOADED (Validate does not require upstreams — Registry.Start is what refuses
+// an empty gateway, with a far better message); that must stay true, and no
+// operator may ever be shown a bare "EOF".
+func TestLoadEmptyFileKeepsOldBehaviour(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		if strings.Contains(err.Error(), "EOF") {
+			t.Fatalf("empty config now fails with a raw parse EOF; the pre-Stage-18 behaviour was a zero Config: %v", err)
+		}
+		t.Fatalf("Load on an empty config: %v, want the same success it gave before", err)
+	}
+	if len(cfg.Upstreams) != 0 {
+		t.Errorf("empty config produced %d upstreams, want 0", len(cfg.Upstreams))
+	}
+	// The usual defaults are still applied on top of the zero Config.
+	if cfg.Transport != TransportStdio {
+		t.Errorf("transport = %q, want the stdio default", cfg.Transport)
+	}
+	if cfg.LogLevel != "info" {
+		t.Errorf("log_level = %q, want the info default", cfg.LogLevel)
 	}
 }

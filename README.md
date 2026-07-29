@@ -152,9 +152,12 @@ mcp-gate call github__search_repositories '{"query":"mcp"}' --config ./config.ya
 # the heaviest individual tools — the data behind allow-list / strip decisions:
 mcp-gate catalog --config ./config.yaml --top 20
 
-# view the call log (last 50 records; filter by upstream/tool/status):
+# view the journal — tool calls AND operator events (last 50 lines; filter by
+# upstream/tool/status):
 mcp-gate logs --file ./logs/calls.jsonl --tail 50
 mcp-gate logs --config ./config.yaml --upstream github --status err
+# show ONLY the operator events (see "Operator events" below):
+mcp-gate logs --config ./config.yaml --events
 # keep watching the log as it grows, or aggregate it instead of listing records
 # (--follow and --stats are mutually exclusive):
 mcp-gate logs --config ./config.yaml --follow
@@ -262,6 +265,50 @@ capability is offered only when the gateway's own client declared it, and
 `{}`. The answer POST is not retried: an upstream that does not get it falls
 back on its own timeout.
 
+## Operator events in the journal
+
+The journal at `log_file` holds **two kinds of line**: one per tool **call**, and
+one per operator **event** — a gateway state you would otherwise never learn
+about. In stdio mode the MCP client owns the terminal, so the gateway's stderr is
+invisible to you, and several of these conditions were only ever logged at debug
+level. They are now written to the same file `mcp-gate logs` reads:
+
+| Event | What it means |
+|---|---|
+| `upstream_start_failed` | An upstream never came up; its tools are absent from the catalog. |
+| `upstream_gave_up` | The supervisor stopped restarting an upstream (attempts exhausted, restart disabled by a reload, or no liveness channel) and dropped it from the catalog. |
+| `notification_dropped` | A subscriber's buffer was full, so a forwarded notification was dropped — forwarding is non-blocking by design. |
+| `server_request_dropped` | An upstream asked something only the client could answer (`elicitation`/`sampling`/`roots`) and no transport took the question, so the tool call was refused on its behalf. |
+| `sse_stream_unavailable` | An HTTP upstream offers no `GET` SSE stream, so `tools/list_changed` from it will never arrive until the gateway restarts. |
+| `catalog_collision` | Two entries claimed the same client-facing tool/prompt name or resource URI; keep-first won and the loser is hidden from the client. |
+| `catalog_bad_template` | A resource URI template does not compile: it is listed to the client but can never match a read. |
+| `result_truncation_skipped` | A result exceeded `max_result_bytes` but had no truncatable text (e.g. images only), so it passed through whole. |
+
+Events show up inline with calls, marked `EVT`; `mcp-gate logs --events` shows
+only them, and `--stats` gains a per-event table. `--tool` and `--status` are
+call-only filters, so events are excluded while either is set (`--upstream`
+applies to both). One consequence worth knowing: `notification_dropped` names no
+upstream — a drop is a property of the *subscriber* whose buffer was full, not of
+whoever sent the notification — so **`--upstream X` never shows it**. Look for it
+without that filter. Repeated drops are coalesced — the first one is written at
+once, further ones within a minute are counted into the `count=` of the next
+line for that key, and the remainder is flushed at shutdown. A line that carries
+such a backlog says so in its `detail=`, naming the time of the **oldest**
+occurrence it folds in — the line's own timestamp is the newest one, so the two
+together bound when the burst actually happened.
+
+Two practical notes:
+
+- **Set `log_file`.** With it empty the journal goes to stderr, which in stdio
+  mode belongs to the MCP client — the events would be written where you cannot
+  see them.
+- **Read a journal with the same (or a newer) binary that wrote it.** Events
+  carry a `"kind"` field older versions do not know, so `mcp-gate logs` from
+  ≤ v0.4.0 renders them as sparse, mostly empty records.
+
+Nothing about this is visible to the MCP client: no error codes, result bodies
+or capabilities changed — the events go to the journal only.
+
 ## Reloading config (SIGHUP)
 
 The gateway reloads its configuration live on **SIGHUP** — no restart, no
@@ -309,6 +356,14 @@ from). If that file doesn't exist and `--config` wasn't passed either, it
 errors explicitly instead of starting an empty gateway. Relative paths inside
 the config (`log_file`, `skill_file`, `debug_payload_log`) resolve against the
 **config file's own directory**, not the current working directory.
+
+**Unknown keys are a startup error.** The config is parsed strictly: a
+misspelled or unrecognized key stops the gateway with the key name and its line
+number, instead of being silently ignored as it once was. The concrete win: a
+typo in `enabled` can no longer leave an upstream quietly running. Custom `x-`
+scratch keys are rejected too — to share a block, put a YAML anchor on the first
+real upstream and merge it (`<<: *anchor`) into the others; anchors and merge
+keys work as usual.
 
 An upstream is **enabled by default**: omit `enabled:` entirely and it is
 launched like any other. To keep one out of the gateway without deleting its

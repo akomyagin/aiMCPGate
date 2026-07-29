@@ -226,6 +226,13 @@ type Registry struct {
 	payloadLog logging.PayloadLog
 	start      upstreamStarter
 
+	// eventMu/eventSeen back the operator-event throttle (Stage 18, events.go).
+	// eventMu is a LEAF mutex: no other registry lock is taken from under it, and
+	// noteThrottled always journals from outside it. eventSeen is created in New
+	// and only ever read/written under eventMu.
+	eventMu   sync.Mutex
+	eventSeen map[eventKey]*eventState
+
 	// version is the gateway's build version (from -ldflags in main), passed
 	// down to every upstream connection so the initialize handshake reports
 	// the real binary version as clientInfo.version instead of a hardcoded
@@ -313,6 +320,16 @@ type Registry struct {
 	// written by mergeLocked, cleared by dropLocked, always in step with the
 	// catalog.
 	handshakes map[string]handshakeMeta
+	// catalogDefects remembers, per upstream, the set of catalog defects its
+	// LAST merge journaled (see catalogDefect): duplicate client-facing names,
+	// duplicate resource URIs, uncompilable URI templates. mergeLocked emits an
+	// event only for defects NOT already in this set and then replaces the set
+	// wholesale, so re-merging an unchanged catalog writes nothing while a newly
+	// appeared defect is still reported at once. Guarded by r.mu like the maps it
+	// mirrors; cleared only when the upstream is really removed (dropUpstream /
+	// dropUpstreamIfCurrent), never by installLocked's internal drop-then-merge —
+	// that IS the repeat this memory exists to absorb.
+	catalogDefects map[string]map[catalogDefect]struct{}
 	// cachedTools is the sorted catalog slice Tools() hands out, rebuilt lazily
 	// on the first read after a mutation: the catalog changes only at discrete
 	// points (mergeLocked/dropLocked), while tools/list reads it on every client
@@ -540,6 +557,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		payloadLog:        payloadLog,
 		autoRestart:       supervise,
 		version:           version,
+		eventSeen:         map[eventKey]*eventState{},
 		conns:             map[string]Upstream{},
 		tools:             map[string]ToolDescriptor{},
 		toolRoute:         map[string]route{},
@@ -552,6 +570,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		rawResources:      map[string][]mcp.Resource{},
 		rawTemplates:      map[string][]mcp.ResourceTemplate{},
 		handshakes:        map[string]handshakeMeta{},
+		catalogDefects:    map[string]map[catalogDefect]struct{}{},
 		subscribers:       map[int]chan struct{}{},
 		notifSubs:         map[int]chan mcp.Message{},
 		pendingServerReqs: map[string]pendingServerReq{},
@@ -652,7 +671,14 @@ func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 	onRequest := func(method string, id, params json.RawMessage) {
 		r.onUpstreamRequest(name, method, id, params)
 	}
-	conn := upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify, onRequest)
+	onStreamUnavailable := func() {
+		r.emitEvent(logging.EventRecord{
+			Event:    logging.EventSSEStreamUnavailable,
+			Upstream: name,
+			Detail:   "upstream offers no GET SSE stream; tools/list_changed from it will never arrive (until gateway restart)",
+		})
+	}
+	conn := upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify, onRequest, onStreamUnavailable)
 	// Same race-free timing as startStdio: Initialize runs later, on this same
 	// launch goroutine. The len gate keeps doctor/call/catalog (no MCP client,
 	// so nothing declared) sending exactly {}.
@@ -728,6 +754,14 @@ func (r *Registry) Start(ctx context.Context) error {
 		if res.err != nil {
 			r.log.Warn("upstream failed to come up", "upstream", u.Name, "err", res.err)
 			r.recordFailure(u.Name, res.err.Error())
+			// Same text recordFailure keeps for StartReport / doctor: showing
+			// this reason to the operator is a policy already settled in Stage 8,
+			// so the journal adds no new leak surface (plan §4).
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventUpstreamStartFailed,
+				Upstream: u.Name,
+				Detail:   res.err.Error(),
+			})
 			continue
 		}
 		n := r.merge(u.Name, res.conn, res.tools, res.aux, res.meta)
@@ -1014,6 +1048,14 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			// connection is already closed, so its catalog entry must go too.
 			if r.dropUpstreamIfCurrent(u.Name, dead) {
 				r.log.Info("stdio upstream restart disabled by reload, dropped from catalog", "upstream", u.Name)
+				// Only the branch that actually dropped the upstream emits: in
+				// the else-branch the entry is a fresh connection someone else
+				// installed, so nothing was lost from the client's catalog.
+				r.emitEvent(logging.EventRecord{
+					Event:    logging.EventUpstreamGaveUp,
+					Upstream: u.Name,
+					Detail:   "restart policy disabled by a config reload; upstream dropped from the catalog",
+				})
 				r.notifyCatalogChanged()
 			} else {
 				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
@@ -1024,6 +1066,12 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			if r.dropUpstreamIfCurrent(u.Name, dead) {
 				r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
 					"upstream", u.Name, "max_attempts", policy.MaxAttempts)
+				r.emitEvent(logging.EventRecord{
+					Event:    logging.EventUpstreamGaveUp,
+					Upstream: u.Name,
+					Detail: fmt.Sprintf("exhausted restart attempts (max_attempts=%d); upstream dropped from the catalog",
+						policy.MaxAttempts),
+				})
 				r.notifyCatalogChanged()
 			} else {
 				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
@@ -1065,6 +1113,11 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			// non-stdio path cannot silently spin.
 			_ = conn.Close()
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventUpstreamGaveUp,
+				Upstream: u.Name,
+				Detail:   "restarted upstream reports no liveness channel; giving up on supervising it",
+			})
 			return nil, nil, false
 		}
 		if !r.replaceUpstreamIfLive(u.Name, conn, tools, aux, meta, supCtx) {
@@ -1223,10 +1276,14 @@ func (r *Registry) relistUpstream(name string) {
 // routing tables under the registry lock, recording the handshake metadata
 // launch retained alongside. It returns the number of tools actually projected
 // into the catalog (post-filter, post-dedup).
+// The unlock is explicit rather than deferred because the events mergeLocked
+// collected MUST be journaled outside the lock (see mergeLocked and emitEvent);
+// the same shape as forwardNotification's.
 func (r *Registry) merge(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta) int {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := r.mergeLocked(name, conn, tools, aux, meta)
+	n, pending := r.mergeLocked(name, conn, tools, aux, meta)
+	r.mu.Unlock()
+	r.emitEvents(pending)
 	r.log.Debug("upstream catalog merged", "upstream", name, "tools", n,
 		"prompts", len(aux.prompts), "resources", len(aux.resources), "resource_templates", len(aux.templates))
 	return n
@@ -1340,8 +1397,44 @@ func (r *Registry) filterFor(name string) config.ToolFilter {
 // advertising a name that happens to match another's projection).
 // It returns the number of entries actually added to the catalog by this call
 // (post-filter, post-dedup) — the count the client really sees, which callers
-// report to diagnostics (UpstreamStatus.Tools → doctor) and logs.
-func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta) int {
+// report to diagnostics (UpstreamStatus.Tools → doctor) and logs — plus the
+// operator events the merge noticed, which the CALLER must journal AFTER
+// releasing r.mu.
+//
+// Why the events are returned instead of written here (independent review,
+// H1/M2): this is not a cold path. Besides Start/Reload/restart it is reached
+// from an upstream's own notifications/tools/list_changed — onUpstreamNotifi
+// cation → relistUpstream → replaceUpstreamIfCurrent → installLocked → here —
+// at up to one merge per relistDebounce (200ms). Journaling from under r.mu
+// would put a potentially FOREVER-blocking write(2) (see emitEvent) under the
+// registry's central lock, on a frequency an upstream controls. The defect
+// memory (r.catalogDefects) closes the second half: a re-merge of an unchanged
+// broken catalog reports nothing, because a static defect is a fact an operator
+// needs once, not a stream.
+func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux auxCatalog, meta handshakeMeta) (int, []logging.EventRecord) {
+	var pending []logging.EventRecord
+	known := r.catalogDefects[name]
+	found := map[catalogDefect]struct{}{}
+	// noteDefect records a defect of THIS merge and queues an event for it
+	// unless the previous merge of the same upstream already reported it (or
+	// this very merge did — a raw list may repeat one name several times).
+	noteDefect := func(event, subject, detail string) {
+		d := catalogDefect{event: event, subject: subject}
+		if _, dup := found[d]; dup {
+			return
+		}
+		found[d] = struct{}{}
+		if _, seen := known[d]; seen {
+			return
+		}
+		pending = append(pending, logging.EventRecord{
+			Event:    event,
+			Upstream: name,
+			Subject:  subject,
+			Detail:   detail,
+		})
+	}
+
 	r.cachedToolsValid = false
 	r.conns[name] = conn
 	r.rawTools[name] = tools
@@ -1353,6 +1446,8 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
 		if _, dup := r.tools[e.name]; dup {
 			r.log.Warn("duplicate client-facing tool name skipped", "name", e.name, "upstream", name)
+			noteDefect(logging.EventCatalogCollision, e.name,
+				"duplicate client-facing tool name, keep-first: this upstream's tool is hidden from the client")
 			continue
 		}
 		r.tools[e.name] = ToolDescriptor{Name: e.name, Upstream: name, Tool: e.tool}
@@ -1369,6 +1464,8 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 		ns := name + NameSeparator + p.Name
 		if _, dup := r.prompts[ns]; dup {
 			r.log.Warn("duplicate client-facing prompt name skipped", "name", ns, "upstream", name)
+			noteDefect(logging.EventCatalogCollision, ns,
+				"duplicate client-facing prompt name, keep-first: this upstream's prompt is hidden from the client")
 			continue
 		}
 		r.prompts[ns] = PromptDescriptor{Name: ns, Upstream: name, Prompt: p}
@@ -1383,6 +1480,8 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 	for _, res := range aux.resources {
 		if _, dup := r.resources[res.URI]; dup {
 			r.log.Warn("duplicate resource uri skipped", "uri", res.URI, "upstream", name)
+			noteDefect(logging.EventCatalogCollision, res.URI,
+				"duplicate resource uri, keep-first: this upstream's resource is hidden from the client")
 			continue
 		}
 		r.resources[res.URI] = ResourceDescriptor{URI: res.URI, Upstream: name, Resource: res}
@@ -1398,12 +1497,25 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 		if err != nil {
 			r.log.Warn("unusable resource uri template, listed but never matched",
 				"template", tpl.URITemplate, "upstream", name, "err", err)
+			// Detail carries the regexp compiler's message — gateway-side text
+			// about the template's own syntax, not a payload or a secret.
+			noteDefect(logging.EventCatalogBadTemplate, tpl.URITemplate,
+				"uri template does not compile; it is listed to the client but will never match a read: "+err.Error())
 		}
 		r.resourceTemplates = append(r.resourceTemplates, ResourceTemplateDescriptor{
 			URITemplate: tpl.URITemplate, Upstream: name, Template: tpl, re: re,
 		})
 	}
-	return n
+	// Replace (not merge) the remembered defect set: a defect that disappeared
+	// — the winner of a collision went away, the upstream stopped advertising
+	// the broken template — is forgotten, so if it ever comes back the operator
+	// is told again. A clean catalog drops the entry entirely.
+	if len(found) > 0 {
+		r.catalogDefects[name] = found
+	} else {
+		delete(r.catalogDefects, name)
+	}
+	return n, pending
 }
 
 // templateRegexp translates an RFC 6570 level-1 URI template into an anchored
@@ -1449,6 +1561,11 @@ func templateRegexp(tmpl string) (*regexp.Regexp, error) {
 func (r *Registry) dropUpstream(name string) {
 	r.mu.Lock()
 	r.dropLocked(name)
+	// A real removal also forgets what was already reported about this upstream:
+	// if the same name comes back later with the same broken catalog, that is
+	// news again. (installLocked's internal dropLocked deliberately does NOT do
+	// this — see the catalogDefects field comment.)
+	delete(r.catalogDefects, name)
 	r.mu.Unlock()
 	r.dropPendingServerReqs(name)
 }
@@ -1482,6 +1599,7 @@ func (r *Registry) dropUpstreamIfCurrent(name string, conn Upstream) bool {
 		return false
 	}
 	r.dropLocked(name)
+	delete(r.catalogDefects, name) // real removal — see dropUpstream
 	r.mu.Unlock()
 	r.dropPendingServerReqs(name)
 	return true
@@ -1539,7 +1657,12 @@ func (r *Registry) dropLocked(name string) {
 // templates" (a tools/list_changed re-list refreshes only tools; a filter
 // re-projection touches nothing upstream), so the currently recorded auxiliary
 // catalogs are carried over as a unit.
-func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, aux *auxCatalog, meta *handshakeMeta, logMsg string) {
+//
+// Like mergeLocked it RETURNS the operator events it noticed instead of writing
+// them: every caller here holds r.mu, and a journal write under that lock can
+// block the whole gateway (see emitEvent). Callers must hand the batch to
+// emitEvents after unlocking.
+func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, aux *auxCatalog, meta *handshakeMeta, logMsg string) []logging.EventRecord {
 	if meta == nil {
 		m := r.handshakes[name] // zero value when absent — nothing to preserve
 		meta = &m
@@ -1552,8 +1675,9 @@ func (r *Registry) installLocked(name string, conn Upstream, tools []mcp.Tool, a
 		}
 	}
 	r.dropLocked(name)
-	n := r.mergeLocked(name, conn, tools, *aux, *meta)
+	n, pending := r.mergeLocked(name, conn, tools, *aux, *meta)
 	r.log.Debug(logMsg, "upstream", name, "tools", n)
+	return pending
 }
 
 // replaceUpstreamIfLive atomically swaps out an upstream's connection and
@@ -1573,8 +1697,9 @@ func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp
 		r.mu.Unlock()
 		return false
 	}
-	r.installLocked(name, conn, tools, &aux, &meta, "upstream catalog replaced")
+	pending := r.installLocked(name, conn, tools, &aux, &meta, "upstream catalog replaced")
 	r.mu.Unlock()
+	r.emitEvents(pending)
 	// The dead predecessor's parked server→client requests can never be
 	// answered through the fresh connection (its id space is new) — drop them
 	// (found by review).
@@ -1593,16 +1718,22 @@ func (r *Registry) replaceUpstreamIfLive(name string, conn Upstream, tools []mcp
 // comparison (all Upstream implementations are pointers, so == is identity).
 // Returns false — leaving the catalog untouched — when r.conns[name] is no
 // longer oldConn (removed, or already replaced by something newer).
+// The unlock is explicit (no defer) so the collected events are journaled
+// OUTSIDE r.mu: this is the hottest path into mergeLocked — an upstream firing
+// list_changed drives it every relistDebounce — and it is exactly the path that
+// made "merge is cold, journaling under r.mu is fine" false (review H1/M2).
 func (r *Registry) replaceUpstreamIfCurrent(name string, oldConn Upstream, tools []mcp.Tool) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.conns[name] != oldConn {
+		r.mu.Unlock()
 		return false
 	}
 	// nil meta/aux: a re-list runs no new handshake and refreshes only the
 	// tools — keep the recorded handshake metadata and the prompt/resource/
 	// template lists.
-	r.installLocked(name, oldConn, tools, nil, nil, "upstream catalog refreshed after list_changed")
+	pending := r.installLocked(name, oldConn, tools, nil, nil, "upstream catalog refreshed after list_changed")
+	r.mu.Unlock()
+	r.emitEvents(pending)
 	return true
 }
 
@@ -1682,15 +1813,27 @@ func (r *Registry) SubscribeNotifications() (<-chan mcp.Message, func()) {
 // onUpstreamNotification), so the send is strictly non-blocking: a subscriber
 // whose buffer is full has the message dropped — the reader must never stall
 // on a slow client transport.
+// Drops are also journaled as operator events (Stage 18), but NOT from under
+// notifMu: the drop is only counted while the lock is held and reported after
+// the explicit Unlock, so no journal write ever happens inside the notification
+// lock (plan §3.4, §11). The unlock is explicit rather than deferred for exactly
+// that reason.
 func (r *Registry) forwardNotification(msg mcp.Message) {
+	dropped := 0
 	r.notifMu.Lock()
-	defer r.notifMu.Unlock()
 	for _, ch := range r.notifSubs {
 		select {
 		case ch <- msg:
 		default:
 			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
+			dropped++
 		}
+	}
+	r.notifMu.Unlock()
+
+	for i := 0; i < dropped; i++ {
+		r.noteThrottled(logging.EventNotificationDropped, "", msg.Method,
+			"subscriber buffer full; non-blocking forwarding drops on backpressure")
 	}
 }
 
@@ -1951,18 +2094,22 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 // No I/O happens here: the connection and the raw list are reused as-is. A
 // concurrent restart/reload may have dropped the upstream since the diff was
 // computed — then there is nothing to re-merge.
+// The unlock is explicit (no defer) for the same reason as in merge: the events
+// installLocked collected are journaled only after r.mu is released.
 func (r *Registry) remergeUpstream(name string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	conn, ok := r.conns[name]
 	if !ok {
+		r.mu.Unlock()
 		return
 	}
 	tools := r.rawTools[name] // read BEFORE installLocked's drop, which deletes the entry
 	// nil meta/aux: a filter-only re-projection runs no new handshake and
 	// touches nothing upstream — keep the recorded metadata and the prompt/
 	// resource/template lists.
-	r.installLocked(name, conn, tools, nil, nil, "upstream catalog re-projected")
+	pending := r.installLocked(name, conn, tools, nil, nil, "upstream catalog re-projected")
+	r.mu.Unlock()
+	r.emitEvents(pending)
 }
 
 // retireAndClose retires an upstream's supervisor and closes its live
@@ -2602,6 +2749,22 @@ func (r *Registry) failureSummary() string {
 // Marking phaseClosing first makes any Reload queued behind this lock bail out
 // with ErrClosing instead of relaunching upstreams during shutdown.
 func (r *Registry) Close() error {
+	// Flush the coalesced operator events FIRST, while the journal is still open:
+	// the transports call reg.Close() from inside Serve, which returns before
+	// serve's own deferred callLog.Close() runs (stdio.go / http.go), so these
+	// lines still reach the file.
+	//
+	// DELIBERATE tail, not a bug (named by independent review, L1): this runs
+	// BEFORE phase = phaseClosing and before the connections are torn down, so a
+	// drop that happens during the teardown itself is counted into a remainder
+	// nobody flushes afterwards. Flushing later instead would lose more — the
+	// journal write must happen while the file is certainly open and while no
+	// lifecycle lock is held — and a second flush at the end would need its own
+	// ordering proof against callLog.Close(). The window is milliseconds of
+	// shutdown; what it can lose is a count, never a first occurrence (that one
+	// was journaled immediately when its window opened).
+	r.flushEvents()
+
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 	r.phase = phaseClosing

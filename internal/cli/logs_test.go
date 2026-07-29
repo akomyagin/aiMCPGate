@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,7 +34,9 @@ func writeLog(t *testing.T) string {
 	return path
 }
 
-// runLogsCmd executes the logs subcommand with args and captures its stdout.
+// runLogsCmd executes the logs subcommand with args and captures everything it
+// wrote, on either stream. Most tests here assert on CONTENT and do not care
+// which stream carried it.
 func runLogsCmd(t *testing.T, args ...string) string {
 	t.Helper()
 	root := Build("test")
@@ -45,6 +48,74 @@ func runLogsCmd(t *testing.T, args ...string) string {
 		t.Fatalf("logs %v: %v\n%s", args, err, out.String())
 	}
 	return out.String()
+}
+
+// runLogsCmdOSStreams runs the logs subcommand the way a user's shell does —
+// with cobra's writers left UNSET — and captures the real process stdout and
+// stderr separately.
+//
+// Leaving the writers unset is the entire point, and it is subtle enough to
+// spell out: cobra's Command.Println resolves through OutOrStderr(), which
+// falls back to os.Stderr ONLY when no out writer was configured. A test that
+// calls root.SetOut(&buf) hands Println that buffer, so the stream bug simply
+// does not occur under such a test — separate out/err buffers cannot catch it
+// either. That is why this helper swaps the os-level files instead, and why the
+// bug survived until a built binary was smoke-tested.
+//
+// Not safe for t.Parallel: os.Stdout/os.Stderr are process-global.
+func runLogsCmdOSStreams(t *testing.T, args ...string) (stdout, stderr string) {
+	t.Helper()
+
+	capture := func(target **os.File) (restore func(), read func() string) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		orig := *target
+		*target = w
+		// Drain concurrently: a pipe buffer that fills would deadlock the writer.
+		done := make(chan string, 1)
+		go func() {
+			var b bytes.Buffer
+			_, _ = io.Copy(&b, r)
+			done <- b.String()
+		}()
+		return func() { *target = orig; _ = w.Close() }, func() string { s := <-done; _ = r.Close(); return s }
+	}
+
+	restoreOut, readOut := capture(&os.Stdout)
+	restoreErr, readErr := capture(&os.Stderr)
+
+	root := Build("test")
+	root.SetArgs(append([]string{"logs"}, args...))
+	execErr := root.Execute()
+
+	restoreOut()
+	restoreErr()
+	stdout, stderr = readOut(), readErr()
+	if execErr != nil {
+		t.Fatalf("logs %v: %v\nstdout:\n%s\nstderr:\n%s", args, execErr, stdout, stderr)
+	}
+	return stdout, stderr
+}
+
+// TestLogsListingGoesToStdout pins the STREAM, not the content: cobra's
+// cmd.Println writes to the error stream, so the listing used to be invisible
+// to `mcp-gate logs | grep` and `mcp-gate logs > file` while looking perfectly
+// fine on a terminal. Merged out/err buffers cannot catch that, which is how it
+// survived until a built binary was smoke-tested.
+func TestLogsListingGoesToStdout(t *testing.T) {
+	path := writeLog(t)
+	stdout, stderr := runLogsCmdOSStreams(t, "--file", path)
+	for _, want := range []string{"github__search", "web__fetch", "github__create_issue"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("listing line %q is not on stdout (a pipe or redirect would lose it)\nstdout:\n%s\nstderr:\n%s",
+				want, stdout, stderr)
+		}
+		if strings.Contains(stderr, want) {
+			t.Errorf("listing line %q leaked onto stderr\nstderr:\n%s", want, stderr)
+		}
+	}
 }
 
 func TestLogsShowsAll(t *testing.T) {
@@ -327,5 +398,295 @@ func TestLogsFollowAppliesFilters(t *testing.T) {
 	waitOutputContains(t, out, "web__keep", 5*time.Second)
 	if strings.Contains(out.String(), "github__skip") {
 		t.Fatalf("follow printed a record the --upstream filter should have dropped:\n%s", out.String())
+	}
+}
+
+// mustEventLine renders one operator-event journal line, the way the gateway's
+// CallLog.RecordEvent writes it.
+func mustEventLine(t *testing.T, e logging.EventRecord) []byte {
+	t.Helper()
+	e.Kind = logging.KindEvent
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	return append(b, '\n')
+}
+
+// writeMixedLog writes a journal holding both kinds of line, in this order:
+// call(github__search ok), event(upstream_start_failed), call(web__fetch err),
+// event(notification_dropped, count 5).
+func writeMixedLog(t *testing.T) string {
+	t.Helper()
+	base := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	buf.Write(mustRecordLine(t, logging.CallRecord{
+		Time: base, Upstream: "github", Method: "tools/call", Tool: "github__search", OK: true,
+	}))
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time: base.Add(time.Second), Event: logging.EventUpstreamStartFailed,
+		Upstream: "broken", Detail: "exec: no such file or directory",
+	}))
+	buf.Write(mustRecordLine(t, logging.CallRecord{
+		Time: base.Add(2 * time.Second), Upstream: "web", Method: "tools/call",
+		Tool: "web__fetch", OK: false, Err: "timeout",
+	}))
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time: base.Add(3 * time.Second), Event: logging.EventNotificationDropped,
+		Subject: "notifications/progress", Detail: "subscriber buffer full", Count: 5,
+	}))
+	path := filepath.Join(t.TempDir(), "calls.log")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLogsShowsEventsInline (Stage 18, C1): by default the journal is shown
+// whole — calls and events interleaved in file order, events marked EVT. Hiding
+// events behind a flag would defeat the point of journaling them.
+func TestLogsShowsEventsInline(t *testing.T) {
+	out := runLogsCmd(t, "--file", writeMixedLog(t))
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("logs printed %d lines, want 4 (2 calls + 2 events):\n%s", len(lines), out)
+	}
+	if !strings.Contains(lines[0], "github__search") {
+		t.Errorf("line 0 = %q, want the first call", lines[0])
+	}
+	if !strings.Contains(lines[1], "EVT") || !strings.Contains(lines[1], logging.EventUpstreamStartFailed) {
+		t.Errorf("line 1 = %q, want the start-failure event marked EVT", lines[1])
+	}
+	if !strings.Contains(lines[1], "broken") {
+		t.Errorf("line 1 = %q, want the failing upstream named", lines[1])
+	}
+	if !strings.Contains(lines[2], "web__fetch") {
+		t.Errorf("line 2 = %q, want the second call (journal order)", lines[2])
+	}
+	if !strings.Contains(lines[3], logging.EventNotificationDropped) || !strings.Contains(lines[3], "count=5") {
+		t.Errorf("line 3 = %q, want the coalesced drop event with its count", lines[3])
+	}
+}
+
+// TestLogsEventsFlagShowsOnlyEvents (C2).
+func TestLogsEventsFlagShowsOnlyEvents(t *testing.T) {
+	out := runLogsCmd(t, "--file", writeMixedLog(t), "--events")
+	if strings.Contains(out, "github__search") || strings.Contains(out, "web__fetch") {
+		t.Errorf("--events leaked call records:\n%s", out)
+	}
+	for _, want := range []string{logging.EventUpstreamStartFailed, logging.EventNotificationDropped} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--events output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestLogsToolFilterSuppressesEvents (C3): --tool is a call-only filter, so
+// events must not slip through it; the call filtering itself is unchanged.
+func TestLogsToolFilterSuppressesEvents(t *testing.T) {
+	out := runLogsCmd(t, "--file", writeMixedLog(t), "--tool", "github__search")
+	if strings.Contains(out, "EVT") {
+		t.Errorf("--tool let operator events through:\n%s", out)
+	}
+	if !strings.Contains(out, "github__search") {
+		t.Errorf("--tool dropped the call it should have matched:\n%s", out)
+	}
+	if strings.Contains(out, "web__fetch") {
+		t.Errorf("--tool leaked a non-matching call:\n%s", out)
+	}
+}
+
+// TestLogsEventsFlagRejectsCallOnlyFilters pins the mutual exclusions: --events
+// with a call-only filter could only ever print nothing.
+func TestLogsEventsFlagRejectsCallOnlyFilters(t *testing.T) {
+	for _, args := range [][]string{
+		{"logs", "--file", "/dev/null", "--events", "--tool", "x"},
+		{"logs", "--file", "/dev/null", "--events", "--status", "ok"},
+	} {
+		root := Build("test")
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetErr(&out)
+		root.SetArgs(args)
+		if err := root.Execute(); err == nil {
+			t.Errorf("%v must fail: --events and call-only filters are mutually exclusive", args)
+		}
+	}
+}
+
+// TestLogsStatsEventsSection (Stage 18, C4): --stats keeps its call table
+// unchanged and adds an events table. COUNT sums the COALESCED occurrences, so
+// a line with count 5 plus a line with no count is 6 — reading the absent count
+// as zero would under-report exactly the floods the throttle exists for.
+func TestLogsStatsEventsSection(t *testing.T) {
+	base := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	for i := 1; i <= 3; i++ {
+		buf.Write(mustRecordLine(t, logging.CallRecord{
+			Upstream: "github", Method: "tools/call", Tool: "github__search",
+			Duration: time.Duration(i) * time.Millisecond, OK: true,
+		}))
+	}
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time: base, Event: logging.EventNotificationDropped,
+		Subject: "notifications/progress", Count: 5,
+	}))
+	last := base.Add(time.Minute)
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time: last, Event: logging.EventNotificationDropped,
+		Subject: "notifications/progress", // no count: one occurrence
+	}))
+	path := filepath.Join(t.TempDir(), "calls.log")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := runLogsCmd(t, "--file", path, "--stats")
+	if !strings.Contains(out, "UPSTREAM") || !strings.Contains(out, "github__search") {
+		t.Errorf("the call table is missing from --stats:\n%s", out)
+	}
+	var eventRow []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.Contains(line, logging.EventNotificationDropped) {
+			eventRow = strings.Fields(line)
+		}
+	}
+	if eventRow == nil {
+		t.Fatalf("no events row in --stats output:\n%s", out)
+	}
+	if !strings.Contains(out, "EVENT") || !strings.Contains(out, "SUBJECT") {
+		t.Errorf("events table header missing:\n%s", out)
+	}
+	// event, subject, count, last (upstream is empty for this event, so the
+	// tabwriter row has 4 fields).
+	if len(eventRow) != 4 {
+		t.Fatalf("events row = %v, want 4 fields (event, subject, count, last)", eventRow)
+	}
+	if eventRow[2] != "6" {
+		t.Errorf("events COUNT = %q, want 6 (5 coalesced + 1 uncounted occurrence)", eventRow[2])
+	}
+	if eventRow[3] != last.Format(time.RFC3339) {
+		t.Errorf("events LAST = %q, want the most recent occurrence %q", eventRow[3], last.Format(time.RFC3339))
+	}
+}
+
+// TestLogsOldFileByteCompatible (C6): on a journal written entirely by a
+// pre-Stage-18 gateway (only call lines), both `logs` and `logs --stats` must
+// produce exactly what they did before events existed.
+func TestLogsOldFileByteCompatible(t *testing.T) {
+	path := writeLog(t) // github×2 ok, web×1 err — the pre-existing fixture
+
+	const wantList = "0001-01-01T00:00:00Z  ok    github        tools/call          github__search  0ms\n" +
+		"0001-01-01T00:00:00Z  ERR   web           tools/call          web__fetch  0ms  error=\"timeout\"\n" +
+		"0001-01-01T00:00:00Z  ok    github        tools/call          github__create_issue  0ms\n"
+	if got := runLogsCmd(t, "--file", path); got != wantList {
+		t.Errorf("plain listing changed on an events-free journal:\ngot:\n%q\nwant:\n%q", got, wantList)
+	}
+
+	const wantStats = "UPSTREAM  TOOL                  COUNT  ERROR%  P50  P95\n" +
+		"github    github__create_issue  1      0.0%    0ms  0ms\n" +
+		"github    github__search        1      0.0%    0ms  0ms\n" +
+		"web       web__fetch            1      100.0%  0ms  0ms\n"
+	if got := runLogsCmd(t, "--file", path, "--stats"); got != wantStats {
+		t.Errorf("--stats changed on an events-free journal:\ngot:\n%q\nwant:\n%q", got, wantStats)
+	}
+}
+
+// TestLogsFollowPrintsAppendedEvent (C5): --follow's watch loop must print
+// events appended after it started, not only calls.
+func TestLogsFollowPrintsAppendedEvent(t *testing.T) {
+	saved := followPollInterval
+	followPollInterval = 5 * time.Millisecond
+	defer func() { followPollInterval = saved }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "calls.log")
+	rec1 := mustRecordLine(t, logging.CallRecord{Upstream: "github", Method: "tools/call", Tool: "github__one", OK: true})
+	if err := os.WriteFile(path, rec1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := &syncWriter{}
+	done := make(chan error, 1)
+	go func() {
+		done <- followLog(ctx, out, path, int64(len(rec1)), nil, recordFilter{})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("followLog did not return after context cancellation")
+		}
+	}()
+
+	ev := mustEventLine(t, logging.EventRecord{
+		Time: time.Now(), Event: logging.EventUpstreamGaveUp, Upstream: "doomed",
+		Detail: "exhausted restart attempts (max_attempts=2)",
+	})
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitOutputContains(t, out, logging.EventUpstreamGaveUp, 5*time.Second)
+	if !strings.Contains(out.String(), "EVT") {
+		t.Errorf("appended event was not rendered as an EVT line:\n%s", out.String())
+	}
+}
+
+// TestLogsEscapesUpstreamControlledSubject (review M3): an event's Subject is
+// not gateway-authored — for catalog_collision it is a resource URI and for
+// catalog_bad_template a URI template, both taken verbatim from an upstream and,
+// unlike a tool name, never normalized by namespacing. A "\n" in one must not
+// forge a second output line that an operator cannot tell from a real journal
+// entry (nor an ESC repaint their terminal).
+func TestLogsEscapesUpstreamControlledSubject(t *testing.T) {
+	forged := "file:///a\n2026-07-29T10:00:00Z  EVT   ghost         forged_event      nothing-happened"
+	var buf bytes.Buffer
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time:  time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC),
+		Event: logging.EventCatalogCollision, Upstream: "evil",
+		Subject: forged + "\x1b[31m",
+	}))
+	path := filepath.Join(t.TempDir(), "calls.log")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := runLogsCmd(t, "--file", path)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("one journal event printed %d lines — the subject forged extra ones:\n%s", len(lines), out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("a raw ESC reached the terminal:\n%q", out)
+	}
+	if !strings.Contains(out, `\n`) {
+		t.Errorf("the newline was not escaped, so nothing is pinned here:\n%s", out)
+	}
+	if !strings.Contains(out, "file:///a") {
+		t.Errorf("the subject itself is gone from the line:\n%s", out)
+	}
+}
+
+// TestLogsStatsEventsOnlyReportsEmptiness (review S3): `--events --stats` on a
+// journal with no events used to print ABSOLUTELY nothing — the call table is
+// skipped by --events and the event table has no rows — which is
+// indistinguishable from a command that broke silently.
+func TestLogsStatsEventsOnlyReportsEmptiness(t *testing.T) {
+	out := runLogsCmd(t, "--file", writeLog(t), "--events", "--stats")
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("--events --stats on an event-free journal printed nothing at all")
+	}
+	if !strings.Contains(out, "no events") {
+		t.Errorf("--events --stats output = %q, want it to say there are no events", out)
 	}
 }

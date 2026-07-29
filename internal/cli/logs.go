@@ -39,16 +39,23 @@ func newLogsCmd() *cobra.Command {
 		statusFilt   string
 		follow       bool
 		stats        bool
+		eventsOnly   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "logs",
 		Short: "Show recent tool-call log records, with optional filters",
-		Long: "logs reads the JSON-lines call log the gateway writes (log_file in the\n" +
-			"config, or stderr if unset — pass --file to read a specific file). It prints\n" +
-			"the most recent records, optionally filtered by upstream, tool, or ok status.\n" +
+		Long: "logs reads the JSON-lines journal the gateway writes (log_file in the\n" +
+			"config, or stderr if unset — pass --file to read a specific file). The journal\n" +
+			"holds two kinds of line: tool CALLS and operator EVENTS (an upstream that\n" +
+			"failed to start, dropped notifications, catalog collisions, a result the size\n" +
+			"limit could not truncate). Both are printed in journal order; event lines are\n" +
+			"marked EVT. It prints the most recent records, optionally filtered by upstream,\n" +
+			"tool, or ok status — --tool and --status are call-only, so events are excluded\n" +
+			"while either is set, and --events shows events alone.\n" +
 			"--follow keeps watching the file and prints new records as they are appended;\n" +
 			"--stats aggregates ALL matching records into a per-(upstream, tool) table\n" +
-			"(count, error rate, p50/p95 latency) instead of printing them.",
+			"(count, error rate, p50/p95 latency) instead of printing them, followed by a\n" +
+			"per-event table when the journal has events.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := resolveLogFile(file, *configPath)
 			if err != nil {
@@ -58,7 +65,7 @@ func newLogsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			filt := recordFilter{upstream: upstreamFilt, tool: toolFilt, ok: ok}
+			filt := recordFilter{upstream: upstreamFilt, tool: toolFilt, ok: ok, eventsOnly: eventsOnly}
 			if stats {
 				return runLogsStats(cmd, path, filt)
 			}
@@ -75,12 +82,17 @@ func newLogsCmd() *cobra.Command {
 	configPath = addConfigFlag(cmd)
 	cmd.Flags().StringVarP(&file, "file", "f", "", "path to the JSON-lines call log (overrides config's log_file)")
 	cmd.Flags().IntVarP(&tail, "tail", "n", 50, "show at most the last N matching records (0 = all)")
-	cmd.Flags().StringVar(&upstreamFilt, "upstream", "", "only records for this upstream")
-	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (namespaced name)")
-	cmd.Flags().StringVar(&statusFilt, "status", "", "filter by outcome: ok | err (default: all)")
+	cmd.Flags().StringVar(&upstreamFilt, "upstream", "", "only records for this upstream (applies to calls and events alike)")
+	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (namespaced name); call-only — operator events are excluded while it is set")
+	cmd.Flags().StringVar(&statusFilt, "status", "", "filter by outcome: ok | err (default: all); call-only — operator events are excluded while it is set")
+	cmd.Flags().BoolVar(&eventsOnly, "events", false, "show ONLY operator events (upstream failures, dropped notifications, catalog collisions…), not tool calls")
 	cmd.Flags().BoolVar(&follow, "follow", false, "after printing the tail, keep watching the file and print new records as they are appended (Ctrl-C to stop)")
 	cmd.Flags().BoolVar(&stats, "stats", false, "aggregate all matching records per (upstream, tool): count, error rate, p50/p95 latency (--tail is ignored)")
 	cmd.MarkFlagsMutuallyExclusive("follow", "stats")
+	// --tool/--status are call-only filters, so combining them with --events
+	// could only ever produce an empty result: reject the combination instead.
+	cmd.MarkFlagsMutuallyExclusive("events", "tool")
+	cmd.MarkFlagsMutuallyExclusive("events", "status")
 	return cmd
 }
 
@@ -119,15 +131,20 @@ func parseStatus(s string) (*bool, error) {
 	}
 }
 
-// recordFilter is the shared --upstream/--tool/--status predicate: the plain
-// listing, --follow's live watch and --stats all apply exactly the same one.
+// recordFilter is the shared --upstream/--tool/--status/--events predicate: the
+// plain listing, --follow's live watch and --stats all apply exactly the same
+// one, to both kinds of journal line.
 type recordFilter struct {
-	upstream string
-	tool     string
-	ok       *bool // nil = no filter, else must equal rec.OK
+	upstream   string
+	tool       string
+	ok         *bool // nil = no filter, else must equal rec.OK
+	eventsOnly bool  // --events: drop call records entirely
 }
 
 func (f recordFilter) match(rec logging.CallRecord) bool {
+	if f.eventsOnly {
+		return false
+	}
 	if f.upstream != "" && rec.Upstream != f.upstream {
 		return false
 	}
@@ -140,6 +157,48 @@ func (f recordFilter) match(rec logging.CallRecord) bool {
 	return true
 }
 
+// matchEvent is match's counterpart for operator events (Stage 18). --upstream
+// applies to both kinds; --tool and --status are call-only, and a call-only
+// filter EXCLUDES events rather than passing them through: a filter on a field
+// an event does not have cannot be answered honestly either way, and silently
+// showing everything would make `--status err` look like it matched events too.
+func (f recordFilter) matchEvent(e logging.EventRecord) bool {
+	if f.tool != "" || f.ok != nil {
+		return false
+	}
+	if f.upstream != "" && e.Upstream != f.upstream {
+		return false
+	}
+	return true
+}
+
+// matchEntry applies the right half of the filter to one journal line.
+func (f recordFilter) matchEntry(e logging.Entry) bool {
+	switch {
+	case e.Call != nil:
+		return f.match(*e.Call)
+	case e.Event != nil:
+		return f.matchEvent(*e.Event)
+	default:
+		return false
+	}
+}
+
+// filterEntries keeps the matching lines, preserving journal order. Both kinds
+// are counted by --tail together: it is the tail of the JOURNAL, not of calls.
+func filterEntries(entries []logging.Entry, filt recordFilter, tail int) []logging.Entry {
+	out := entries[:0]
+	for _, e := range entries {
+		if filt.matchEntry(e) {
+			out = append(out, e)
+		}
+	}
+	if tail > 0 && len(out) > tail {
+		out = out[len(out)-tail:]
+	}
+	return out
+}
+
 func runLogs(cmd *cobra.Command, path string, tail int, filt recordFilter) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -147,24 +206,18 @@ func runLogs(cmd *cobra.Command, path string, tail int, filt recordFilter) error
 	}
 	defer func() { _ = f.Close() }()
 
-	records, err := logging.ReadRecords(f)
+	entries, err := logging.ReadEntries(f)
 	if err != nil {
 		return fmt.Errorf("read call log %q: %w", path, err)
 	}
 
-	filtered := records[:0]
-	for _, rec := range records {
-		if filt.match(rec) {
-			filtered = append(filtered, rec)
-		}
-	}
-
-	if tail > 0 && len(filtered) > tail {
-		filtered = filtered[len(filtered)-tail:]
-	}
-
-	for _, rec := range filtered {
-		cmd.Println(formatRecord(rec))
+	// OutOrStdout, not cmd.Println: cobra's Println writes to the ERROR stream,
+	// which silently made `mcp-gate logs | grep` and `... > file` come back
+	// empty. --follow and --stats always used stdout; the listing was the odd
+	// one out.
+	out := cmd.OutOrStdout()
+	for _, e := range filterEntries(entries, filt, tail) {
+		fmt.Fprintln(out, formatEntry(e))
 	}
 	return nil
 }
@@ -183,25 +236,17 @@ func runLogsFollow(ctx context.Context, cmd *cobra.Command, path string, tail in
 		return fmt.Errorf("open call log %q: %w", path, err)
 	}
 	cut := bytes.LastIndexByte(buf, '\n') + 1 // 0 when no newline at all
-	records, err := logging.ReadRecords(bytes.NewReader(buf[:cut]))
+	entries, err := logging.ReadEntries(bytes.NewReader(buf[:cut]))
 	if err != nil {
 		return fmt.Errorf("read call log %q: %w", path, err)
 	}
-	filtered := records[:0]
-	for _, rec := range records {
-		if filt.match(rec) {
-			filtered = append(filtered, rec)
-		}
-	}
-	if tail > 0 && len(filtered) > tail {
-		filtered = filtered[len(filtered)-tail:]
-	}
-	for _, rec := range filtered {
-		cmd.Println(formatRecord(rec))
+	out := cmd.OutOrStdout() // same stream the follow loop below writes to
+	for _, e := range filterEntries(entries, filt, tail) {
+		fmt.Fprintln(out, formatEntry(e))
 	}
 
 	pending := append([]byte(nil), buf[cut:]...)
-	return followLog(ctx, cmd.OutOrStdout(), path, int64(len(buf)), pending, filt)
+	return followLog(ctx, out, path, int64(len(buf)), pending, filt)
 }
 
 // followLog is --follow's watch loop: every followPollInterval it stats path
@@ -239,11 +284,11 @@ func followLog(ctx context.Context, out io.Writer, path string, offset int64, pe
 		if cut == 0 {
 			continue // still no complete line; keep buffering
 		}
-		records, _ := logging.ReadRecords(bytes.NewReader(pending[:cut]))
+		entries, _ := logging.ReadEntries(bytes.NewReader(pending[:cut]))
 		pending = append(pending[:0:0], pending[cut:]...)
-		for _, rec := range records {
-			if filt.match(rec) {
-				fmt.Fprintln(out, formatRecord(rec))
+		for _, e := range entries {
+			if filt.matchEntry(e) {
+				fmt.Fprintln(out, formatEntry(e))
 			}
 		}
 	}
@@ -289,19 +334,102 @@ func runLogsStats(cmd *cobra.Command, path string, filt recordFilter) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	records, err := logging.ReadRecords(f)
+	entries, err := logging.ReadEntries(f)
 	if err != nil {
 		return fmt.Errorf("read call log %q: %w", path, err)
 	}
 
-	stats := aggregateStats(records, filt)
+	var records []logging.CallRecord
+	var events []logging.EventRecord
+	for _, e := range entries {
+		switch {
+		case e.Call != nil && filt.match(*e.Call):
+			records = append(records, *e.Call)
+		case e.Event != nil && filt.matchEvent(*e.Event):
+			events = append(events, *e.Event)
+		}
+	}
+
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "UPSTREAM\tTOOL\tCOUNT\tERROR%\tP50\tP95")
-	for _, s := range stats {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%.1f%%\t%s\t%s\n",
-			s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
+	// The call table is printed exactly as before — on a journal without events
+	// the whole output is byte-for-byte what pre-Stage-18 `logs --stats` gave.
+	// --events asks for events only, so the call table is skipped entirely.
+	if !filt.eventsOnly {
+		fmt.Fprintln(w, "UPSTREAM\tTOOL\tCOUNT\tERROR%\tP50\tP95")
+		for _, s := range aggregateStats(records, filt) {
+			fmt.Fprintf(w, "%s\t%s\t%d\t%.1f%%\t%s\t%s\n",
+				s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
+		}
+	}
+	switch {
+	case len(events) > 0:
+		if !filt.eventsOnly {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintln(w, "EVENT\tUPSTREAM\tSUBJECT\tCOUNT\tLAST")
+		for _, s := range aggregateEventStats(events) {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
+				s.event, s.upstream, printableField(s.subject), s.count, s.last.Format(time.RFC3339))
+		}
+	case filt.eventsOnly:
+		// --events --stats on a journal with no matching events would otherwise
+		// print ABSOLUTELY nothing (the call table is skipped, the event table is
+		// empty) — indistinguishable from a command that silently broke. Only in
+		// this branch: without --events the call table above is the output, and
+		// adding a line to it would break the byte-for-byte compatibility of
+		// pre-Stage-18 `logs --stats`.
+		fmt.Fprintln(w, "no events")
 	}
 	return w.Flush()
+}
+
+// eventStats is one row of the --stats events table: the aggregate over every
+// matching event line of one (event, upstream, subject) key.
+type eventStats struct {
+	event    string
+	upstream string
+	subject  string
+	count    int
+	last     time.Time
+}
+
+// aggregateEventStats groups events by (event, upstream, subject) and sums their
+// occurrences. A line's Count is the number of occurrences COALESCED into it, so
+// an absent (zero) count means one occurrence — counting it as zero would
+// under-report exactly the floods the throttle exists for.
+func aggregateEventStats(events []logging.EventRecord) []eventStats {
+	type key struct{ event, upstream, subject string }
+	groups := map[key]*eventStats{}
+	for _, e := range events {
+		k := key{e.Event, e.Upstream, e.Subject}
+		g := groups[k]
+		if g == nil {
+			g = &eventStats{event: e.Event, upstream: e.Upstream, subject: e.Subject}
+			groups[k] = g
+		}
+		n := e.Count
+		if n < 1 {
+			n = 1
+		}
+		g.count += n
+		if e.Time.After(g.last) {
+			g.last = e.Time
+		}
+	}
+	out := make([]eventStats, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, *g)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].event != out[j].event {
+			return out[i].event < out[j].event
+		}
+		if out[i].upstream != out[j].upstream {
+			return out[i].upstream < out[j].upstream
+		}
+		return out[i].subject < out[j].subject
+	})
+	return out
 }
 
 // aggregateStats groups the matching records by (upstream, tool) and computes
@@ -375,6 +503,59 @@ func formatRecord(rec logging.CallRecord) string {
 		line += "  error=" + strconv.Quote(rec.Err)
 	}
 	return line
+}
+
+// formatEntry renders one journal line, whichever kind it is.
+func formatEntry(e logging.Entry) string {
+	if e.Event != nil {
+		return formatEvent(*e.Event)
+	}
+	if e.Call != nil {
+		return formatRecord(*e.Call)
+	}
+	return ""
+}
+
+// formatEvent renders one operator event, aligned like formatRecord with EVT
+// where a call line carries ok/ERR. Events never carry payloads (see
+// logging.EventRecord), so no secret can appear here either. count is printed
+// only when the line coalesces more than one occurrence.
+func formatEvent(e logging.EventRecord) string {
+	line := fmt.Sprintf("%s  %-4s  %-12s  %-18s  %s",
+		e.Time.Format(time.RFC3339),
+		"EVT",
+		e.Upstream,
+		e.Event,
+		printableField(e.Subject),
+	)
+	if e.Detail != "" {
+		line += "  detail=" + strconv.Quote(e.Detail)
+	}
+	if e.Count > 1 {
+		line += fmt.Sprintf("  count=%d", e.Count)
+	}
+	return line
+}
+
+// printableField makes a journal-supplied string safe to put on a terminal line.
+// An event's Subject is NOT gateway-authored the way its Detail is: for
+// catalog_collision it can be a resource URI and for catalog_bad_template a URI
+// template, both taken verbatim from an upstream and — unlike a tool name —
+// never normalized by namespacing. A "\n" in one would forge a second output
+// line indistinguishable from a real journal entry, and an ESC would repaint the
+// operator's terminal (found by independent review, M3).
+//
+// Strings made entirely of printable runes are returned VERBATIM, so the normal
+// output keeps its exact former shape; only a string that actually carries a
+// control character pays the strconv.Quote escaping. Deliberately not applied to
+// formatRecord's rec.Tool: that is a pre-existing class, left as named debt.
+func printableField(s string) string {
+	for _, r := range s {
+		if !strconv.IsPrint(r) {
+			return strconv.Quote(s)
+		}
+	}
+	return s
 }
 
 func durMS(d time.Duration) string {
