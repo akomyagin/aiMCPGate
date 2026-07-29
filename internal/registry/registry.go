@@ -1831,10 +1831,10 @@ func (r *Registry) forwardNotification(msg mcp.Message) {
 	}
 	r.notifMu.Unlock()
 
-	for i := 0; i < dropped; i++ {
-		r.noteThrottled(logging.EventNotificationDropped, "", msg.Method,
-			"subscriber buffer full; non-blocking forwarding drops on backpressure")
-	}
+	// One note carrying the whole count, not one per drop: the number is already
+	// known here, and n simultaneous drops are one honest count=n line.
+	r.noteThrottled(logging.EventNotificationDropped, "", msg.Method,
+		"subscriber buffer full; non-blocking forwarding drops on backpressure", dropped)
 }
 
 // withLogger stamps the emitting upstream's name into a notifications/message

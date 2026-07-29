@@ -268,7 +268,7 @@ func (r *Registry) onUpstreamRequest(name, method string, originalID, params jso
 		// from the user's side this looks like a tool that just failed, with the
 		// reason visible nowhere else (Stage 18).
 		r.noteThrottled(logging.EventServerRequestDropped, name, method,
-			"no client transport accepted the request; the tool call was refused on the upstream's behalf")
+			"no client transport accepted the request; the tool call was refused on the upstream's behalf", 1)
 		return
 	}
 	r.log.Debug("upstream request proxied to client", "upstream", name, "method", method, "id", gatewayID)
@@ -438,7 +438,7 @@ func onUpstreamRootsList(r *Registry, name string, originalID json.RawMessage) {
 	// used to forget (found by review).
 	rootsExpire(r, gatewayID, "no client transport accepted the roots/list request")
 	r.noteThrottled(logging.EventServerRequestDropped, name, mcp.MethodRootsList,
-		"no client transport accepted the request; the tool call was refused on the upstream's behalf")
+		"no client transport accepted the request; the tool call was refused on the upstream's behalf", 1)
 }
 
 // rootsExpire unwinds the single-flight when the ONE roots/list question in

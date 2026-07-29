@@ -186,8 +186,15 @@ func (f recordFilter) matchEntry(e logging.Entry) bool {
 
 // filterEntries keeps the matching lines, preserving journal order. Both kinds
 // are counted by --tail together: it is the tail of the JOURNAL, not of calls.
+//
+// The result is a FRESH slice, never entries[:0]: writing the filtered lines
+// over the head of the input would silently corrupt entries for any caller that
+// still reads it afterwards. Today's two callers do not, but this is a general
+// helper and the damage would be invisible at the call site. Reusing the array
+// buys nothing worth that: the command has already read the whole file into
+// memory by the time it gets here.
 func filterEntries(entries []logging.Entry, filt recordFilter, tail int) []logging.Entry {
-	out := entries[:0]
+	var out []logging.Entry
 	for _, e := range entries {
 		if filt.matchEntry(e) {
 			out = append(out, e)
@@ -356,7 +363,7 @@ func runLogsStats(cmd *cobra.Command, path string, filt recordFilter) error {
 	// --events asks for events only, so the call table is skipped entirely.
 	if !filt.eventsOnly {
 		fmt.Fprintln(w, "UPSTREAM\tTOOL\tCOUNT\tERROR%\tP50\tP95")
-		for _, s := range aggregateStats(records, filt) {
+		for _, s := range aggregateStats(records) {
 			fmt.Fprintf(w, "%s\t%s\t%d\t%.1f%%\t%s\t%s\n",
 				s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
 		}
@@ -394,9 +401,9 @@ type eventStats struct {
 }
 
 // aggregateEventStats groups events by (event, upstream, subject) and sums their
-// occurrences. A line's Count is the number of occurrences COALESCED into it, so
-// an absent (zero) count means one occurrence — counting it as zero would
-// under-report exactly the floods the throttle exists for.
+// occurrences. A line's Count is the number of occurrences COALESCED into it,
+// and the "absent == 1" wire convention is undone by EventRecord.Occurrences —
+// the single reader-side home of that rule, not a local branch here.
 func aggregateEventStats(events []logging.EventRecord) []eventStats {
 	type key struct{ event, upstream, subject string }
 	groups := map[key]*eventStats{}
@@ -407,11 +414,7 @@ func aggregateEventStats(events []logging.EventRecord) []eventStats {
 			g = &eventStats{event: e.Event, upstream: e.Upstream, subject: e.Subject}
 			groups[k] = g
 		}
-		n := e.Count
-		if n < 1 {
-			n = 1
-		}
-		g.count += n
+		g.count += e.Occurrences()
 		if e.Time.After(g.last) {
 			g.last = e.Time
 		}
@@ -432,13 +435,17 @@ func aggregateEventStats(events []logging.EventRecord) []eventStats {
 	return out
 }
 
-// aggregateStats groups the matching records by (upstream, tool) and computes
+// aggregateStats groups the given records by (upstream, tool) and computes
 // count, error count and p50/p95 duration per group. Rows are sorted by
 // upstream then tool, so the output is deterministic. Percentiles are the
 // sorted-slice index floor(q*len) — a group always has len >= 1 by
 // construction (it exists only because a record landed in it), and q < 1
 // keeps the index strictly below len.
-func aggregateStats(records []logging.CallRecord, filt recordFilter) []callStats {
+//
+// It takes no filter: selection is the caller's job (runLogsStats already
+// splits the journal through the same predicate to separate calls from events),
+// and re-applying it here only re-ran a decision that was made one screen up.
+func aggregateStats(records []logging.CallRecord) []callStats {
 	type key struct{ upstream, tool string }
 	type agg struct {
 		count, errs int
@@ -446,9 +453,6 @@ func aggregateStats(records []logging.CallRecord, filt recordFilter) []callStats
 	}
 	groups := make(map[key]*agg)
 	for _, rec := range records {
-		if !filt.match(rec) {
-			continue
-		}
 		k := key{rec.Upstream, rec.Tool}
 		g := groups[k]
 		if g == nil {
@@ -519,20 +523,31 @@ func formatEntry(e logging.Entry) string {
 // formatEvent renders one operator event, aligned like formatRecord with EVT
 // where a call line carries ok/ERR. Events never carry payloads (see
 // logging.EventRecord), so no secret can appear here either. count is printed
-// only when the line coalesces more than one occurrence.
+// only when the line coalesces more than one occurrence (Occurrences applies the
+// journal's "absent == 1" convention).
+//
+// The trailing trim is not cosmetic housekeeping: an event with no Subject is
+// the NORMAL case for the events an operator most needs to see
+// (upstream_start_failed, upstream_gave_up, sse_stream_unavailable), and without
+// it those lines end in the %-18s padding plus a separator — dangling whitespace
+// on a bare line, and a detail= sitting four spaces out instead of two, i.e. a
+// column that visibly disagrees with every other event line. Accepted cost,
+// chosen rather than stumbled into: a Subject that itself ENDS in a space (a URI
+// taken verbatim from an upstream could) loses that space. It is invisible on a
+// terminal anyway, and it only ever affects the line's own tail.
 func formatEvent(e logging.EventRecord) string {
-	line := fmt.Sprintf("%s  %-4s  %-12s  %-18s  %s",
+	line := strings.TrimRight(fmt.Sprintf("%s  %-4s  %-12s  %-18s  %s",
 		e.Time.Format(time.RFC3339),
 		"EVT",
 		e.Upstream,
 		e.Event,
 		printableField(e.Subject),
-	)
+	), " ")
 	if e.Detail != "" {
 		line += "  detail=" + strconv.Quote(e.Detail)
 	}
-	if e.Count > 1 {
-		line += fmt.Sprintf("  count=%d", e.Count)
+	if n := e.Occurrences(); n > 1 {
+		line += fmt.Sprintf("  count=%d", n)
 	}
 	return line
 }

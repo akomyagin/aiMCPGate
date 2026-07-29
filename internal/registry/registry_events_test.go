@@ -526,7 +526,7 @@ func TestHTTPUpstreamWithoutSSEJournalsEvent(t *testing.T) {
 func TestEventsAreNotJournaledWithoutCallLog(t *testing.T) {
 	r := New(&config.Config{}, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
 	r.emitEvent(logging.EventRecord{Event: logging.EventUpstreamStartFailed, Upstream: "x"})
-	r.noteThrottled(logging.EventNotificationDropped, "", "notifications/progress", "detail")
+	r.noteThrottled(logging.EventNotificationDropped, "", "notifications/progress", "detail", 1)
 	r.flushEvents()
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -722,9 +722,9 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	const ev = logging.EventNotificationDropped
 	const subject = "notifications/progress"
 	const detail = "subscriber buffer full"
-	r.noteThrottled(ev, "", subject, detail) // journaled at once: opens the window
-	r.noteThrottled(ev, "", subject, detail) // suppressed
-	r.noteThrottled(ev, "", subject, detail) // suppressed
+	r.noteThrottled(ev, "", subject, detail, 1) // journaled at once: opens the window
+	r.noteThrottled(ev, "", subject, detail, 1) // suppressed
+	r.noteThrottled(ev, "", subject, detail, 1) // suppressed
 
 	// Age the state: those two happened a day ago and the key then went silent.
 	dayAgo := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
@@ -738,7 +738,7 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	st.lastEmit = dayAgo
 	r.eventMu.Unlock()
 
-	r.noteThrottled(ev, "", subject, detail) // the fourth: carries the backlog
+	r.noteThrottled(ev, "", subject, detail, 1) // the fourth: carries the backlog
 
 	evs := j.events(t, ev)
 	if len(evs) != 2 {
@@ -754,5 +754,50 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	}
 	if late.Time.Sub(dayAgo) < 23*time.Hour {
 		t.Fatalf("line time %s is not the fresh occurrence — the test aged nothing", late.Time)
+	}
+}
+
+// TestSimultaneousDropsAreOneCountedLine: when a notification is dropped by two
+// wedged subscribers at once, that is TWO occurrences that happened at the same
+// instant, and the journal must say so on one line. The counting loop this
+// replaced called noteThrottled once per drop, so the first call opened the
+// window with count=1 and the second was merely suppressed — an operator saw
+// "one drop" until the next occurrence or the shutdown flush finally revealed
+// the rest. Close() at the end is part of the assertion: a leftover remainder
+// would surface there as a second line.
+func TestSimultaneousDropsAreOneCountedLine(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	_, unsub1 := r.SubscribeNotifications() // both subscribed and never reading
+	defer unsub1()
+	_, unsub2 := r.SubscribeNotifications()
+	defer unsub2()
+
+	// Fill both buffers: every subscriber gets every notification, so after
+	// notifSubBuffer sends both are exactly full.
+	for i := 0; i < notifSubBuffer; i++ {
+		r.onUpstreamNotification("web", mcp.NotifProgress, json.RawMessage(`{"progress":1}`))
+	}
+	// This one is dropped by BOTH subscribers, inside a single notifMu hold.
+	r.onUpstreamNotification("web", mcp.NotifProgress, json.RawMessage(`{"progress":1}`))
+
+	evs := j.events(t, logging.EventNotificationDropped)
+	if len(evs) != 1 {
+		t.Fatalf("got %d notification_dropped lines, want exactly 1; journal:\n%s", len(evs), j.bytes())
+	}
+	if got := evs[0].Occurrences(); got != 2 {
+		t.Errorf("line reports %d occurrence(s), want 2 (one drop per wedged subscriber)", got)
+	}
+	if strings.Contains(evs[0].Detail, "coalesced into this line") {
+		t.Errorf("simultaneous drops must not be dated to a backlog that does not exist: detail = %q", evs[0].Detail)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if evs := j.events(t, logging.EventNotificationDropped); len(evs) != 1 {
+		t.Fatalf("the shutdown flush emitted a remainder, so the drops were not all counted into the first line: %d lines; journal:\n%s",
+			len(evs), j.bytes())
 	}
 }
