@@ -80,11 +80,12 @@ type EventRecord struct {
 }
 
 // Occurrences is the READ half of the "absent == 1" convention Count carries on
-// the wire. The write half is the emitter's normalization of 1 to zero, which
-// omitempty then keeps out of the line; without a shared reader every consumer
-// re-derives the rule for itself, and one that reads an absent count as zero
-// under-reports exactly the floods the coalescing throttle exists for. Making
-// the rule a method of the record keeps the two halves next to each other.
+// the wire. The write half is the emitter's normalization of 1 to zero — that
+// lives in a different package, internal/registry's emitEvent, which omitempty
+// then keeps out of the line. Occurrences is the single place every consumer of
+// this package reads the convention back; without it, a consumer that reads an
+// absent count as zero under-reports exactly the floods the coalescing throttle
+// exists for.
 func (e EventRecord) Occurrences() int {
 	if e.Count < 1 {
 		return 1

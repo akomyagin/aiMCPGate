@@ -190,11 +190,13 @@ func (f recordFilter) matchEntry(e logging.Entry) bool {
 // The result is a FRESH slice, never entries[:0]: writing the filtered lines
 // over the head of the input would silently corrupt entries for any caller that
 // still reads it afterwards. Today's two callers do not, but this is a general
-// helper and the damage would be invisible at the call site. Reusing the array
-// buys nothing worth that: the command has already read the whole file into
-// memory by the time it gets here.
+// helper and the damage would be invisible at the call site. It is preallocated
+// to len(entries) (the filtered result can only be smaller) to avoid the
+// O(log n) reallocations append would otherwise do; both callers only range
+// over the result, so a nil vs. empty-but-non-nil slice makes no difference to
+// them.
 func filterEntries(entries []logging.Entry, filt recordFilter, tail int) []logging.Entry {
-	var out []logging.Entry
+	out := make([]logging.Entry, 0, len(entries))
 	for _, e := range entries {
 		if filt.matchEntry(e) {
 			out = append(out, e)
@@ -528,13 +530,18 @@ func formatEntry(e logging.Entry) string {
 //
 // The trailing trim is not cosmetic housekeeping: an event with no Subject is
 // the NORMAL case for the events an operator most needs to see
-// (upstream_start_failed, upstream_gave_up, sse_stream_unavailable), and without
-// it those lines end in the %-18s padding plus a separator — dangling whitespace
-// on a bare line, and a detail= sitting four spaces out instead of two, i.e. a
-// column that visibly disagrees with every other event line. Accepted cost,
-// chosen rather than stumbled into: a Subject that itself ENDS in a space (a URI
-// taken verbatim from an upstream could) loses that space. It is invisible on a
-// terminal anyway, and it only ever affects the line's own tail.
+// (upstream_start_failed, upstream_gave_up, sse_stream_unavailable), and
+// without it those lines end in dangling whitespace — the two spaces of the
+// format string's own separator, plus, for any Event name shorter than the
+// %-18s field (which is most of them: only upstream_gave_up reaches 16 of 18),
+// the leftover padding too — and a detail= sitting out past the column every
+// other event line uses. TrimRight over the whole prefix (not just the
+// Subject) is what removes both sources at once. Accepted cost, chosen rather
+// than stumbled into: since the trim runs over the full prefix string, a
+// Subject that is ENTIRELY spaces disappears along with the column padding,
+// becoming indistinguishable from an empty Subject; ordinary Subjects (a
+// method or tool name) never trigger this. It is invisible on a terminal
+// anyway.
 func formatEvent(e logging.EventRecord) string {
 	line := strings.TrimRight(fmt.Sprintf("%s  %-4s  %-12s  %-18s  %s",
 		e.Time.Format(time.RFC3339),
