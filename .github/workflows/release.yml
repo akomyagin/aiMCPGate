@@ -18,29 +18,42 @@ jobs:
     permissions:
       contents: write
       packages: write
+    # Action majors are floated (`@v7`), not SHA-pinned: this is a solo repo
+    # publishing from a tag we cut by hand, so a compromised-tag window is a
+    # worse trade than never noticing a deprecation again. All actions below sit
+    # on Node 24 runtimes, which need runner >= v2.327.1 — satisfied by
+    # GitHub-hosted `ubuntu-latest`, but a self-hosted runner would have to be
+    # updated first.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      # Kept in lockstep with the `go` directive in go.mod (currently 1.23.4)
+      # and with the Go version in the Glama.ai build spec. setup-go v6 changed
+      # toolchain selection, which only bites when go.mod declares a `toolchain`
+      # line different from the pinned version — we have none, the versions
+      # match exactly.
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.23.4"
 
       # qemu + buildx let goreleaser build the linux/arm64 image on the amd64
       # runner; the login lets it push both images and the multi-arch manifests
       # to ghcr.io (see `dockers:` / `docker_manifests:` in .goreleaser.yaml).
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: goreleaser/goreleaser-action@v6
+      # goreleaser-action v7 is the Node 24 / ESM rebuild; the goreleaser CLI
+      # version it installs is a separate axis and stays on `~> v2`.
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
@@ -54,14 +67,21 @@ jobs:
     needs: goreleaser
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           # setup-node writes an .npmrc that reads the token from
           # NODE_AUTH_TOKEN when registry-url is set.
           registry-url: "https://registry.npmjs.org"
+          # setup-node v5 added automatic dependency caching, keyed off a
+          # `packageManager` field in package.json and a lockfile. npm/ has
+          # neither (it is a wrapper with one runtime dep: none), so the cache
+          # would not engage today — disabled explicitly so that adding a
+          # `packageManager` field later cannot silently turn on a cache that
+          # then fails looking for a lockfile we do not keep.
+          package-manager-cache: false
 
       # package.json carries the placeholder 0.0.0-dev; stamp the tag's version
       # (without the v prefix) so install.js downloads the matching release.
