@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -526,7 +527,7 @@ func TestHTTPUpstreamWithoutSSEJournalsEvent(t *testing.T) {
 func TestEventsAreNotJournaledWithoutCallLog(t *testing.T) {
 	r := New(&config.Config{}, quietLogger(), nil, noopPayloadLog(), false, "0.0.0-test")
 	r.emitEvent(logging.EventRecord{Event: logging.EventUpstreamStartFailed, Upstream: "x"})
-	r.noteThrottled(logging.EventNotificationDropped, "", "notifications/progress", "detail")
+	r.noteThrottled(logging.EventNotificationDropped, "", "notifications/progress", "detail", 1)
 	r.flushEvents()
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -722,9 +723,9 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	const ev = logging.EventNotificationDropped
 	const subject = "notifications/progress"
 	const detail = "subscriber buffer full"
-	r.noteThrottled(ev, "", subject, detail) // journaled at once: opens the window
-	r.noteThrottled(ev, "", subject, detail) // suppressed
-	r.noteThrottled(ev, "", subject, detail) // suppressed
+	r.noteThrottled(ev, "", subject, detail, 1) // journaled at once: opens the window
+	r.noteThrottled(ev, "", subject, detail, 1) // suppressed
+	r.noteThrottled(ev, "", subject, detail, 1) // suppressed
 
 	// Age the state: those two happened a day ago and the key then went silent.
 	dayAgo := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
@@ -738,7 +739,7 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	st.lastEmit = dayAgo
 	r.eventMu.Unlock()
 
-	r.noteThrottled(ev, "", subject, detail) // the fourth: carries the backlog
+	r.noteThrottled(ev, "", subject, detail, 1) // the fourth: carries the backlog
 
 	evs := j.events(t, ev)
 	if len(evs) != 2 {
@@ -754,5 +755,207 @@ func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
 	}
 	if late.Time.Sub(dayAgo) < 23*time.Hour {
 		t.Fatalf("line time %s is not the fresh occurrence — the test aged nothing", late.Time)
+	}
+}
+
+// TestSimultaneousDropsAreOneCountedLine: when a notification is dropped by two
+// wedged subscribers at once, that is TWO occurrences that happened at the same
+// instant, and the journal must say so on one line. The counting loop this
+// replaced called noteThrottled once per drop, so the first call opened the
+// window with count=1 and the second was merely suppressed — an operator saw
+// "one drop" until the next occurrence or the shutdown flush finally revealed
+// the rest. Close() at the end is part of the assertion: a leftover remainder
+// would surface there as a second line.
+func TestSimultaneousDropsAreOneCountedLine(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	_, unsub1 := r.SubscribeNotifications() // both subscribed and never reading
+	defer unsub1()
+	_, unsub2 := r.SubscribeNotifications()
+	defer unsub2()
+
+	// Fill both buffers: every subscriber gets every notification, so after
+	// notifSubBuffer sends both are exactly full.
+	for i := 0; i < notifSubBuffer; i++ {
+		r.onUpstreamNotification("web", mcp.NotifProgress, json.RawMessage(`{"progress":1}`))
+	}
+	// This one is dropped by BOTH subscribers, inside a single notifMu hold.
+	r.onUpstreamNotification("web", mcp.NotifProgress, json.RawMessage(`{"progress":1}`))
+
+	evs := j.events(t, logging.EventNotificationDropped)
+	if len(evs) != 1 {
+		t.Fatalf("got %d notification_dropped lines, want exactly 1; journal:\n%s", len(evs), j.bytes())
+	}
+	if got := evs[0].Occurrences(); got != 2 {
+		t.Errorf("line reports %d occurrence(s), want 2 (one drop per wedged subscriber)", got)
+	}
+	if evs[0].Subject != mcp.NotifProgress {
+		t.Errorf("subject = %q, want the dropped method %q", evs[0].Subject, mcp.NotifProgress)
+	}
+	if evs[0].Detail == "" {
+		t.Error("event carries no detail; the operator needs the drop reason")
+	}
+	if strings.Contains(evs[0].Detail, "coalesced into this line") {
+		t.Errorf("simultaneous drops must not be dated to a backlog that does not exist: detail = %q", evs[0].Detail)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if evs := j.events(t, logging.EventNotificationDropped); len(evs) != 1 {
+		t.Fatalf("the shutdown flush emitted a remainder, so the drops were not all counted into the first line: %d lines; journal:\n%s",
+			len(evs), j.bytes())
+	}
+}
+
+// TestNoteThrottledAccumulatesWithinOpenWindow pins the branch no existing test
+// drives: a SECOND call landing while the window is still open, carrying n > 1.
+// The naive-looking mutation "st.suppressed += n" -> "st.suppressed++" passes
+// every other test in this file (they only ever pass n=1 while suppressed), but
+// silently discards (n-1) occurrences of any multi-occurrence call arriving
+// mid-window — exactly the shape forwardNotification produces when several
+// subscribers wedge on the same message. This test opens the window with n=1,
+// then feeds n=3 into the open window, and requires the eventual emission to
+// account for all 3, not 1.
+func TestNoteThrottledAccumulatesWithinOpenWindow(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	const ev = logging.EventNotificationDropped
+	const subject = "notifications/progress"
+	const detail = "subscriber buffer full"
+
+	r.noteThrottled(ev, "", subject, detail, 1) // opens the window, journaled at once
+	r.noteThrottled(ev, "", subject, detail, 3) // lands INSIDE the open window
+
+	r.eventMu.Lock()
+	st := r.eventSeen[eventKey{event: ev, subject: subject}]
+	if st == nil {
+		r.eventMu.Unlock()
+		t.Fatal("no throttle state recorded for the key")
+	}
+	suppressed := st.suppressed
+	r.eventMu.Unlock()
+	if suppressed != 3 {
+		t.Fatalf("suppressed = %d, want 3 (the mutation st.suppressed++ would leave 1 here)", suppressed)
+	}
+
+	// Force the window closed and drive an emission that must carry the backlog.
+	r.eventMu.Lock()
+	st.lastEmit = time.Now().Add(-2 * eventThrottleWindow)
+	r.eventMu.Unlock()
+	r.noteThrottled(ev, "", subject, detail, 1) // the fifth occurrence: reopens, carries the backlog
+
+	evs := j.events(t, ev)
+	if len(evs) != 2 {
+		t.Fatalf("journal has %d lines, want 2 (window opener + the backlog carrier); journal:\n%s", len(evs), j.bytes())
+	}
+	if got := evs[1].Occurrences(); got != 4 {
+		t.Errorf("backlog line reports %d occurrence(s), want 4 (3 suppressed + the current one) — "+
+			"st.suppressed += n must have run, not st.suppressed++", got)
+	}
+}
+
+// TestNoteThrottledNonPositiveIsNoOp pins the guard `n <= 0` at the very top of
+// noteThrottled: zero (and negative) occurrences must not journal anything, and
+// — this is the part a naive removal of the guard breaks first — must not even
+// create an entry in r.eventSeen. The map entry matters because its mere
+// existence changes later behavior (a zero-value eventState reads as "window
+// never opened"); a call that did nothing must leave no trace at all.
+func TestNoteThrottledNonPositiveIsNoOp(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	const ev = logging.EventNotificationDropped
+	const subject = "notifications/zero"
+	const detail = "should never appear"
+
+	r.noteThrottled(ev, "", subject, detail, 0)
+	r.noteThrottled(ev, "", subject, detail, -5)
+
+	if evs := j.events(t, ev); len(evs) != 0 {
+		t.Fatalf("got %d %s lines from n<=0 calls, want 0; journal:\n%s", len(evs), ev, j.bytes())
+	}
+	r.eventMu.Lock()
+	_, seen := r.eventSeen[eventKey{event: ev, subject: subject}]
+	r.eventMu.Unlock()
+	if seen {
+		t.Error("n<=0 must not create an eventSeen entry for the key (the guard runs before state is touched)")
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if evs := j.events(t, ev); len(evs) != 0 {
+		t.Fatalf("the shutdown flush journaled %d lines for a key that was never touched; journal:\n%s", len(evs), j.bytes())
+	}
+}
+
+// TestNoteThrottledConcurrent is the ONLY test in this file (or the package)
+// that calls noteThrottled from more than one goroutine at once. Every other
+// test drives it from a single call site, so a green `go test -race` elsewhere
+// proves nothing about the locking contract documented on noteThrottled ("takes
+// only the leaf eventMu, emitEvent is called outside it"). This test fires many
+// goroutines at a shared key and at per-goroutine distinct keys simultaneously,
+// then requires the journaled counts plus whatever flushEvents recovers at
+// shutdown to sum to exactly the number of occurrences sent — a test on
+// conservation, not merely on the absence of a panic or a race-detector flag.
+func TestNoteThrottledConcurrent(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	const ev = logging.EventNotificationDropped
+	const sharedSubject = "notifications/shared"
+	const goroutines = 20
+	const perGoroutine = 25 // occurrences sent by each goroutine to the shared key
+
+	var wg sync.WaitGroup
+	// Half the goroutines hammer one shared key (contention on the same
+	// eventState); the other half each own a distinct key (contention on the
+	// map itself, under eventMu, with no cross-key interference).
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for n := 0; n < perGoroutine; n++ {
+				r.noteThrottled(ev, "", sharedSubject, "concurrent shared", 1)
+			}
+		}(i)
+	}
+	const distinctGoroutines = 10
+	for i := 0; i < distinctGoroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			subject := fmt.Sprintf("notifications/distinct-%d", i)
+			for n := 0; n < perGoroutine; n++ {
+				r.noteThrottled(ev, "", subject, "concurrent distinct", 3)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if err := r.Close(); err != nil { // flushes whatever remained suppressed
+		t.Fatalf("Close: %v", err)
+	}
+
+	wantShared := goroutines * perGoroutine
+	wantDistinct := distinctGoroutines * perGoroutine * 3
+	gotShared := 0
+	gotDistinct := 0
+	for _, e := range j.events(t, ev) {
+		n := e.Occurrences()
+		if e.Subject == sharedSubject {
+			gotShared += n
+		} else if strings.HasPrefix(e.Subject, "notifications/distinct-") {
+			gotDistinct += n
+		}
+	}
+	if gotShared != wantShared {
+		t.Errorf("shared-key occurrences journaled+flushed = %d, want %d", gotShared, wantShared)
+	}
+	if gotDistinct != wantDistinct {
+		t.Errorf("distinct-key occurrences journaled+flushed = %d, want %d", gotDistinct, wantDistinct)
 	}
 }

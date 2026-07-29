@@ -690,3 +690,96 @@ func TestLogsStatsEventsOnlyReportsEmptiness(t *testing.T) {
 		t.Errorf("--events --stats output = %q, want it to say there are no events", out)
 	}
 }
+
+// TestFilterEntriesLeavesInputAlone: filterEntries used to write its result over
+// the head of the input slice (out := entries[:0]), so the caller's slice came
+// back silently rewritten. Both of today's callers happen to drop the input
+// right after, which is exactly why the corruption would stay invisible until a
+// third caller read it — pin the property, not the two lucky call sites.
+func TestFilterEntriesLeavesInputAlone(t *testing.T) {
+	entries := []logging.Entry{
+		{Call: &logging.CallRecord{Upstream: "github", Tool: "github__search", OK: true}},
+		{Event: &logging.EventRecord{Event: logging.EventUpstreamStartFailed, Upstream: "broken"}},
+		{Call: &logging.CallRecord{Upstream: "web", Tool: "web__fetch", OK: false}},
+	}
+	before := append([]logging.Entry(nil), entries...)
+
+	got := filterEntries(entries, recordFilter{upstream: "web"}, 0)
+
+	if !reflect.DeepEqual(entries, before) {
+		t.Errorf("filterEntries rewrote its input:\n got: %s\nwant: %s", dumpEntries(entries), dumpEntries(before))
+	}
+	if len(got) != 1 || got[0].Call == nil || got[0].Call.Upstream != "web" {
+		t.Fatalf("filtered result = %s, want the single web call", dumpEntries(got))
+	}
+}
+
+// dumpEntries renders entries readably: an Entry is two pointers, so %+v on the
+// slice prints addresses and tells the reader nothing about what moved.
+func dumpEntries(entries []logging.Entry) string {
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		switch {
+		case e.Call != nil:
+			parts = append(parts, "call:"+e.Call.Upstream+"/"+e.Call.Tool)
+		case e.Event != nil:
+			parts = append(parts, "event:"+e.Event.Event+"/"+e.Event.Upstream)
+		default:
+			parts = append(parts, "empty")
+		}
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+// TestFormatEventSubjectlessLineIsAligned: the events an operator most needs —
+// upstream_start_failed, upstream_gave_up, sse_stream_unavailable — carry no
+// Subject, and their lines used to end in the column padding plus a separator:
+// dangling whitespace, and a detail= pushed four spaces out instead of two,
+// misaligned against every event line that does have a subject.
+func TestFormatEventSubjectlessLineIsAligned(t *testing.T) {
+	base := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+
+	bare := formatEvent(logging.EventRecord{
+		Time: base, Event: logging.EventUpstreamGaveUp, Upstream: "broken",
+	})
+	if bare != strings.TrimRight(bare, " ") {
+		t.Errorf("subject-less line ends in whitespace: %q", bare)
+	}
+
+	withDetail := formatEvent(logging.EventRecord{
+		Time: base, Event: logging.EventUpstreamGaveUp, Upstream: "broken",
+		Detail: "gave up after 5 restarts",
+	})
+	if !strings.Contains(withDetail, `  detail="gave up after 5 restarts"`) ||
+		strings.Contains(withDetail, `   detail=`) {
+		t.Errorf("detail= is not two spaces out on a subject-less line: %q", withDetail)
+	}
+
+	withCount := formatEvent(logging.EventRecord{
+		Time: base, Event: logging.EventUpstreamGaveUp, Upstream: "broken", Count: 3,
+	})
+	if !strings.Contains(withCount, "  count=3") || strings.Contains(withCount, "   count=") {
+		t.Errorf("count= is not two spaces out on a subject-less line: %q", withCount)
+	}
+}
+
+// TestFormatEventWithSubjectIsUnchanged is the other half of the trim: a line
+// that HAS a subject must come out byte-for-byte as it did before, so an
+// operator's existing eye (and any grep) still matches. The literal below is the
+// pre-trim output.
+func TestFormatEventWithSubjectIsUnchanged(t *testing.T) {
+	got := formatEvent(logging.EventRecord{
+		Time:    time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC),
+		Event:   logging.EventNotificationDropped,
+		Subject: "notifications/progress",
+		Detail:  "subscriber buffer full",
+		Count:   5,
+	})
+	const want = "2026-07-29T10:00:00Z  EVT   " + // time, EVT padded to 4
+		"              " + // upstream is empty here: 12 columns + separator
+		"notification_dropped  notifications/progress" +
+		`  detail="subscriber buffer full"  count=5`
+	if got != want {
+		t.Errorf("event line with a subject changed:\n got: %q\nwant: %q", got, want)
+	}
+}

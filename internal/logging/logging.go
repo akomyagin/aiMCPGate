@@ -76,7 +76,21 @@ type EventRecord struct {
 	Upstream string    `json:"upstream,omitempty"` // which upstream, when attributable
 	Subject  string    `json:"subject,omitempty"`  // method / tool / uri / template — the thing affected
 	Detail   string    `json:"detail,omitempty"`   // sanitized human-readable reason
-	Count    int       `json:"count,omitempty"`    // occurrences coalesced into this line (absent == 1)
+	Count    int       `json:"count,omitempty"`    // occurrences coalesced into this line (absent == 1) — read it through Occurrences
+}
+
+// Occurrences is the READ half of the "absent == 1" convention Count carries on
+// the wire. The write half is the emitter's normalization of 1 to zero — that
+// lives in a different package, internal/registry's emitEvent, which omitempty
+// then keeps out of the line. Occurrences is the single place every consumer of
+// this package reads the convention back; without it, a consumer that reads an
+// absent count as zero under-reports exactly the floods the coalescing throttle
+// exists for.
+func (e EventRecord) Occurrences() int {
+	if e.Count < 1 {
+		return 1
+	}
+	return e.Count
 }
 
 // KindEvent is the value of EventRecord.Kind — the journal's line discriminator.

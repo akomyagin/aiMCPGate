@@ -61,7 +61,8 @@ type catalogDefect struct{ event, subject string }
 // catalog build the registry without a journal (events are simply not recorded
 // there — doctor has its own StartReport). Time and Kind are stamped here so no
 // call site can forget them, and a Count of 1 is normalized to zero so the wire
-// keeps its "absent == 1" convention.
+// keeps its "absent == 1" convention — the paired read is
+// logging.EventRecord.Occurrences, the one place that undoes it.
 //
 // The mutex inside callLog is a LEAF in the LOCK-ORDER sense: emitEvent takes
 // nothing else, and nothing else is taken from under it, so no deadlock is
@@ -104,11 +105,28 @@ func (r *Registry) emitEvents(batch []logging.EventRecord) {
 // remainder was suppressed before it); later ones inside the window only bump a
 // counter.
 //
+// n is how many occurrences of the key happened AT ONCE — a caller that already
+// counted them (forwardNotification drops one message per wedged subscriber
+// under a single lock hold) passes the total instead of calling in a loop,
+// which took eventMu n times to re-derive a number it already had. n <= 0 is a
+// no-op: nothing happened. The observable consequence, intended: a drop on two
+// subscribers now yields ONE line saying count=2, where the loop yielded a
+// count=1 line plus an invisible remainder that waited for the next occurrence
+// or for the shutdown flush.
+//
+// backlogDetail is computed from `held` alone and never from n: the n
+// occurrences are happening right now, so dating them to the backlog's start
+// would be exactly the false temporal attribution backlogDetail exists to
+// prevent.
+//
 // Locking contract: it takes ONLY r.eventMu, a leaf mutex, and calls emitEvent
 // from OUTSIDE it. Callers must not hold notifMu / serverReqMu / rootsMu when
 // calling — collect what needs reporting under those locks and note it after
 // unlocking (see forwardNotification).
-func (r *Registry) noteThrottled(event, upstream, subject, detail string) {
+func (r *Registry) noteThrottled(event, upstream, subject, detail string, n int) {
+	if n <= 0 {
+		return
+	}
 	now := time.Now()
 	key := eventKey{event: event, upstream: upstream, subject: subject}
 
@@ -122,12 +140,12 @@ func (r *Registry) noteThrottled(event, upstream, subject, detail string) {
 		if st.suppressed == 0 {
 			st.firstHeld = now
 		}
-		st.suppressed++
+		st.suppressed += n
 		r.eventMu.Unlock()
 		return
 	}
 	held, heldSince := st.suppressed, st.firstHeld
-	count := held + 1
+	count := held + n
 	st.suppressed = 0
 	st.firstHeld = time.Time{}
 	st.lastEmit = now

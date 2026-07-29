@@ -344,3 +344,21 @@ func TestEventRecordCountIsWrittenWhenAboveOne(t *testing.T) {
 		t.Fatalf("entries = %+v, want one event with count 7", entries)
 	}
 }
+
+// TestEventRecordOccurrences pins the READ half of the "absent == 1" wire
+// convention. Zero is what the writer produces for a single occurrence
+// (omitempty then drops the field), so a reader that took Count literally would
+// count that line as no occurrence at all.
+func TestEventRecordOccurrences(t *testing.T) {
+	for _, tc := range []struct {
+		count, want int
+	}{
+		{0, 1}, // absent on the wire: one occurrence
+		{1, 1}, // a writer that did not normalize means the same thing
+		{5, 5},
+	} {
+		if got := (EventRecord{Count: tc.count}).Occurrences(); got != tc.want {
+			t.Errorf("EventRecord{Count: %d}.Occurrences() = %d, want %d", tc.count, got, tc.want)
+		}
+	}
+}
