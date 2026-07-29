@@ -624,7 +624,10 @@ func Load(path string) (*Config, error) {
 		} else {
 			var typeErr *yaml.TypeError
 			if errors.As(err, &typeErr) {
-				return nil, fmt.Errorf("parse config %q: %w\nunknown or misspelled config keys are fatal since v0.5.0; fix or remove the keys listed above", path, err)
+				// No version number in this text on purpose: it is written before
+				// the release it ships in is cut, so naming one would risk telling
+				// the user a version that never existed (found by review, L8).
+				return nil, fmt.Errorf("parse config %q: %w\nunknown or misspelled config keys are fatal; fix or remove the keys listed above", path, err)
 			}
 			return nil, fmt.Errorf("parse config %q: %w", path, err)
 		}

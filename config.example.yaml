@@ -3,7 +3,7 @@
 # Secrets (tokens) are referenced with ${ENV_VAR} and resolved from the
 # environment / a local .env at load time — never commit real secrets here.
 #
-# UNKNOWN KEYS ARE A STARTUP ERROR. Since v0.5.0 the config is parsed strictly:
+# UNKNOWN KEYS ARE A STARTUP ERROR. The config is parsed strictly:
 # a misspelled or unrecognized key stops the gateway, naming the key and its
 # line number, instead of being silently ignored. (Previously `enabld: false`
 # left the upstream ENABLED, with nothing anywhere saying why.) This includes

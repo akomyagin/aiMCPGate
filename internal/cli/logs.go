@@ -355,15 +355,24 @@ func runLogsStats(cmd *cobra.Command, path string, filt recordFilter) error {
 				s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
 		}
 	}
-	if len(events) > 0 {
+	switch {
+	case len(events) > 0:
 		if !filt.eventsOnly {
 			fmt.Fprintln(w)
 		}
 		fmt.Fprintln(w, "EVENT\tUPSTREAM\tSUBJECT\tCOUNT\tLAST")
 		for _, s := range aggregateEventStats(events) {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
-				s.event, s.upstream, s.subject, s.count, s.last.Format(time.RFC3339))
+				s.event, s.upstream, printableField(s.subject), s.count, s.last.Format(time.RFC3339))
 		}
+	case filt.eventsOnly:
+		// --events --stats on a journal with no matching events would otherwise
+		// print ABSOLUTELY nothing (the call table is skipped, the event table is
+		// empty) — indistinguishable from a command that silently broke. Only in
+		// this branch: without --events the call table above is the output, and
+		// adding a line to it would break the byte-for-byte compatibility of
+		// pre-Stage-18 `logs --stats`.
+		fmt.Fprintln(w, "no events")
 	}
 	return w.Flush()
 }
@@ -511,7 +520,7 @@ func formatEvent(e logging.EventRecord) string {
 		"EVT",
 		e.Upstream,
 		e.Event,
-		e.Subject,
+		printableField(e.Subject),
 	)
 	if e.Detail != "" {
 		line += "  detail=" + strconv.Quote(e.Detail)
@@ -520,6 +529,27 @@ func formatEvent(e logging.EventRecord) string {
 		line += fmt.Sprintf("  count=%d", e.Count)
 	}
 	return line
+}
+
+// printableField makes a journal-supplied string safe to put on a terminal line.
+// An event's Subject is NOT gateway-authored the way its Detail is: for
+// catalog_collision it can be a resource URI and for catalog_bad_template a URI
+// template, both taken verbatim from an upstream and — unlike a tool name —
+// never normalized by namespacing. A "\n" in one would forge a second output
+// line indistinguishable from a real journal entry, and an ESC would repaint the
+// operator's terminal (found by independent review, M3).
+//
+// Strings made entirely of printable runes are returned VERBATIM, so the normal
+// output keeps its exact former shape; only a string that actually carries a
+// control character pays the strconv.Quote escaping. Deliberately not applied to
+// formatRecord's rec.Tool: that is a pre-existing class, left as named debt.
+func printableField(s string) string {
+	for _, r := range s {
+		if !strconv.IsPrint(r) {
+			return strconv.Quote(s)
+		}
+	}
+	return s
 }
 
 func durMS(d time.Duration) string {

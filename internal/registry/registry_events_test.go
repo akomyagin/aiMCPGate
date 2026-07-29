@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -369,9 +370,13 @@ func TestCatalogCollisionsJournalEvents(t *testing.T) {
 	newFakes := func() map[string]*fakeUpstream {
 		return map[string]*fakeUpstream{
 			// "dup" twice within one upstream: the runtime surprise keep-first guards.
-			// The resources capability must be declared or launch never lists them.
-			"a": {name: "a", tools: []string{"dup", "dup"}, resources: []string{"file:///shared"},
-				templates: []string{badUTF8Template}, caps: json.RawMessage(`{"tools":{},"resources":{}}`)},
+			// "pdup" twice does the same for prompts — a SEPARATE branch with its own
+			// emission, so a tool-only case leaves it unpinned (it was: independent
+			// verification found deleting that emission kept the whole package green).
+			// Each kind's capability must be declared or launch never lists it at all.
+			"a": {name: "a", tools: []string{"dup", "dup"}, prompts: []string{"pdup", "pdup"},
+				resources: []string{"file:///shared"}, templates: []string{badUTF8Template},
+				caps: json.RawMessage(`{"tools":{},"prompts":{},"resources":{}}`)},
 			// b claims a URI a already owns.
 			"b": {name: "b", tools: []string{"t"}, resources: []string{"file:///shared"},
 				caps: json.RawMessage(`{"tools":{},"resources":{}}`)},
@@ -386,17 +391,22 @@ func TestCatalogCollisionsJournalEvents(t *testing.T) {
 	defer func() { _ = r.Close() }()
 
 	collisions := j.events(t, logging.EventCatalogCollision)
-	if len(collisions) != 2 {
-		t.Fatalf("got %d catalog_collision events, want 2 (dup tool + dup uri); journal:\n%s",
+	if len(collisions) != 3 {
+		t.Fatalf("got %d catalog_collision events, want 3 (dup tool + dup prompt + dup uri); journal:\n%s",
 			len(collisions), j.bytes())
 	}
-	var sawTool, sawURI bool
+	var sawTool, sawPrompt, sawURI bool
 	for _, e := range collisions {
 		switch e.Subject {
 		case "a__dup":
 			sawTool = true
 			if e.Upstream != "a" {
 				t.Errorf("tool collision upstream = %q, want the loser %q", e.Upstream, "a")
+			}
+		case "a__pdup":
+			sawPrompt = true
+			if e.Upstream != "a" {
+				t.Errorf("prompt collision upstream = %q, want the loser %q", e.Upstream, "a")
 			}
 		case "file:///shared":
 			sawURI = true
@@ -407,8 +417,8 @@ func TestCatalogCollisionsJournalEvents(t *testing.T) {
 			t.Errorf("unexpected collision subject %q", e.Subject)
 		}
 	}
-	if !sawTool || !sawURI {
-		t.Errorf("collisions = %+v, want both the duplicate tool and the duplicate uri", collisions)
+	if !sawTool || !sawPrompt || !sawURI {
+		t.Errorf("collisions = %+v, want the duplicate tool, prompt and uri all three", collisions)
 	}
 
 	bad := j.events(t, logging.EventCatalogBadTemplate)
@@ -520,5 +530,229 @@ func TestEventsAreNotJournaledWithoutCallLog(t *testing.T) {
 	r.flushEvents()
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// --- Review round 2: the merge path is NOT cold (H1) and must not journal
+// --- while r.mu is held (M2), and a coalesced line must date its own backlog
+// --- (M4).
+
+// relistFake is an upstream whose tools/list answer the test can swap at any
+// moment (race-safe) and which counts the re-lists the registry really made.
+// Everything else comes from the embedded fakeUpstream.
+type relistFake struct {
+	*fakeUpstream
+	listMu sync.Mutex
+	list   []mcp.Tool
+	lists  atomic.Int64
+}
+
+func newRelistFake(name string, tools ...string) *relistFake {
+	f := &relistFake{fakeUpstream: &fakeUpstream{name: name, caps: json.RawMessage(`{"tools":{}}`)}}
+	f.setTools(tools...)
+	return f
+}
+
+func (f *relistFake) setTools(names ...string) {
+	out := make([]mcp.Tool, 0, len(names))
+	for _, n := range names {
+		out = append(out, mcp.Tool{
+			Name: n, Description: json.RawMessage(`"d"`), InputSchema: json.RawMessage(`{"type":"object"}`),
+		})
+	}
+	f.listMu.Lock()
+	f.list = out
+	f.listMu.Unlock()
+}
+
+func (f *relistFake) ListTools(context.Context) ([]mcp.Tool, error) {
+	f.listMu.Lock()
+	out := append([]mcp.Tool(nil), f.list...)
+	f.listMu.Unlock()
+	f.lists.Add(1)
+	return out, nil
+}
+
+// relistRegistry starts a registry over one relistFake.
+func relistRegistry(t *testing.T, f *relistFake, callLog logging.CallLog) *Registry {
+	t.Helper()
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: f.name, Enabled: boolPtr(true)}}}
+	r := New(cfg, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+	r.start = func(context.Context, config.Upstream) (Upstream, error) { return f, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return r
+}
+
+// fireRelist drives ONE list_changed → debounce → re-list cycle and waits until
+// the re-list has actually fetched the catalog. runRelist serializes the cycles
+// per upstream, so cycle N's merge is complete before cycle N+1's fetch starts.
+func (f *relistFake) fireRelist(t *testing.T, r *Registry) {
+	t.Helper()
+	before := f.lists.Load()
+	r.onUpstreamNotification(f.name, mcp.NotifToolsListChanged, nil)
+	deadline := time.Now().Add(10 * time.Second)
+	for f.lists.Load() <= before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the re-list never ran after notifications/tools/list_changed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRelistDoesNotRejournalUnchangedCatalogDefects (review H1): an upstream
+// firing tools/list_changed re-runs the WHOLE merge — including all four
+// collision branches — every relistDebounce. A static defect (a duplicate name,
+// a broken template) is a fact the operator needs ONCE; without the defect
+// memory a noisy upstream rewrites the same line up to five times a second,
+// forever. A defect that is genuinely NEW must still be reported at once, which
+// is what the second half asserts (and what makes the first half a real
+// assertion rather than "events stopped working").
+func TestRelistDoesNotRejournalUnchangedCatalogDefects(t *testing.T) {
+	j, callLog := newJournal()
+	f := newRelistFake("a", "dup", "dup")
+	r := relistRegistry(t, f, callLog)
+	defer func() { _ = r.Close() }()
+
+	first := j.waitForEvent(t, logging.EventCatalogCollision, 5*time.Second)
+	if len(first) != 1 || first[0].Subject != "a__dup" {
+		t.Fatalf("start journaled %+v, want exactly one collision on a__dup", first)
+	}
+
+	// Three re-lists of the very same (still broken) catalog.
+	for i := 0; i < 3; i++ {
+		f.fireRelist(t, r)
+	}
+
+	// A genuinely new defect: it must appear, and its appearance doubles as the
+	// barrier proving the three repeats above have long since merged.
+	f.setTools("dup", "dup", "dup2", "dup2")
+	f.fireRelist(t, r)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(j.events(t, logging.EventCatalogCollision)) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a NEW collision was never journaled; journal:\n%s", j.bytes())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	evs := j.events(t, logging.EventCatalogCollision)
+	if len(evs) != 2 {
+		t.Fatalf("got %d catalog_collision events, want exactly 2 (a__dup once at start, a__dup2 once when it appeared); journal:\n%s",
+			len(evs), j.bytes())
+	}
+	if evs[0].Subject != "a__dup" || evs[1].Subject != "a__dup2" {
+		t.Errorf("collision subjects = %q/%q, want a__dup then a__dup2", evs[0].Subject, evs[1].Subject)
+	}
+}
+
+// blockingJournal parks the FIRST write made after it is armed until the test
+// releases it — standing in for the real hazard: with log_file unset the journal
+// is os.Stderr, a pipe to the MCP client in stdio mode, whose 64 KiB buffer a
+// client that stopped reading fills, blocking write(2) forever.
+type blockingJournal struct {
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *blockingJournal) Write(p []byte) (int, error) {
+	if b.armed.CompareAndSwap(true, false) {
+		b.entered <- struct{}{}
+		<-b.release
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// TestCatalogEventIsNotJournaledUnderRegistryLock (review M2, and the teeth of
+// H1): the re-list path takes r.mu — the registry's central lock, needed by
+// tools/list and by tools/call routing — and used to journal from under it. A
+// journal write that never returns would therefore wedge the whole gateway.
+// Here the write is deliberately parked and a catalog READER (ToolCount, which
+// takes r.mu.RLock) must still be served immediately.
+func TestCatalogEventIsNotJournaledUnderRegistryLock(t *testing.T) {
+	j := &blockingJournal{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(j.release) }) }
+	defer unblock()
+
+	f := newRelistFake("a", "one")
+	r := relistRegistry(t, f, logging.NewCallLogWriter(j))
+	defer func() { _ = r.Close() }()
+
+	// Start journaled nothing (a clean catalog). Arm the trap, then make the
+	// next re-list find a collision, which is what triggers the write.
+	j.armed.Store(true)
+	f.setTools("dup", "dup")
+	f.fireRelist(t, r)
+
+	select {
+	case <-j.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the re-list never journaled its collision event, so this test proves nothing")
+	}
+
+	// The journal write is parked right now. Reading the catalog must not be.
+	done := make(chan int, 1)
+	go func() { done <- r.ToolCount() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		unblock() // let the parked writer finish so the test can unwind
+		t.Fatal("ToolCount() blocked while an operator event was being journaled: the write is happening under r.mu")
+	}
+	unblock()
+}
+
+// TestThrottledBacklogNamesItsOwnStart (review M4): the throttle window is only
+// re-checked on the NEXT occurrence of a key, so a key that goes quiet leaves
+// its remainder unreported for as long as it stays quiet — and the line that
+// finally carries it is stamped NOW. Without the backlog text an operator reads
+// "count=3, just now" off a line whose other two occurrences are a day old.
+func TestThrottledBacklogNamesItsOwnStart(t *testing.T) {
+	j, callLog := newJournal()
+	r := New(&config.Config{}, quietLogger(), callLog, noopPayloadLog(), false, "0.0.0-test")
+
+	const ev = logging.EventNotificationDropped
+	const subject = "notifications/progress"
+	const detail = "subscriber buffer full"
+	r.noteThrottled(ev, "", subject, detail) // journaled at once: opens the window
+	r.noteThrottled(ev, "", subject, detail) // suppressed
+	r.noteThrottled(ev, "", subject, detail) // suppressed
+
+	// Age the state: those two happened a day ago and the key then went silent.
+	dayAgo := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	r.eventMu.Lock()
+	st := r.eventSeen[eventKey{event: ev, subject: subject}]
+	if st == nil || st.suppressed != 2 {
+		r.eventMu.Unlock()
+		t.Fatalf("throttle state = %+v, want 2 suppressed occurrences", st)
+	}
+	st.firstHeld = dayAgo
+	st.lastEmit = dayAgo
+	r.eventMu.Unlock()
+
+	r.noteThrottled(ev, "", subject, detail) // the fourth: carries the backlog
+
+	evs := j.events(t, ev)
+	if len(evs) != 2 {
+		t.Fatalf("journal has %d lines, want 2 (window opener + the backlog carrier):\n%s", len(evs), j.bytes())
+	}
+	late := evs[1]
+	if late.Count != 3 {
+		t.Errorf("backlog line count = %d, want 3 (2 suppressed + the current one)", late.Count)
+	}
+	if !strings.Contains(late.Detail, dayAgo.Format(time.RFC3339)) {
+		t.Errorf("backlog line does not say WHEN its backlog started (want %s):\ndetail = %q",
+			dayAgo.Format(time.RFC3339), late.Detail)
+	}
+	if late.Time.Sub(dayAgo) < 23*time.Hour {
+		t.Fatalf("line time %s is not the fresh occurrence — the test aged nothing", late.Time)
 	}
 }

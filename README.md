@@ -287,9 +287,15 @@ level. They are now written to the same file `mcp-gate logs` reads:
 Events show up inline with calls, marked `EVT`; `mcp-gate logs --events` shows
 only them, and `--stats` gains a per-event table. `--tool` and `--status` are
 call-only filters, so events are excluded while either is set (`--upstream`
-applies to both). Repeated drops are coalesced — the first one is written at
+applies to both). One consequence worth knowing: `notification_dropped` names no
+upstream — a drop is a property of the *subscriber* whose buffer was full, not of
+whoever sent the notification — so **`--upstream X` never shows it**. Look for it
+without that filter. Repeated drops are coalesced — the first one is written at
 once, further ones within a minute are counted into the `count=` of the next
-line for that key, and the remainder is flushed at shutdown.
+line for that key, and the remainder is flushed at shutdown. A line that carries
+such a backlog says so in its `detail=`, naming the time of the **oldest**
+occurrence it folds in — the line's own timestamp is the newest one, so the two
+together bound when the burst actually happened.
 
 Two practical notes:
 
@@ -353,7 +359,7 @@ the config (`log_file`, `skill_file`, `debug_payload_log`) resolve against the
 
 **Unknown keys are a startup error.** The config is parsed strictly: a
 misspelled or unrecognized key stops the gateway with the key name and its line
-number, instead of being ignored as it was before v0.5.0. The concrete win: a
+number, instead of being silently ignored as it once was. The concrete win: a
 typo in `enabled` can no longer leave an upstream quietly running. Custom `x-`
 scratch keys are rejected too — to share a block, put a YAML anchor on the first
 real upstream and merge it (`<<: *anchor`) into the others; anchors and merge

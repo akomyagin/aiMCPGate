@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/logging"
@@ -43,8 +44,18 @@ type eventKey struct{ event, upstream, subject string }
 
 type eventState struct {
 	suppressed int       // occurrences seen since lastEmit, not yet journaled
+	firstHeld  time.Time // when the OLDEST still-unjournaled occurrence happened
 	lastEmit   time.Time // when this key last reached the journal
 }
+
+// catalogDefect identifies one static defect of an upstream's projected catalog
+// — a client-facing name/URI lost to keep-first, or a URI template that does not
+// compile. It is the dedup key behind r.catalogDefects: a defect is an operator
+// FACT ("this upstream has a name conflict"), not an event stream, so re-running
+// the same merge over an unchanged catalog must journal nothing at all. Without
+// that, an upstream firing tools/list_changed re-merges through relistUpstream up
+// to five times a second (relistDebounce) and rewrites the same lines forever.
+type catalogDefect struct{ event, subject string }
 
 // emitEvent writes one event line. It is nil-safe on r.callLog: doctor, call and
 // catalog build the registry without a journal (events are simply not recorded
@@ -52,10 +63,16 @@ type eventState struct {
 // call site can forget them, and a Count of 1 is normalized to zero so the wire
 // keeps its "absent == 1" convention.
 //
-// The mutex inside callLog is a LEAF: emitEvent takes nothing else, and nothing
-// else is taken from under it. That is what makes it safe to call from the merge
-// paths while r.mu is held (see mergeLocked) — those are cold paths (Start,
-// Reload, restart), never the tool-call path.
+// The mutex inside callLog is a LEAF in the LOCK-ORDER sense: emitEvent takes
+// nothing else, and nothing else is taken from under it, so no deadlock is
+// reachable through it. That is NOT the same as "safe to call under any lock":
+// RecordEvent ends in a write(2), and with log_file unset the journal is
+// os.Stderr, which in stdio mode is a pipe to the MCP client — a client that
+// stopped draining it fills the 64 KiB pipe buffer and the write blocks
+// FOREVER. So emitEvent must never run while a lock a request path needs is
+// held; in particular NEVER under r.mu (found by independent review, H1/M2 —
+// the merge paths used to do exactly that; they now buffer and emit after the
+// unlock, see mergeLocked and emitEvents).
 func (r *Registry) emitEvent(e logging.EventRecord) {
 	if r.callLog == nil {
 		return
@@ -68,6 +85,18 @@ func (r *Registry) emitEvent(e logging.EventRecord) {
 		e.Count = 0
 	}
 	r.callLog.RecordEvent(e)
+}
+
+// emitEvents writes a batch of events collected UNDER a lock, and must be
+// called only after that lock has been released — see emitEvent for why a
+// journal write under r.mu can wedge the whole gateway. It is the counterpart
+// of mergeLocked's pending slice: the catalog paths gather what they noticed
+// while mutating and hand it here afterwards. A nil/empty batch is a no-op, so
+// the call sites need no guard.
+func (r *Registry) emitEvents(batch []logging.EventRecord) {
+	for _, e := range batch {
+		r.emitEvent(e)
+	}
 }
 
 // noteThrottled coalesces a repeatable event, per (event, upstream, subject).
@@ -90,12 +119,17 @@ func (r *Registry) noteThrottled(event, upstream, subject, detail string) {
 		r.eventSeen[key] = st
 	}
 	if !st.lastEmit.IsZero() && now.Sub(st.lastEmit) < eventThrottleWindow {
+		if st.suppressed == 0 {
+			st.firstHeld = now
+		}
 		st.suppressed++
 		r.eventMu.Unlock()
 		return
 	}
-	count := st.suppressed + 1
+	held, heldSince := st.suppressed, st.firstHeld
+	count := held + 1
 	st.suppressed = 0
+	st.firstHeld = time.Time{}
 	st.lastEmit = now
 	r.eventMu.Unlock()
 
@@ -104,9 +138,29 @@ func (r *Registry) noteThrottled(event, upstream, subject, detail string) {
 		Event:    event,
 		Upstream: upstream,
 		Subject:  subject,
-		Detail:   detail,
+		Detail:   detail + backlogDetail(held, heldSince),
 		Count:    count,
 	})
+}
+
+// backlogDetail names the coalesced remainder a line carries: how many earlier
+// occurrences were folded into it and WHEN the oldest of them happened.
+//
+// It exists because the window is only ever re-checked on the NEXT occurrence
+// of a key: a key that goes quiet for a day leaves its remainder unreported for
+// that day, and the line that finally carries it is stamped with the time of the
+// LATEST occurrence. Without this suffix an operator reads "count=40, just now"
+// off a line whose other 39 occurrences happened yesterday — false temporal
+// attribution in a feature whose whole point is an honest report (found by
+// independent review, M4). No timer goroutine is used to shorten the delay: the
+// plan rejected one deliberately (lifecycle + test nondeterminism), so the fix
+// is to make the line TRUTHFUL, not to make it timely.
+func backlogDetail(held int, since time.Time) string {
+	if held <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" [%d earlier occurrence(s) coalesced into this line, the oldest at %s]",
+		held, since.Format(time.RFC3339))
 }
 
 // flushEvents journals the suppressed remainder of every throttled key. It is
@@ -117,14 +171,16 @@ func (r *Registry) flushEvents() {
 	type pending struct {
 		key   eventKey
 		count int
+		since time.Time
 	}
 	var out []pending
 
 	r.eventMu.Lock()
 	for k, st := range r.eventSeen {
 		if st.suppressed > 0 {
-			out = append(out, pending{key: k, count: st.suppressed})
+			out = append(out, pending{key: k, count: st.suppressed, since: st.firstHeld})
 			st.suppressed = 0
+			st.firstHeld = time.Time{}
 		}
 	}
 	r.eventMu.Unlock()
@@ -134,7 +190,7 @@ func (r *Registry) flushEvents() {
 			Event:    p.key.event,
 			Upstream: p.key.upstream,
 			Subject:  p.key.subject,
-			Detail:   eventFlushDetail(p.key.event),
+			Detail:   eventFlushDetail(p.key.event) + backlogDetail(p.count, p.since),
 			Count:    p.count,
 		})
 	}

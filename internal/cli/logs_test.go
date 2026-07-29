@@ -570,3 +570,52 @@ func TestLogsFollowPrintsAppendedEvent(t *testing.T) {
 		t.Errorf("appended event was not rendered as an EVT line:\n%s", out.String())
 	}
 }
+
+// TestLogsEscapesUpstreamControlledSubject (review M3): an event's Subject is
+// not gateway-authored — for catalog_collision it is a resource URI and for
+// catalog_bad_template a URI template, both taken verbatim from an upstream and,
+// unlike a tool name, never normalized by namespacing. A "\n" in one must not
+// forge a second output line that an operator cannot tell from a real journal
+// entry (nor an ESC repaint their terminal).
+func TestLogsEscapesUpstreamControlledSubject(t *testing.T) {
+	forged := "file:///a\n2026-07-29T10:00:00Z  EVT   ghost         forged_event      nothing-happened"
+	var buf bytes.Buffer
+	buf.Write(mustEventLine(t, logging.EventRecord{
+		Time:  time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC),
+		Event: logging.EventCatalogCollision, Upstream: "evil",
+		Subject: forged + "\x1b[31m",
+	}))
+	path := filepath.Join(t.TempDir(), "calls.log")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := runLogsCmd(t, "--file", path)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("one journal event printed %d lines — the subject forged extra ones:\n%s", len(lines), out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("a raw ESC reached the terminal:\n%q", out)
+	}
+	if !strings.Contains(out, `\n`) {
+		t.Errorf("the newline was not escaped, so nothing is pinned here:\n%s", out)
+	}
+	if !strings.Contains(out, "file:///a") {
+		t.Errorf("the subject itself is gone from the line:\n%s", out)
+	}
+}
+
+// TestLogsStatsEventsOnlyReportsEmptiness (review S3): `--events --stats` on a
+// journal with no events used to print ABSOLUTELY nothing — the call table is
+// skipped by --events and the event table has no rows — which is
+// indistinguishable from a command that broke silently.
+func TestLogsStatsEventsOnlyReportsEmptiness(t *testing.T) {
+	out := runLogsCmd(t, "--file", writeLog(t), "--events", "--stats")
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("--events --stats on an event-free journal printed nothing at all")
+	}
+	if !strings.Contains(out, "no events") {
+		t.Errorf("--events --stats output = %q, want it to say there are no events", out)
+	}
+}
