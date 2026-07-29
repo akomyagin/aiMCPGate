@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,7 +34,9 @@ func writeLog(t *testing.T) string {
 	return path
 }
 
-// runLogsCmd executes the logs subcommand with args and captures its stdout.
+// runLogsCmd executes the logs subcommand with args and captures everything it
+// wrote, on either stream. Most tests here assert on CONTENT and do not care
+// which stream carried it.
 func runLogsCmd(t *testing.T, args ...string) string {
 	t.Helper()
 	root := Build("test")
@@ -45,6 +48,74 @@ func runLogsCmd(t *testing.T, args ...string) string {
 		t.Fatalf("logs %v: %v\n%s", args, err, out.String())
 	}
 	return out.String()
+}
+
+// runLogsCmdOSStreams runs the logs subcommand the way a user's shell does —
+// with cobra's writers left UNSET — and captures the real process stdout and
+// stderr separately.
+//
+// Leaving the writers unset is the entire point, and it is subtle enough to
+// spell out: cobra's Command.Println resolves through OutOrStderr(), which
+// falls back to os.Stderr ONLY when no out writer was configured. A test that
+// calls root.SetOut(&buf) hands Println that buffer, so the stream bug simply
+// does not occur under such a test — separate out/err buffers cannot catch it
+// either. That is why this helper swaps the os-level files instead, and why the
+// bug survived until a built binary was smoke-tested.
+//
+// Not safe for t.Parallel: os.Stdout/os.Stderr are process-global.
+func runLogsCmdOSStreams(t *testing.T, args ...string) (stdout, stderr string) {
+	t.Helper()
+
+	capture := func(target **os.File) (restore func(), read func() string) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		orig := *target
+		*target = w
+		// Drain concurrently: a pipe buffer that fills would deadlock the writer.
+		done := make(chan string, 1)
+		go func() {
+			var b bytes.Buffer
+			_, _ = io.Copy(&b, r)
+			done <- b.String()
+		}()
+		return func() { *target = orig; _ = w.Close() }, func() string { s := <-done; _ = r.Close(); return s }
+	}
+
+	restoreOut, readOut := capture(&os.Stdout)
+	restoreErr, readErr := capture(&os.Stderr)
+
+	root := Build("test")
+	root.SetArgs(append([]string{"logs"}, args...))
+	execErr := root.Execute()
+
+	restoreOut()
+	restoreErr()
+	stdout, stderr = readOut(), readErr()
+	if execErr != nil {
+		t.Fatalf("logs %v: %v\nstdout:\n%s\nstderr:\n%s", args, execErr, stdout, stderr)
+	}
+	return stdout, stderr
+}
+
+// TestLogsListingGoesToStdout pins the STREAM, not the content: cobra's
+// cmd.Println writes to the error stream, so the listing used to be invisible
+// to `mcp-gate logs | grep` and `mcp-gate logs > file` while looking perfectly
+// fine on a terminal. Merged out/err buffers cannot catch that, which is how it
+// survived until a built binary was smoke-tested.
+func TestLogsListingGoesToStdout(t *testing.T) {
+	path := writeLog(t)
+	stdout, stderr := runLogsCmdOSStreams(t, "--file", path)
+	for _, want := range []string{"github__search", "web__fetch", "github__create_issue"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("listing line %q is not on stdout (a pipe or redirect would lose it)\nstdout:\n%s\nstderr:\n%s",
+				want, stdout, stderr)
+		}
+		if strings.Contains(stderr, want) {
+			t.Errorf("listing line %q leaked onto stderr\nstderr:\n%s", want, stderr)
+		}
+	}
 }
 
 func TestLogsShowsAll(t *testing.T) {

@@ -211,8 +211,13 @@ func runLogs(cmd *cobra.Command, path string, tail int, filt recordFilter) error
 		return fmt.Errorf("read call log %q: %w", path, err)
 	}
 
+	// OutOrStdout, not cmd.Println: cobra's Println writes to the ERROR stream,
+	// which silently made `mcp-gate logs | grep` and `... > file` come back
+	// empty. --follow and --stats always used stdout; the listing was the odd
+	// one out.
+	out := cmd.OutOrStdout()
 	for _, e := range filterEntries(entries, filt, tail) {
-		cmd.Println(formatEntry(e))
+		fmt.Fprintln(out, formatEntry(e))
 	}
 	return nil
 }
@@ -235,12 +240,13 @@ func runLogsFollow(ctx context.Context, cmd *cobra.Command, path string, tail in
 	if err != nil {
 		return fmt.Errorf("read call log %q: %w", path, err)
 	}
+	out := cmd.OutOrStdout() // same stream the follow loop below writes to
 	for _, e := range filterEntries(entries, filt, tail) {
-		cmd.Println(formatEntry(e))
+		fmt.Fprintln(out, formatEntry(e))
 	}
 
 	pending := append([]byte(nil), buf[cut:]...)
-	return followLog(ctx, cmd.OutOrStdout(), path, int64(len(buf)), pending, filt)
+	return followLog(ctx, out, path, int64(len(buf)), pending, filt)
 }
 
 // followLog is --follow's watch loop: every followPollInterval it stats path
