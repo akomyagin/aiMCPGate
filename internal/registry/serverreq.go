@@ -7,6 +7,7 @@ import (
 	"maps"
 	"time"
 
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -263,6 +264,11 @@ func (r *Registry) onUpstreamRequest(name, method string, originalID, params jso
 	}
 	if !r.publishServerReq(gatewayID, entry, UpstreamRequest{GatewayID: gatewayID, Method: method, Params: params}) {
 		spec.refuse(r, name, originalID, "no client transport accepted the request")
+		// Journaled outside serverReqMu (publishServerReq already released it):
+		// from the user's side this looks like a tool that just failed, with the
+		// reason visible nowhere else (Stage 18).
+		r.noteThrottled(logging.EventServerRequestDropped, name, method,
+			"no client transport accepted the request; the tool call was refused on the upstream's behalf")
 		return
 	}
 	r.log.Debug("upstream request proxied to client", "upstream", name, "method", method, "id", gatewayID)
@@ -431,6 +437,8 @@ func onUpstreamRootsList(r *Registry, name string, originalID json.RawMessage) {
 	// — which also clears rootsStale, the one piece the hand-rolled rollback
 	// used to forget (found by review).
 	rootsExpire(r, gatewayID, "no client transport accepted the roots/list request")
+	r.noteThrottled(logging.EventServerRequestDropped, name, mcp.MethodRootsList,
+		"no client transport accepted the request; the tool call was refused on the upstream's behalf")
 }
 
 // rootsExpire unwinds the single-flight when the ONE roots/list question in

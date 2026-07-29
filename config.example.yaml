@@ -2,6 +2,25 @@
 #
 # Secrets (tokens) are referenced with ${ENV_VAR} and resolved from the
 # environment / a local .env at load time — never commit real secrets here.
+#
+# UNKNOWN KEYS ARE A STARTUP ERROR. Since v0.5.0 the config is parsed strictly:
+# a misspelled or unrecognized key stops the gateway, naming the key and its
+# line number, instead of being silently ignored. (Previously `enabld: false`
+# left the upstream ENABLED, with nothing anywhere saying why.) This includes
+# custom "x-" scratch keys at the top level — there is no escape hatch. To share
+# a block between upstreams, anchor it on the FIRST real upstream and merge it
+# into the others; anchors and merge keys keep working under strict parsing:
+#
+#   upstreams:
+#     - name: first
+#       command: some-server
+#       env: &common
+#         REGION: eu
+#     - name: second
+#       command: other-server
+#       env:
+#         <<: *common
+#         REGION: us
 
 # Client-facing transport: how a client (Claude Code, Cursor, ...) reaches the
 # gateway. "stdio" (Phase 1) launches the gateway as a subprocess; "http" (Phase 2)
@@ -16,10 +35,17 @@ listen_addr: "127.0.0.1:28080" # only used when transport: http
 # unnecessary.
 # auth_token: ${AIMCPGATE_TOKEN}
 
-# Where the JSON-lines tool-call log is written. Empty → stderr only.
-# `mcp-gate logs --file <this>` reads it back. Relative paths (like this one)
-# resolve against THIS config file's directory, not the cwd mcp-gate was
-# launched from — so serve can be run from anywhere and still find its files.
+# Where the JSON-lines journal is written. It holds BOTH tool calls and
+# operator events (an upstream that failed to start or was given up on, dropped
+# notifications, catalog collisions, a result max_result_bytes could not
+# truncate); `mcp-gate logs` shows both, `mcp-gate logs --events` shows only the
+# events. `mcp-gate logs --file <this>` reads it back.
+#
+# SET THIS. Empty → the journal goes to stderr, and in stdio mode stderr belongs
+# to the MCP client, where the operator never sees it — the events would be
+# written to nowhere useful. Relative paths (like this one) resolve against THIS
+# config file's directory, not the cwd mcp-gate was launched from — so serve can
+# be run from anywhere and still find its files.
 log_file: ./logs/calls.jsonl
 log_level: info             # debug | info | warn | error
 
@@ -50,6 +76,13 @@ call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 # "[truncated by mcp-gate: ...]" marker is appended; results without text
 # content (images, unknown shapes) pass through unchanged. 0 = unlimited (the
 # default).
+#
+# Note the asymmetry: a NON-TEXT oversized result reaches the client whole, the
+# limit simply does not apply to it (mangling an unknown shape would break the
+# gateway's transparency contract). That is not silent any more — the gateway
+# writes a `result_truncation_skipped` operator event into log_file naming the
+# upstream, the tool and the size, so `mcp-gate logs --events` shows which calls
+# escaped the limit.
 # max_result_bytes: 65536
 
 # Catalog presentation (Round 8) — both optional, hot-reloadable via SIGHUP.

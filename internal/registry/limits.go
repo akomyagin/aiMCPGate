@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -97,7 +98,12 @@ func truncationMarker(limit int) string {
 // a warning: guessing at an unknown format would break the gateway's
 // transparency contract, an honest oversized result beats a mangled one.
 // Errors (resp.Error) are never truncated — only successful results are.
-func (r *Registry) truncateResult(resp *mcp.Message, upstream string, limit int) {
+//
+// tool is the upstream's ORIGINAL tool name, not the client-facing namespaced
+// one: the namespaced name is not carried down this call path, and threading it
+// through guardedCall/timedCall would be signature noise for a journal field the
+// operator resolves unambiguously anyway from the (upstream, tool) pair.
+func (r *Registry) truncateResult(resp *mcp.Message, upstream, tool string, limit int) {
 	if resp == nil || resp.Error != nil || len(resp.Result) <= limit {
 		return
 	}
@@ -105,6 +111,16 @@ func (r *Registry) truncateResult(resp *mcp.Message, upstream string, limit int)
 	if !ok {
 		r.log.Warn("tool result exceeds max_result_bytes but is not truncatable, passing through unchanged",
 			"upstream", upstream, "bytes", len(resp.Result), "limit", limit)
+		// The operator half of the truncation asymmetry: the client still gets
+		// the full oversized result (unchanged contract), but the journal now
+		// says which call slipped past max_result_bytes and why.
+		r.emitEvent(logging.EventRecord{
+			Event:    logging.EventResultTruncationSkipped,
+			Upstream: upstream,
+			Subject:  tool,
+			Detail: fmt.Sprintf("result of %d bytes exceeds max_result_bytes=%d but carries no truncatable text content; passed through unchanged",
+				len(resp.Result), limit),
+		})
 		return
 	}
 	r.log.Debug("tool result truncated",
@@ -296,7 +312,7 @@ func (r *Registry) timedCall(ctx context.Context, conn Upstream, rt route, argum
 	})
 	if err == nil {
 		if limit := r.config().EffectiveMaxResultBytesFor(rt.upstream); limit > 0 {
-			r.truncateResult(resp, rt.upstream, limit)
+			r.truncateResult(resp, rt.upstream, rt.original, limit)
 		}
 	}
 	return resp, err

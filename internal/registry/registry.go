@@ -226,6 +226,13 @@ type Registry struct {
 	payloadLog logging.PayloadLog
 	start      upstreamStarter
 
+	// eventMu/eventSeen back the operator-event throttle (Stage 18, events.go).
+	// eventMu is a LEAF mutex: no other registry lock is taken from under it, and
+	// noteThrottled always journals from outside it. eventSeen is created in New
+	// and only ever read/written under eventMu.
+	eventMu   sync.Mutex
+	eventSeen map[eventKey]*eventState
+
 	// version is the gateway's build version (from -ldflags in main), passed
 	// down to every upstream connection so the initialize handshake reports
 	// the real binary version as clientInfo.version instead of a hardcoded
@@ -540,6 +547,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		payloadLog:        payloadLog,
 		autoRestart:       supervise,
 		version:           version,
+		eventSeen:         map[eventKey]*eventState{},
 		conns:             map[string]Upstream{},
 		tools:             map[string]ToolDescriptor{},
 		toolRoute:         map[string]route{},
@@ -652,7 +660,14 @@ func (r *Registry) startHTTP(u config.Upstream) (Upstream, error) {
 	onRequest := func(method string, id, params json.RawMessage) {
 		r.onUpstreamRequest(name, method, id, params)
 	}
-	conn := upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify, onRequest)
+	onStreamUnavailable := func() {
+		r.emitEvent(logging.EventRecord{
+			Event:    logging.EventSSEStreamUnavailable,
+			Upstream: name,
+			Detail:   "upstream offers no GET SSE stream; tools/list_changed from it will never arrive (until gateway restart)",
+		})
+	}
+	conn := upstream.StartHTTP(r.log, u.Name, u.URL, u.Headers, nil, r.version, onNotify, onRequest, onStreamUnavailable)
 	// Same race-free timing as startStdio: Initialize runs later, on this same
 	// launch goroutine. The len gate keeps doctor/call/catalog (no MCP client,
 	// so nothing declared) sending exactly {}.
@@ -728,6 +743,14 @@ func (r *Registry) Start(ctx context.Context) error {
 		if res.err != nil {
 			r.log.Warn("upstream failed to come up", "upstream", u.Name, "err", res.err)
 			r.recordFailure(u.Name, res.err.Error())
+			// Same text recordFailure keeps for StartReport / doctor: showing
+			// this reason to the operator is a policy already settled in Stage 8,
+			// so the journal adds no new leak surface (plan §4).
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventUpstreamStartFailed,
+				Upstream: u.Name,
+				Detail:   res.err.Error(),
+			})
 			continue
 		}
 		n := r.merge(u.Name, res.conn, res.tools, res.aux, res.meta)
@@ -1014,6 +1037,14 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			// connection is already closed, so its catalog entry must go too.
 			if r.dropUpstreamIfCurrent(u.Name, dead) {
 				r.log.Info("stdio upstream restart disabled by reload, dropped from catalog", "upstream", u.Name)
+				// Only the branch that actually dropped the upstream emits: in
+				// the else-branch the entry is a fresh connection someone else
+				// installed, so nothing was lost from the client's catalog.
+				r.emitEvent(logging.EventRecord{
+					Event:    logging.EventUpstreamGaveUp,
+					Upstream: u.Name,
+					Detail:   "restart policy disabled by a config reload; upstream dropped from the catalog",
+				})
 				r.notifyCatalogChanged()
 			} else {
 				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
@@ -1024,6 +1055,12 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			if r.dropUpstreamIfCurrent(u.Name, dead) {
 				r.log.Error("stdio upstream exhausted restart attempts, dropping from catalog",
 					"upstream", u.Name, "max_attempts", policy.MaxAttempts)
+				r.emitEvent(logging.EventRecord{
+					Event:    logging.EventUpstreamGaveUp,
+					Upstream: u.Name,
+					Detail: fmt.Sprintf("exhausted restart attempts (max_attempts=%d); upstream dropped from the catalog",
+						policy.MaxAttempts),
+				})
 				r.notifyCatalogChanged()
 			} else {
 				r.log.Info("stdio upstream entry already replaced, leaving it", "upstream", u.Name)
@@ -1065,6 +1102,11 @@ func (r *Registry) restart(u config.Upstream, dead Upstream, supCtx context.Cont
 			// non-stdio path cannot silently spin.
 			_ = conn.Close()
 			r.log.Error("restarted upstream has no done channel; giving up", "upstream", u.Name)
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventUpstreamGaveUp,
+				Upstream: u.Name,
+				Detail:   "restarted upstream reports no liveness channel; giving up on supervising it",
+			})
 			return nil, nil, false
 		}
 		if !r.replaceUpstreamIfLive(u.Name, conn, tools, aux, meta, supCtx) {
@@ -1353,6 +1395,15 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 	for _, e := range filterAndRenameTools(name, tools, r.filterFor(name)) {
 		if _, dup := r.tools[e.name]; dup {
 			r.log.Warn("duplicate client-facing tool name skipped", "name", e.name, "upstream", name)
+			// Emitted from under r.mu: allowed here because callLog's mutex is a
+			// leaf (no deadlock is reachable) and merge is a COLD path —
+			// Start/Reload/restart, never a tool call (plan §3.4, §11).
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventCatalogCollision,
+				Upstream: name,
+				Subject:  e.name,
+				Detail:   "duplicate client-facing tool name, keep-first: this upstream's tool is hidden from the client",
+			})
 			continue
 		}
 		r.tools[e.name] = ToolDescriptor{Name: e.name, Upstream: name, Tool: e.tool}
@@ -1369,6 +1420,12 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 		ns := name + NameSeparator + p.Name
 		if _, dup := r.prompts[ns]; dup {
 			r.log.Warn("duplicate client-facing prompt name skipped", "name", ns, "upstream", name)
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventCatalogCollision,
+				Upstream: name,
+				Subject:  ns,
+				Detail:   "duplicate client-facing prompt name, keep-first: this upstream's prompt is hidden from the client",
+			})
 			continue
 		}
 		r.prompts[ns] = PromptDescriptor{Name: ns, Upstream: name, Prompt: p}
@@ -1383,6 +1440,12 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 	for _, res := range aux.resources {
 		if _, dup := r.resources[res.URI]; dup {
 			r.log.Warn("duplicate resource uri skipped", "uri", res.URI, "upstream", name)
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventCatalogCollision,
+				Upstream: name,
+				Subject:  res.URI,
+				Detail:   "duplicate resource uri, keep-first: this upstream's resource is hidden from the client",
+			})
 			continue
 		}
 		r.resources[res.URI] = ResourceDescriptor{URI: res.URI, Upstream: name, Resource: res}
@@ -1398,6 +1461,14 @@ func (r *Registry) mergeLocked(name string, conn Upstream, tools []mcp.Tool, aux
 		if err != nil {
 			r.log.Warn("unusable resource uri template, listed but never matched",
 				"template", tpl.URITemplate, "upstream", name, "err", err)
+			// Detail carries the regexp compiler's message — gateway-side text
+			// about the template's own syntax, not a payload or a secret.
+			r.emitEvent(logging.EventRecord{
+				Event:    logging.EventCatalogBadTemplate,
+				Upstream: name,
+				Subject:  tpl.URITemplate,
+				Detail:   "uri template does not compile; it is listed to the client but will never match a read: " + err.Error(),
+			})
 		}
 		r.resourceTemplates = append(r.resourceTemplates, ResourceTemplateDescriptor{
 			URITemplate: tpl.URITemplate, Upstream: name, Template: tpl, re: re,
@@ -1682,15 +1753,27 @@ func (r *Registry) SubscribeNotifications() (<-chan mcp.Message, func()) {
 // onUpstreamNotification), so the send is strictly non-blocking: a subscriber
 // whose buffer is full has the message dropped — the reader must never stall
 // on a slow client transport.
+// Drops are also journaled as operator events (Stage 18), but NOT from under
+// notifMu: the drop is only counted while the lock is held and reported after
+// the explicit Unlock, so no journal write ever happens inside the notification
+// lock (plan §3.4, §11). The unlock is explicit rather than deferred for exactly
+// that reason.
 func (r *Registry) forwardNotification(msg mcp.Message) {
+	dropped := 0
 	r.notifMu.Lock()
-	defer r.notifMu.Unlock()
 	for _, ch := range r.notifSubs {
 		select {
 		case ch <- msg:
 		default:
 			r.log.Debug("notification subscriber buffer full, dropping", "method", msg.Method)
+			dropped++
 		}
+	}
+	r.notifMu.Unlock()
+
+	for i := 0; i < dropped; i++ {
+		r.noteThrottled(logging.EventNotificationDropped, "", msg.Method,
+			"subscriber buffer full; non-blocking forwarding drops on backpressure")
 	}
 }
 
@@ -2602,6 +2685,12 @@ func (r *Registry) failureSummary() string {
 // Marking phaseClosing first makes any Reload queued behind this lock bail out
 // with ErrClosing instead of relaunching upstreams during shutdown.
 func (r *Registry) Close() error {
+	// Flush the coalesced operator events FIRST, while the journal is still open:
+	// the transports call reg.Close() from inside Serve, which returns before
+	// serve's own deferred callLog.Close() runs (stdio.go / http.go), so these
+	// lines still reach the file.
+	r.flushEvents()
+
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 	r.phase = phaseClosing

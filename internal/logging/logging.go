@@ -52,10 +52,55 @@ type CallRecord struct {
 	Err      string        `json:"error,omitempty"` // sanitized error, no secrets
 }
 
-// CallLog persists CallRecords. Implementations must be safe for concurrent
-// use — many upstream calls run on separate goroutines.
+// EventRecord is one operator-facing event in the same JSON-lines journal
+// CallRecords go to. Kind is the discriminator: call lines never carry it
+// (CallRecord is unchanged, bytes-for-bytes), event lines always say "event".
+//
+// These are the things that used to reach only stderr — invisible in stdio mode,
+// where the MCP client owns the terminal — or only slog's Debug level, silent
+// under the default log_level: info. They carry NO payloads: upstream names,
+// method/tool/prompt names, resource URIs/templates and fixed gateway-authored
+// reasons only (SKILL §6; see the Stage 18 plan §4).
+//
+// Backward compatibility, stated honestly: an OLD binary (<= v0.4.0) reading a
+// NEW journal decodes an event line into a near-empty CallRecord (only Time and
+// Upstream set) and renders it as a sparse ERR line. Hiding event lines from old
+// readers entirely is impossible without corrupting their stream — a
+// type-conflicting line breaks their decoder's resync and eats the NEXT record,
+// which is strictly worse than one sparse line. Read a journal with the same (or
+// a newer) binary that wrote it.
+type EventRecord struct {
+	Time     time.Time `json:"time"`
+	Kind     string    `json:"kind"`               // always KindEvent — the discriminator
+	Event    string    `json:"event"`              // one of the Event* constants below
+	Upstream string    `json:"upstream,omitempty"` // which upstream, when attributable
+	Subject  string    `json:"subject,omitempty"`  // method / tool / uri / template — the thing affected
+	Detail   string    `json:"detail,omitempty"`   // sanitized human-readable reason
+	Count    int       `json:"count,omitempty"`    // occurrences coalesced into this line (absent == 1)
+}
+
+// KindEvent is the value of EventRecord.Kind — the journal's line discriminator.
+const KindEvent = "event"
+
+// Event identifiers. These constants are the single source of names shared by
+// the emitter (internal/registry) and the reader (`mcp-gate logs`).
+const (
+	EventUpstreamStartFailed     = "upstream_start_failed"     // Start: upstream bring-up failed, it is absent from the catalog
+	EventUpstreamGaveUp          = "upstream_gave_up"          // supervisor gave up, upstream dropped from the catalog
+	EventNotificationDropped     = "notification_dropped"      // forwardNotification: subscriber buffer full
+	EventServerRequestDropped    = "server_request_dropped"    // publishServerReq delivered to nobody → the tool call was refused
+	EventSSEStreamUnavailable    = "sse_stream_unavailable"    // HTTP upstream offers no GET SSE: no list_changed from it, ever
+	EventCatalogCollision        = "catalog_collision"         // keep-first: a tool/prompt/resource is hidden from the client
+	EventCatalogBadTemplate      = "catalog_bad_template"      // a URI template is exposed but can never match
+	EventResultTruncationSkipped = "result_truncation_skipped" // max_result_bytes silently did not apply
+)
+
+// CallLog persists CallRecords and operator EventRecords — both go to the same
+// JSON-lines journal, told apart by EventRecord.Kind. Implementations must be
+// safe for concurrent use — many upstream calls run on separate goroutines.
 type CallLog interface {
 	Record(r CallRecord)
+	RecordEvent(e EventRecord)
 	io.Closer
 }
 
@@ -86,7 +131,21 @@ type jsonLog[T any] struct {
 // call start, recordPayload passes time.Now()). Marshaling happens outside the
 // mutex — r is a local copy, so concurrent Records only serialize on the write.
 func (l *jsonLog[T]) Record(r T) {
-	b, err := json.Marshal(r)
+	l.writeLine(r)
+}
+
+// RecordEvent appends one operator EventRecord to the same journal. It is a
+// method on the generic type, so jsonCallLog gets it for free; jsonPayloadLog
+// gets it too, harmlessly — the PayloadLog interface does not ask for it.
+func (l *jsonLog[T]) RecordEvent(e EventRecord) {
+	l.writeLine(e)
+}
+
+// writeLine is the shared body of Record/RecordEvent: marshal outside the mutex
+// (v is the caller's copy, so concurrent writers only serialize on the write),
+// then append one line under mu, honoring the closed flag.
+func (l *jsonLog[T]) writeLine(v any) {
+	b, err := json.Marshal(v)
 	if err != nil {
 		return // records are normally marshalable; ignore defensively
 	}
@@ -243,18 +302,30 @@ func NewPayloadLogWriter(w io.Writer) PayloadLog {
 	return &jsonPayloadLog{w: w}
 }
 
-// ReadRecords decodes CallRecords from a JSON-lines stream (the format
-// NewCallLog writes). It is the read side consumed by the `mcp-gate logs`
-// command. A line that fails to decode is skipped rather than aborting the whole
-// read, so a partially-written trailing line (the writer crashed mid-append)
-// does not hide the records before it. CallRecord is the single shared shape
-// between writer and reader — no parallel struct.
-func ReadRecords(r io.Reader) ([]CallRecord, error) {
+// Entry is one line of the journal: exactly one of the two fields is non-nil.
+type Entry struct {
+	Call  *CallRecord
+	Event *EventRecord
+}
+
+// ReadEntries decodes a JSON-lines journal (the format NewCallLog writes) into
+// its two kinds of lines, preserving file order. It is the read side consumed by
+// `mcp-gate logs`.
+//
+// Each line is first taken as raw JSON, then probed for the "kind"
+// discriminator: absent (or empty) means a CallRecord — that is every line
+// written before Stage 18 and every call line since — and "event" means an
+// EventRecord. A line whose kind is some THIRD, unknown value is skipped
+// entirely: a reader must not invent an interpretation for a type it does not
+// know. A line that fails to decode at all is skipped rather than aborting the
+// whole read, so a partially-written trailing line (the writer crashed
+// mid-append) does not hide the records before it.
+func ReadEntries(r io.Reader) ([]Entry, error) {
 	dec := json.NewDecoder(r)
-	var out []CallRecord
+	var out []Entry
 	for {
-		var rec CallRecord
-		err := dec.Decode(&rec)
+		var raw json.RawMessage
+		err := dec.Decode(&raw)
 		if err == io.EOF {
 			return out, nil
 		}
@@ -266,6 +337,46 @@ func ReadRecords(r io.Reader) ([]CallRecord, error) {
 			}
 			continue
 		}
-		out = append(out, rec)
+		var probe struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			continue // not an object with a string kind — unusable line
+		}
+		switch probe.Kind {
+		case "":
+			var rec CallRecord
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				continue
+			}
+			out = append(out, Entry{Call: &rec})
+		case KindEvent:
+			var ev EventRecord
+			if err := json.Unmarshal(raw, &ev); err != nil {
+				continue
+			}
+			out = append(out, Entry{Event: &ev})
+		default:
+			continue // unknown kind: a future record type this binary cannot read
+		}
 	}
+}
+
+// ReadRecords decodes only the CallRecords of a JSON-lines journal. It is
+// ReadEntries projected onto call lines, kept as its own function because that
+// is what every pre-Stage-18 caller wants and what old journals contain
+// exclusively. CallRecord is the single shared shape between writer and reader —
+// no parallel struct.
+func ReadRecords(r io.Reader) ([]CallRecord, error) {
+	entries, err := ReadEntries(r)
+	if err != nil {
+		return nil, err
+	}
+	var out []CallRecord
+	for _, e := range entries {
+		if e.Call != nil {
+			out = append(out, *e.Call)
+		}
+	}
+	return out, nil
 }

@@ -145,6 +145,17 @@ type httpTransport struct {
 	// registry answers from its own goroutine).
 	onRequest func(method string, id, params json.RawMessage)
 
+	// onStreamUnavailable, when set, is invoked at most once per connection —
+	// from the SSE stream goroutine — when the upstream EXPLICITLY refuses the
+	// GET stream (405/404, or a 200 that is not an event stream). It exists so
+	// the registry can journal an operator event: no GET stream means no
+	// tools/list_changed from this upstream for the life of the gateway process,
+	// a state that was previously visible only as one Info line on stderr.
+	// Same contract as onNotify/onRequest: set once in StartHTTP before any
+	// goroutine exists, cheap, non-blocking, no synchronous call back into the
+	// connection.
+	onStreamUnavailable func()
+
 	// streamCtx/streamCancel bound the lifetime of the GET SSE stream
 	// goroutine, independent of any per-call ctx: Close cancels it and then
 	// waits on streamDone (guarded by mu, below).
@@ -194,8 +205,13 @@ type httpTransport struct {
 // writing the fields into the struct literal before any goroutine exists is
 // what makes them lock-free.
 //
-// With BOTH nil nobody listens to the GET stream, so it is never opened at all.
-func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage)) *Conn {
+// onStreamUnavailable, when non-nil, is called once if the upstream refuses the
+// GET stream outright — the registry turns that into an operator event (Stage
+// 18). nil disables the notification.
+//
+// With BOTH onNotify and onRequest nil nobody listens to the GET stream, so it
+// is never opened at all.
+func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]string, client *http.Client, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage), onStreamUnavailable func()) *Conn {
 	if client == nil {
 		// Each connection gets its OWN client with its own cloned transport.
 		// Sharing one package-level client (the previous design) meant Close on
@@ -222,16 +238,17 @@ func StartHTTP(log *slog.Logger, name, endpoint string, headers map[string]strin
 	close(streamDone)
 	return &Conn{
 		transport: &httpTransport{
-			name:         name,
-			endpoint:     endpoint,
-			log:          log,
-			client:       client,
-			headers:      headers,
-			onNotify:     onNotify,  // must be set before any goroutine exists
-			onRequest:    onRequest, // same rule — see the doc comment
-			streamCtx:    streamCtx,
-			streamCancel: streamCancel,
-			streamDone:   streamDone,
+			name:                name,
+			endpoint:            endpoint,
+			log:                 log,
+			client:              client,
+			headers:             headers,
+			onNotify:            onNotify,  // must be set before any goroutine exists
+			onRequest:           onRequest, // same rule — see the doc comment
+			onStreamUnavailable: onStreamUnavailable,
+			streamCtx:           streamCtx,
+			streamCancel:        streamCancel,
+			streamDone:          streamDone,
 		},
 		gatewayVersion: gatewayVersion,
 	}
@@ -343,6 +360,11 @@ func (c *httpTransport) runSSEStream(ctx context.Context) {
 		if !opened && err == nil {
 			c.log.Info("upstream does not offer an SSE stream; server-initiated notifications disabled",
 				"upstream", c.name)
+			// This branch is terminal — the loop never comes back — so the
+			// callback fires at most once per connection, no throttling needed.
+			if c.onStreamUnavailable != nil {
+				c.onStreamUnavailable()
+			}
 			return
 		}
 		if opened && time.Since(start) >= sseStreamMaxBackoff {

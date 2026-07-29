@@ -14,7 +14,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"os"
@@ -601,8 +604,30 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	// STRICT parsing (Stage 18): an unknown or misspelled key is a startup
+	// error, not a silently ignored line. The class of bug this closes is
+	// specific and had already bitten: `enabld: false` used to leave the
+	// upstream ENABLED, with nothing anywhere saying why. yaml.v3 names both the
+	// offending key and its line number, so no home-grown spell-checking is
+	// needed on top.
+	//
+	// Anchors and merge keys (<<:) keep working under KnownFields — verified,
+	// including struct elements of the upstreams list. Note the one behavioural
+	// gap between the two APIs: on an EMPTY file Decode returns io.EOF where
+	// Unmarshal left a zero Config, so that case is restored explicitly (the
+	// zero Config then fails validation with its own, clearer message).
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		if errors.Is(err, io.EOF) {
+			cfg = Config{}
+		} else {
+			var typeErr *yaml.TypeError
+			if errors.As(err, &typeErr) {
+				return nil, fmt.Errorf("parse config %q: %w\nunknown or misspelled config keys are fatal since v0.5.0; fix or remove the keys listed above", path, err)
+			}
+			return nil, fmt.Errorf("parse config %q: %w", path, err)
+		}
 	}
 	// Expand ${VAR} / $VAR against the environment only in the fields
 	// documented as carrying secrets (auth_token, upstream env/headers
