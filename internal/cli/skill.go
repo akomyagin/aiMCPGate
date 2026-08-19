@@ -88,6 +88,13 @@ func newSkillCmd() *cobra.Command {
 			"your own file instead (e.g. to add org-specific policy notes or a translation) —\n" +
 			"copy this command's default output as a starting point.\n\n" +
 			"Typical use: mcp-gate skill > .claude/skills/mcp-gate/SKILL.md",
+		// The body always goes to STDOUT, never through cmd.Print: cobra
+		// resolves Print through OutOrStderr(), which is os.Stderr in every real
+		// run, and the README's own instruction is a redirect —
+		// `mcp-gate skill > .claude/skills/mcp-gate/SKILL.md`. That produced a
+		// ZERO-BYTE file while the whole document went to the terminal via
+		// stderr, so the breakage looked like success. Same defect class as the
+		// logs listing fixed in Stage 18.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := loadConfig(*configPath)
 			if err != nil {
@@ -97,20 +104,20 @@ func newSkillCmd() *cobra.Command {
 					// deployment to be useful, so fall back to the built-in
 					// text instead of erroring. An explicit --config that
 					// doesn't exist still errors below.
-					cmd.Print(skillBody)
+					fmt.Fprint(cmd.OutOrStdout(), skillBody)
 					return nil
 				}
 				return err
 			}
 			if cfg.SkillFile == "" {
-				cmd.Print(skillBody)
+				fmt.Fprint(cmd.OutOrStdout(), skillBody)
 				return nil
 			}
 			data, err := os.ReadFile(cfg.SkillFile)
 			if err != nil {
 				return fmt.Errorf("read skill_file %q: %w", cfg.SkillFile, err)
 			}
-			cmd.Print(string(data))
+			fmt.Fprint(cmd.OutOrStdout(), string(data))
 			return nil
 		},
 	}
