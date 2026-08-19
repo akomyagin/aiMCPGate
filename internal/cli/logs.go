@@ -86,7 +86,7 @@ func newLogsCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&file, "file", "f", "", "path to the JSON-lines call log (overrides config's log_file)")
 	cmd.Flags().IntVarP(&tail, "tail", "n", 50, "show at most the last N matching records (0 = all)")
 	cmd.Flags().StringVar(&upstreamFilt, "upstream", "", "only records for this upstream (applies to calls and events alike)")
-	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (namespaced name); call-only — operator events are excluded while it is set")
+	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (as sent by the client — namespaced for a routed call, whatever the client asked for otherwise); call-only — operator events are excluded while it is set")
 	cmd.Flags().StringVar(&statusFilt, "status", "", "filter by outcome: ok | err (default: all); call-only — operator events are excluded while it is set")
 	cmd.Flags().BoolVar(&eventsOnly, "events", false, "show ONLY operator events (upstream failures, dropped notifications, catalog collisions…), not tool calls")
 	cmd.Flags().BoolVar(&follow, "follow", false, "after printing the tail, keep watching the file and print new records as they are appended (Ctrl-C to stop)")
@@ -573,6 +573,13 @@ func formatEvent(e logging.EventRecord) string {
 // Strings made entirely of printable runes are returned VERBATIM, so the normal
 // output keeps its exact former shape; only a string that actually carries a
 // control character pays the strconv.Quote escaping.
+//
+// This is a best-effort guard, not an airtight one: invalid UTF-8 passes
+// through unquoted too, because ranging over a string yields U+FFFD on a bad
+// byte and strconv.IsPrint(U+FFFD) is true. In practice this needs a journal
+// file hand-edited to contain invalid UTF-8 — a line this binary itself wrote
+// cannot carry it, since encoding/json replaces invalid UTF-8 during
+// marshaling before the bytes ever reach disk.
 //
 // It IS applied to a call record's Tool as well, in formatRecord and in the
 // --stats table. That debt was named and deferred while every CallRecord.Tool

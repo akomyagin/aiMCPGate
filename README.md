@@ -84,7 +84,7 @@ they need; HTTP upstreams work out of the box (CA certificates are included).
 introspect the gateway without any real upstream — never use them in a real
 deployment.
 
-### Running CLI commands against a container
+### Running CLI commands inside a container
 
 `doctor`, `catalog`, `call` and `logs` are how an operator inspects a
 deployment. Three facts decide how they must be invoked inside a container:
@@ -122,9 +122,12 @@ docker exec mcp-gate /mcp-gate call demo__echo '{"text":"hi"}' -c /config.yaml
 docker exec mcp-gate /mcp-gate logs    -c /config.yaml --tail 50
 ```
 
-The commands assume a container started with `--name mcp-gate` and your config
-mounted on the default path `/config.yaml`, as in the `docker run` example
-above; `demo__echo` stands in for a tool from your own catalog. A few caveats:
+The commands assume a container started **detached and named**, e.g.
+`docker run -d --name mcp-gate …` — unlike the foreground `docker run --rm -i
+…` example above, which exits as soon as its stdio client disconnects and
+leaves nothing for `docker exec` to reach. The config is assumed mounted on
+the default path `/config.yaml`, as in that same example; `demo__echo` stands
+in for a tool from your own catalog. A few caveats:
 
 - **`logs` is the exception to fact 3**: it reads the journal FILE the running
   gateway writes, so it does reflect the live process. That requires `log_file`
@@ -367,6 +370,16 @@ Two practical notes:
 
 Nothing about this is visible to the MCP client: no error codes, result bodies
 or capabilities changed — the events go to the journal only.
+
+**A call the gateway could not route is not an event — it is an ordinary
+failed CALL line.** A client asking for a tool name no upstream provides gets
+a `CallRecord` like any other, with its `upstream` column set to the sentinel
+`(unrouted)`; `mcp-gate logs --upstream '(unrouted)'` selects exactly those
+lines and nothing else. A second, distinct case looks almost the same but
+names a real upstream instead: the route exists (the tool is in the catalog)
+but the upstream's connection is gone (restarting or dropped) — that line
+carries the real upstream name, so filter for it with `--upstream <name>` as
+usual rather than the sentinel.
 
 ## Reloading config (SIGHUP)
 

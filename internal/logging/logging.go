@@ -301,20 +301,36 @@ const MaxNameRunes = 256
 // the unknown-tool record is the first line carrying raw client input, and
 // without a bound one request can write one journal line of arbitrary size.
 // Counting RUNES, not bytes, keeps the result valid UTF-8. A clamped name gets a
-// trailing "…" so an operator can tell truncation from a genuinely long name;
-// the marker is printable, so it survives printableField unquoted. Strings
-// within the bound are returned VERBATIM — the normal path is untouched.
+// trailing "…" as a hint an operator can use to suspect truncation — not a
+// guarantee: a client-supplied name that already ends in "…" is indistinguishable
+// from a clamped one by inspection alone. The marker is printable, so it
+// survives printableField unquoted. Strings within the bound are returned
+// VERBATIM — the normal path is untouched.
 func ClampName(s string) string {
 	// Fast path: a byte length within the bound cannot exceed it in runes, so
 	// the common case never allocates a []rune.
 	if len(s) <= MaxNameRunes {
 		return s
 	}
-	r := []rune(s)
-	if len(r) <= MaxNameRunes {
-		return s
+	// Count runes without materializing a []rune over the whole string: ranging
+	// over s yields each rune's BYTE offset in i, so once the count reaches the
+	// bound, i is already the byte index to cut at. This keeps the work
+	// O(min(len(s), MaxNameRunes+1)) and allocation-free — s came from the
+	// client and is bounded only by the transport frame (stdio: 32 MiB, see
+	// internal/mcp/codec.go), so a []rune(s) fast path would materialize up to
+	// ~4 bytes per byte of input on one call.
+	n := 0
+	for i := range s {
+		if n == MaxNameRunes {
+			return s[:i] + "…"
+		}
+		n++
 	}
-	return string(r[:MaxNameRunes]) + "…"
+	// Ranged over every byte without hitting the bound: s has more bytes than
+	// MaxNameRunes (the fast path above already excluded len(s) <= MaxNameRunes)
+	// but not more RUNES — e.g. a mix of multi-byte and single-byte runes that
+	// still lands at or under the bound. Verbatim, like the fast path.
+	return s
 }
 
 // PayloadLog persists PayloadRecords. Implementations must be safe for

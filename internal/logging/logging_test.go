@@ -383,6 +383,17 @@ func TestClampName(t *testing.T) {
 		{name: "short ascii", in: "demo__echo", want: "demo__echo"},
 		{name: "exactly the bound", in: strings.Repeat("a", MaxNameRunes), want: strings.Repeat("a", MaxNameRunes)},
 		{
+			// Byte length exceeds the bound (400 bytes) but rune count does not
+			// (200 runes of "щ", 2 bytes each) — the middle branch: the fast
+			// byte-length check cannot short-circuit, but the rune walk still
+			// lands within MaxNameRunes, so the name comes back verbatim,
+			// unclamped. This is exactly the class ClampName exists to protect:
+			// counting in runes, not bytes.
+			name: "multibyte under the bound in runes but over it in bytes",
+			in:   strings.Repeat("щ", 200),
+			want: strings.Repeat("щ", 200),
+		},
+		{
 			name:    "one rune over the bound",
 			in:      strings.Repeat("a", MaxNameRunes+1),
 			want:    strings.Repeat("a", MaxNameRunes) + marker,
