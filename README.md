@@ -168,9 +168,10 @@ mcp-gate token --generate
 # print the auth token currently set in the config:
 mcp-gate token --config ./config-http.yaml
 
-# print ready-to-paste MCP client config snippets (Claude Code / Cursor); requires
-# transport: http in the config, and includes the Bearer header when auth_token is set:
-mcp-gate client-config --config ./config-http.yaml
+# print ready-to-paste MCP client config snippets (Claude Code / Cursor / Claude
+# Desktop) for whichever transport the config uses: a launch command for stdio, or
+# the endpoint URL plus the Bearer header (when auth_token is set) for http:
+mcp-gate client-config --config ./config.yaml
 
 # print a SKILL.md teaching an agent how to use the aggregated catalog
 # (built-in text by default; overridable via skill_file in the config):
