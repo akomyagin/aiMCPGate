@@ -84,6 +84,67 @@ they need; HTTP upstreams work out of the box (CA certificates are included).
 introspect the gateway without any real upstream — never use them in a real
 deployment.
 
+### Running CLI commands inside a container
+
+`doctor`, `catalog`, `call` and `logs` are how an operator inspects a
+deployment. Three facts decide how they must be invoked inside a container:
+
+1. **The binary is `/mcp-gate` and it is NOT in `$PATH`.** The
+   [`Dockerfile`](Dockerfile) does `COPY mcp-gate /mcp-gate` and
+   `ENTRYPOINT ["/mcp-gate"]` — nothing puts it on a search path (check the
+   `Dockerfile` if this ever looks wrong). So the obvious form fails:
+
+   ```console
+   $ docker exec mcp-gate mcp-gate catalog -c /config.yaml
+   OCI runtime exec failed: exec failed: unable to start container process: exec: "mcp-gate": executable file not found in $PATH
+   ```
+
+   Use the absolute path instead — that is the only difference.
+2. **The image is distroless, so there is no shell at all.** The base is
+   `gcr.io/distroless/static-debian12:nonroot`, which ships the binary and CA
+   certificates and nothing else. `docker exec mcp-gate sh -c '…'` fails the
+   same way `sh` is simply not there, and there is no `ls`/`cat` to look around
+   with. Keep pipes, globbing and redirection on the HOST side of the command.
+3. **`docker exec` starts a NEW process; it does not query the running
+   `serve`.** `doctor`, `catalog` and `call` build their own registry, open
+   their own connections to the upstreams, report and exit. Their output is
+   therefore upstream reachability *right now*, not the state of the live
+   gateway: if the running process lost an upstream and dropped it from its
+   catalog, these commands will not show that. They also keep the call journal
+   clean — they run with journaling disabled, so a `call` you make this way does
+   not appear in `logs`.
+
+```bash
+docker exec mcp-gate /mcp-gate version
+docker exec mcp-gate /mcp-gate doctor  -c /config.yaml
+docker exec mcp-gate /mcp-gate catalog -c /config.yaml
+docker exec mcp-gate /mcp-gate call demo__echo '{"text":"hi"}' -c /config.yaml
+docker exec mcp-gate /mcp-gate logs    -c /config.yaml --tail 50
+```
+
+The commands assume a container started **detached and named**, e.g.
+`docker run -d --name mcp-gate …` — unlike the foreground `docker run --rm -i
+…` example above, which exits as soon as its stdio client disconnects and
+leaves nothing for `docker exec` to reach. The config is assumed mounted on
+the default path `/config.yaml`, as in that same example; `demo__echo` stands
+in for a tool from your own catalog. A few caveats:
+
+- **`logs` is the exception to fact 3**: it reads the journal FILE the running
+  gateway writes, so it does reflect the live process. That requires `log_file`
+  in the mounted config to point at a path visible inside the container, and a
+  volume mounted there — otherwise the journal goes to the container's stderr
+  (i.e. to `docker logs`) and `mcp-gate logs` has nothing to read. `-c` is what
+  tells it where the journal is; `--file` overrides it.
+- **This is really about HTTP mode.** In stdio mode the MCP client spawns and
+  owns the container, so there is usually no long-lived container to `exec`
+  into. A gateway you can inspect is one started separately
+  (`docker run -d --name mcp-gate …`) with `transport: http`.
+- **HTTP mode needs a non-default `listen_addr`.** The default is
+  `127.0.0.1:28080` — loopback INSIDE the container, unreachable from the host
+  even with `-p`. Set `listen_addr: 0.0.0.0:<port>` in the config; the gateway
+  then refuses to start without an `auth_token`, on purpose ("the HTTP endpoint
+  would be reachable from the network without authentication").
+
 ## Why
 
 An active MCP user typically has several servers configured (filesystem,
@@ -309,6 +370,16 @@ Two practical notes:
 
 Nothing about this is visible to the MCP client: no error codes, result bodies
 or capabilities changed — the events go to the journal only.
+
+**A call the gateway could not route is not an event — it is an ordinary
+failed CALL line.** A client asking for a tool name no upstream provides gets
+a `CallRecord` like any other, with its `upstream` column set to the sentinel
+`(unrouted)`; `mcp-gate logs --upstream '(unrouted)'` selects exactly those
+lines and nothing else. A second, distinct case looks almost the same but
+names a real upstream instead: the route exists (the tool is in the catalog)
+but the upstream's connection is gone (restarting or dropped) — that line
+carries the real upstream name, so filter for it with `--upstream <name>` as
+usual rather than the sentinel.
 
 ## Reloading config (SIGHUP)
 

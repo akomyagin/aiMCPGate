@@ -55,7 +55,10 @@ func newLogsCmd() *cobra.Command {
 			"--follow keeps watching the file and prints new records as they are appended;\n" +
 			"--stats aggregates ALL matching records into a per-(upstream, tool) table\n" +
 			"(count, error rate, p50/p95 latency) instead of printing them, followed by a\n" +
-			"per-event table when the journal has events.",
+			"per-event table when the journal has events.\n" +
+			"A call the gateway could not route (a tool name no upstream provides) is a\n" +
+			"normal failed CALL line whose upstream is the sentinel " + logging.UpstreamUnrouted + ", so\n" +
+			"--upstream '" + logging.UpstreamUnrouted + "' selects exactly those and nothing else.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := resolveLogFile(file, *configPath)
 			if err != nil {
@@ -83,7 +86,7 @@ func newLogsCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&file, "file", "f", "", "path to the JSON-lines call log (overrides config's log_file)")
 	cmd.Flags().IntVarP(&tail, "tail", "n", 50, "show at most the last N matching records (0 = all)")
 	cmd.Flags().StringVar(&upstreamFilt, "upstream", "", "only records for this upstream (applies to calls and events alike)")
-	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (namespaced name); call-only — operator events are excluded while it is set")
+	cmd.Flags().StringVar(&toolFilt, "tool", "", "only records for this tool (as sent by the client — namespaced for a routed call, whatever the client asked for otherwise); call-only — operator events are excluded while it is set")
 	cmd.Flags().StringVar(&statusFilt, "status", "", "filter by outcome: ok | err (default: all); call-only — operator events are excluded while it is set")
 	cmd.Flags().BoolVar(&eventsOnly, "events", false, "show ONLY operator events (upstream failures, dropped notifications, catalog collisions…), not tool calls")
 	cmd.Flags().BoolVar(&follow, "follow", false, "after printing the tail, keep watching the file and print new records as they are appended (Ctrl-C to stop)")
@@ -367,7 +370,7 @@ func runLogsStats(cmd *cobra.Command, path string, filt recordFilter) error {
 		fmt.Fprintln(w, "UPSTREAM\tTOOL\tCOUNT\tERROR%\tP50\tP95")
 		for _, s := range aggregateStats(records) {
 			fmt.Fprintf(w, "%s\t%s\t%d\t%.1f%%\t%s\t%s\n",
-				s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
+				s.upstream, printableField(s.tool), s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
 		}
 	}
 	switch {
@@ -502,7 +505,7 @@ func formatRecord(rec logging.CallRecord) string {
 		status,
 		rec.Upstream,
 		rec.Method,
-		rec.Tool,
+		printableField(rec.Tool),
 		durMS(rec.Duration),
 	)
 	if rec.Err != "" {
@@ -569,8 +572,22 @@ func formatEvent(e logging.EventRecord) string {
 //
 // Strings made entirely of printable runes are returned VERBATIM, so the normal
 // output keeps its exact former shape; only a string that actually carries a
-// control character pays the strconv.Quote escaping. Deliberately not applied to
-// formatRecord's rec.Tool: that is a pre-existing class, left as named debt.
+// control character pays the strconv.Quote escaping.
+//
+// This is a best-effort guard, not an airtight one: invalid UTF-8 passes
+// through unquoted too, because ranging over a string yields U+FFFD on a bad
+// byte and strconv.IsPrint(U+FFFD) is true. In practice this needs a journal
+// file hand-edited to contain invalid UTF-8 — a line this binary itself wrote
+// cannot carry it, since encoding/json replaces invalid UTF-8 during
+// marshaling before the bytes ever reach disk.
+//
+// It IS applied to a call record's Tool as well, in formatRecord and in the
+// --stats table. That debt was named and deferred while every CallRecord.Tool
+// was gateway-minted (a namespaced catalog name); the unknown-tool record ended
+// that — its Tool is whatever bytes the client put in tools/call, so the debt
+// came due. The fix lives on the READER, not the writer, for two reasons: this
+// function is verbatim for printable strings, so no existing output moves by a
+// byte, and the protection then also covers journals written by OLDER binaries.
 func printableField(s string) string {
 	for _, r := range s {
 		if !strconv.IsPrint(r) {

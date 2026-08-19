@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestCallLogRoundTrip writes records through the JSON-lines writer and reads
@@ -360,5 +361,70 @@ func TestEventRecordOccurrences(t *testing.T) {
 		if got := (EventRecord{Count: tc.count}).Occurrences(); got != tc.want {
 			t.Errorf("EventRecord{Count: %d}.Occurrences() = %d, want %d", tc.count, got, tc.want)
 		}
+	}
+}
+
+// TestClampName pins the bound on the first journal field that carries raw
+// client input (CallRecord.Tool of an unrouted call). The two properties that
+// matter: names within the bound come back VERBATIM (the normal path must not
+// change), and a clamped name stays valid UTF-8 — which is why ClampName counts
+// runes and not bytes.
+func TestClampName(t *testing.T) {
+	const marker = "…"
+	multi := strings.Repeat("щ", MaxNameRunes+10) // 2 bytes per rune
+
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		clamped bool
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "short ascii", in: "demo__echo", want: "demo__echo"},
+		{name: "exactly the bound", in: strings.Repeat("a", MaxNameRunes), want: strings.Repeat("a", MaxNameRunes)},
+		{
+			// Byte length exceeds the bound (400 bytes) but rune count does not
+			// (200 runes of "щ", 2 bytes each) — the middle branch: the fast
+			// byte-length check cannot short-circuit, but the rune walk still
+			// lands within MaxNameRunes, so the name comes back verbatim,
+			// unclamped. This is exactly the class ClampName exists to protect:
+			// counting in runes, not bytes.
+			name: "multibyte under the bound in runes but over it in bytes",
+			in:   strings.Repeat("щ", 200),
+			want: strings.Repeat("щ", 200),
+		},
+		{
+			name:    "one rune over the bound",
+			in:      strings.Repeat("a", MaxNameRunes+1),
+			want:    strings.Repeat("a", MaxNameRunes) + marker,
+			clamped: true,
+		},
+		{
+			name:    "multibyte runes over the bound",
+			in:      multi,
+			want:    strings.Repeat("щ", MaxNameRunes) + marker,
+			clamped: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClampName(tc.in)
+			if got != tc.want {
+				t.Errorf("ClampName(%d runes) = %q…, want %q…", utf8.RuneCountInString(tc.in), got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("ClampName produced invalid UTF-8: %q", got)
+			}
+			if tc.clamped {
+				if n := utf8.RuneCountInString(got); n != MaxNameRunes+1 {
+					t.Errorf("clamped name has %d runes, want %d (bound + the marker)", n, MaxNameRunes+1)
+				}
+				if !strings.HasSuffix(got, marker) {
+					t.Errorf("clamped name %q has no truncation marker", got)
+				}
+			} else if got != tc.in {
+				t.Errorf("name within the bound was not returned verbatim: %q != %q", got, tc.in)
+			}
+		})
 	}
 }

@@ -794,3 +794,102 @@ func TestFormatEventWithSubjectIsUnchanged(t *testing.T) {
 		t.Errorf("event line with a subject changed:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+// TestFormatRecordEscapesControlCharsInTool closes the debt printableField's
+// comment used to name: a CallRecord.Tool was gateway-minted until the
+// unknown-tool record started journaling whatever name the CLIENT asked for. A
+// "\n" in one forges a second output line an operator cannot tell from a real
+// journal entry; an ESC repaints their terminal.
+func TestFormatRecordEscapesControlCharsInTool(t *testing.T) {
+	base := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+
+	forged := formatRecord(logging.CallRecord{
+		Time: base, Upstream: logging.UpstreamUnrouted, Method: "tools/call",
+		Tool: "evil\n2026-07-29T10:00:00Z  ok    ghost         tools/call          fake  0ms\x1b[31m",
+	})
+	if strings.Contains(forged, "\n") {
+		t.Errorf("the tool name forged a second output line:\n%q", forged)
+	}
+	if strings.Contains(forged, "\x1b") {
+		t.Errorf("a raw ESC reached the terminal:\n%q", forged)
+	}
+	if !strings.Contains(forged, `\n`) {
+		t.Errorf("the newline was not escaped, so nothing is pinned here:\n%q", forged)
+	}
+	if !strings.Contains(forged, "evil") {
+		t.Errorf("the name itself is gone from the line:\n%q", forged)
+	}
+
+	// The other half: an ordinary name renders byte-for-byte as it did before the
+	// escaping was introduced. The literal is the pre-change output.
+	const want = "2026-07-29T10:00:00Z  ok    demo          tools/call          demo__echo  12ms"
+	got := formatRecord(logging.CallRecord{
+		Time: base, Upstream: "demo", Method: "tools/call", Tool: "demo__echo",
+		OK: true, Duration: 12 * time.Millisecond,
+	})
+	if got != want {
+		t.Errorf("an ordinary call line changed shape:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStatsEscapesControlCharsInTool is the same guard on the other place a tool
+// name reaches the terminal: the --stats table.
+func TestStatsEscapesControlCharsInTool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "calls.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := logging.NewCallLogWriter(f)
+	log.Record(logging.CallRecord{
+		Time: time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC), Upstream: logging.UpstreamUnrouted,
+		Method: "tools/call", Tool: "evil\nghost                 (unrouted)  1  0.0%  0ms  0ms\x1b[31m",
+		Err: "unknown tool",
+	})
+	_ = f.Close()
+
+	out := runLogsCmd(t, "--file", path, "--stats")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 { // header + the single aggregated row
+		t.Fatalf("one journal record produced %d table lines — the tool name forged extra rows:\n%s", len(lines), out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("a raw ESC reached the terminal:\n%q", out)
+	}
+	if !strings.Contains(out, `\n`) {
+		t.Errorf("the newline was not escaped, so nothing is pinned here:\n%s", out)
+	}
+}
+
+// TestLogsSelectsUnroutedCallsBySentinel is the operator-facing half of the
+// (unrouted) decision: the sentinel exists so that "show me every call that
+// matched no upstream" is one exact query. It also pins that the sentinel can
+// never collide with a real upstream name, which config validates against
+// ^[a-zA-Z0-9_-]+$ — parentheses can never match.
+func TestLogsSelectsUnroutedCallsBySentinel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "calls.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := logging.NewCallLogWriter(f)
+	log.Record(logging.CallRecord{Upstream: "demo", Method: "tools/call", Tool: "demo__echo", OK: true})
+	log.Record(logging.CallRecord{
+		Upstream: logging.UpstreamUnrouted, Method: "tools/call", Tool: "nope__thing",
+		OK: false, Err: "unknown tool: no upstream in the catalog provides this name",
+	})
+	_ = f.Close()
+
+	for _, args := range [][]string{
+		{"--file", path, "--upstream", logging.UpstreamUnrouted},
+		{"--file", path, "--status", "err"},
+	} {
+		out := runLogsCmd(t, args...)
+		if !strings.Contains(out, "nope__thing") {
+			t.Errorf("logs %v did not select the unrouted call:\n%s", args, out)
+		}
+		if strings.Contains(out, "demo__echo") {
+			t.Errorf("logs %v also selected the successful call:\n%s", args, out)
+		}
+	}
+}

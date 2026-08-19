@@ -109,6 +109,15 @@ const (
 	EventResultTruncationSkipped = "result_truncation_skipped" // max_result_bytes silently did not apply
 )
 
+// UpstreamUnrouted is the CallRecord.Upstream value of a call the gateway could
+// not route to any upstream at all — a client asking for a tool name no upstream
+// provides. It is deliberately unlike any real upstream name: config validates
+// those against ^[a-zA-Z0-9_-]+$ (config.go), which parentheses can never match,
+// so `mcp-gate logs --upstream '(unrouted)'` selects exactly these lines and
+// nothing else. Empty string was rejected: it reads as "field not set" and
+// --upstream "" means "no filter", so the lines would not be selectable at all.
+const UpstreamUnrouted = "(unrouted)"
+
 // CallLog persists CallRecords and operator EventRecords — both go to the same
 // JSON-lines journal, told apart by EventRecord.Kind. Implementations must be
 // safe for concurrent use — many upstream calls run on separate goroutines.
@@ -280,6 +289,48 @@ func MaskSecrets(raw json.RawMessage) json.RawMessage {
 		return raw // unreachable in practice: obj came from valid JSON
 	}
 	return b
+}
+
+// MaxNameRunes bounds a client-supplied name written into the journal. 256 is
+// far above any real namespaced tool name (<upstream>__<tool>, both short by
+// construction), so ClampName never fires on legitimate traffic.
+const MaxNameRunes = 256
+
+// ClampName bounds a name that came from the CLIENT before it is journaled.
+// Until this fix every CallRecord.Tool was gateway-minted and therefore bounded;
+// the unknown-tool record is the first line carrying raw client input, and
+// without a bound one request can write one journal line of arbitrary size.
+// Counting RUNES, not bytes, keeps the result valid UTF-8. A clamped name gets a
+// trailing "…" as a hint an operator can use to suspect truncation — not a
+// guarantee: a client-supplied name that already ends in "…" is indistinguishable
+// from a clamped one by inspection alone. The marker is printable, so it
+// survives printableField unquoted. Strings within the bound are returned
+// VERBATIM — the normal path is untouched.
+func ClampName(s string) string {
+	// Fast path: a byte length within the bound cannot exceed it in runes, so
+	// the common case never allocates a []rune.
+	if len(s) <= MaxNameRunes {
+		return s
+	}
+	// Count runes without materializing a []rune over the whole string: ranging
+	// over s yields each rune's BYTE offset in i, so once the count reaches the
+	// bound, i is already the byte index to cut at. This keeps the work
+	// O(min(len(s), MaxNameRunes+1)) and allocation-free — s came from the
+	// client and is bounded only by the transport frame (stdio: 32 MiB, see
+	// internal/mcp/codec.go), so a []rune(s) fast path would materialize up to
+	// ~4 bytes per byte of input on one call.
+	n := 0
+	for i := range s {
+		if n == MaxNameRunes {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	// Ranged over every byte without hitting the bound: s has more bytes than
+	// MaxNameRunes (the fast path above already excluded len(s) <= MaxNameRunes)
+	// but not more RUNES — e.g. a mix of multi-byte and single-byte runes that
+	// still lands at or under the bound. Verbatim, like the fast path.
+	return s
 }
 
 // PayloadLog persists PayloadRecords. Implementations must be safe for

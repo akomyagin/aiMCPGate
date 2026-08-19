@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -259,6 +261,52 @@ func TestLazyGateCallReachesUpstream(t *testing.T) {
 	resp, _ = callToolRaw(t, c, "gate_call", json.RawMessage(`{"arguments":{}}`))
 	if resp.Error == nil || resp.Error.Code != mcp.CodeInvalidParams {
 		t.Errorf("gate_call without name: error = %+v, want code %d", resp.Error, mcp.CodeInvalidParams)
+	}
+}
+
+// TestLazyGateCallOfUnknownToolIsJournaled pins plan §3.4's claim that the
+// unrouted-call journaling fix (DEFECT 3) also covers lazy mode: gate_call
+// unwraps and funnels into the ordinary Registry.CallTool path (as
+// TestLazyGateCallReachesUpstream already shows for the happy path and the
+// error-return path), so an unknown inner name must produce exactly the same
+// journal line a direct unrouted call would — the dispatcher must not swallow
+// or rewrite the record on its way into the registry. Unlike
+// TestLazyGateCallReachesUpstream, this test wires a REAL CallLog (that one
+// runs with callLog == nil, so it cannot see the journal at all).
+func TestLazyGateCallOfUnknownToolIsJournaled(t *testing.T) {
+	cfg := lazyTestConfig(t, "search", config.CatalogModeLazy, 0)
+	var logBuf bytes.Buffer
+	c, cancel, done := startServerWithConfig(t, cfg, logging.NewCallLogWriter(&logBuf))
+	defer func() { cancel(); <-done }()
+
+	const unknown = "nope__nope"
+	resp, _ := callToolRaw(t, c, "gate_call", json.RawMessage(`{"name":"`+unknown+`"}`))
+	if resp.Error == nil {
+		t.Fatal("gate_call of unknown inner tool must return a JSON-RPC error")
+	}
+
+	entries, err := logging.ReadEntries(&logBuf)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	var calls []logging.CallRecord
+	for _, e := range entries {
+		if e.Call != nil {
+			calls = append(calls, *e.Call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("journal has %d call records, want exactly 1; journal:\n%s", len(calls), logBuf.String())
+	}
+	rec := calls[0]
+	if rec.Upstream != logging.UpstreamUnrouted {
+		t.Errorf("upstream = %q, want the %q sentinel", rec.Upstream, logging.UpstreamUnrouted)
+	}
+	if rec.Tool != unknown {
+		t.Errorf("tool = %q, want %q", rec.Tool, unknown)
+	}
+	if rec.OK {
+		t.Errorf("ok = true, want false for an unroutable call")
 	}
 }
 
