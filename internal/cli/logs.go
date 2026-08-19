@@ -55,7 +55,10 @@ func newLogsCmd() *cobra.Command {
 			"--follow keeps watching the file and prints new records as they are appended;\n" +
 			"--stats aggregates ALL matching records into a per-(upstream, tool) table\n" +
 			"(count, error rate, p50/p95 latency) instead of printing them, followed by a\n" +
-			"per-event table when the journal has events.",
+			"per-event table when the journal has events.\n" +
+			"A call the gateway could not route (a tool name no upstream provides) is a\n" +
+			"normal failed CALL line whose upstream is the sentinel " + logging.UpstreamUnrouted + ", so\n" +
+			"--upstream '" + logging.UpstreamUnrouted + "' selects exactly those and nothing else.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := resolveLogFile(file, *configPath)
 			if err != nil {
@@ -367,7 +370,7 @@ func runLogsStats(cmd *cobra.Command, path string, filt recordFilter) error {
 		fmt.Fprintln(w, "UPSTREAM\tTOOL\tCOUNT\tERROR%\tP50\tP95")
 		for _, s := range aggregateStats(records) {
 			fmt.Fprintf(w, "%s\t%s\t%d\t%.1f%%\t%s\t%s\n",
-				s.upstream, s.tool, s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
+				s.upstream, printableField(s.tool), s.count, s.errRate(), durMS(s.p50), durMS(s.p95))
 		}
 	}
 	switch {
@@ -502,7 +505,7 @@ func formatRecord(rec logging.CallRecord) string {
 		status,
 		rec.Upstream,
 		rec.Method,
-		rec.Tool,
+		printableField(rec.Tool),
 		durMS(rec.Duration),
 	)
 	if rec.Err != "" {
@@ -569,8 +572,15 @@ func formatEvent(e logging.EventRecord) string {
 //
 // Strings made entirely of printable runes are returned VERBATIM, so the normal
 // output keeps its exact former shape; only a string that actually carries a
-// control character pays the strconv.Quote escaping. Deliberately not applied to
-// formatRecord's rec.Tool: that is a pre-existing class, left as named debt.
+// control character pays the strconv.Quote escaping.
+//
+// It IS applied to a call record's Tool as well, in formatRecord and in the
+// --stats table. That debt was named and deferred while every CallRecord.Tool
+// was gateway-minted (a namespaced catalog name); the unknown-tool record ended
+// that — its Tool is whatever bytes the client put in tools/call, so the debt
+// came due. The fix lives on the READER, not the writer, for two reasons: this
+// function is verbatim for printable strings, so no existing output moves by a
+// byte, and the protection then also covers journals written by OLDER binaries.
 func printableField(s string) string {
 	for _, r := range s {
 		if !strconv.IsPrint(r) {

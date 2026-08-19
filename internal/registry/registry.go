@@ -65,6 +65,18 @@ var ErrUnknownResource = errors.New("unknown resource")
 // ErrUnknownResource, for completion/complete.
 var ErrUnknownCompletionRef = errors.New("unknown completion ref")
 
+// errUnroutableTool / errToolWithoutConn are the JOURNAL's reasons for a
+// tools/call that never reached an upstream. They are NEVER returned to the
+// client: the client-facing text stays `unknown tool %q` for both cases on
+// purpose — telling a client that the tool exists but its upstream is down
+// leaks the gateway's topology (the same rule CallTool's doc comment already
+// states for upstream names and raw transport errors). Package-level values, so
+// the journaling branch allocates nothing.
+var (
+	errUnroutableTool  = errors.New("unknown tool: no upstream in the catalog provides this name")
+	errToolWithoutConn = errors.New("tool is routed but its upstream has no live connection")
+)
+
 // phase is the registry's lifecycle position, guarded by lifecycleMu. It gates
 // Reload so it can only run between a completed Start and the beginning of
 // Close (see ErrNotStarted / ErrClosing).
@@ -2517,6 +2529,29 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, m
 	r.mu.RUnlock()
 
 	if !ok || conn == nil {
+		// Journal the attempt (metadata only — never the arguments), so a client
+		// hammering a typo'd name is visible to the operator: until this fix that
+		// branch returned in silence — r.audit lives inside callUpstream, which is
+		// never reached from here (POST_MVP_PLAN, DEFECT 3).
+		//
+		// r.mu is ALREADY released above, and that is load-bearing, not incidental:
+		// r.audit ends in a write(2) on the journal, which with log_file unset is
+		// os.Stderr — a pipe to the MCP client in stdio mode. A client that stopped
+		// draining it blocks the write FOREVER, and doing that under r.mu would
+		// wedge every request of the gateway (the same hazard emitEvent's comment
+		// documents; it cost Stage 18 a review finding). Never move this call up.
+		//
+		// start is taken HERE, not at the top of CallTool: the happy path stamps its
+		// own start inside callUpstream and must not pay a second time.Now(). The
+		// resulting Duration is ~0, which is the truth — nothing was forwarded.
+		start := time.Now()
+		up, reason := logging.UpstreamUnrouted, errUnroutableTool
+		if ok {
+			// The route exists but its connection is gone (upstream restarting or
+			// dropped). A different operator fact, and equally silent before.
+			up, reason = rt.upstream, errToolWithoutConn
+		}
+		r.audit(ctx, up, mcp.MethodToolsCall, logging.ClampName(namespaced), start, nil, reason)
 		return nil, fmt.Errorf("unknown tool %q", namespaced)
 	}
 
