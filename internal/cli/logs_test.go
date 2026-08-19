@@ -65,6 +65,17 @@ func runLogsCmd(t *testing.T, args ...string) string {
 // Not safe for t.Parallel: os.Stdout/os.Stderr are process-global.
 func runLogsCmdOSStreams(t *testing.T, args ...string) (stdout, stderr string) {
 	t.Helper()
+	return runCmdOSStreams(t, append([]string{"logs"}, args...)...)
+}
+
+// runCmdOSStreams is the transport-free half of runLogsCmdOSStreams: it runs any
+// subcommand with cobra's writers LEFT UNSET and the process-level streams
+// swapped. Extracted when `token` turned out to carry the same stream bug — see
+// that helper's comment for why buffers set via SetOut cannot catch this class.
+//
+// Not safe for t.Parallel: os.Stdout/os.Stderr are process-global.
+func runCmdOSStreams(t *testing.T, args ...string) (stdout, stderr string) {
+	t.Helper()
 
 	capture := func(target **os.File) (restore func(), read func() string) {
 		r, w, err := os.Pipe()
@@ -87,14 +98,14 @@ func runLogsCmdOSStreams(t *testing.T, args ...string) (stdout, stderr string) {
 	restoreErr, readErr := capture(&os.Stderr)
 
 	root := Build("test")
-	root.SetArgs(append([]string{"logs"}, args...))
+	root.SetArgs(args)
 	execErr := root.Execute()
 
 	restoreOut()
 	restoreErr()
 	stdout, stderr = readOut(), readErr()
 	if execErr != nil {
-		t.Fatalf("logs %v: %v\nstdout:\n%s\nstderr:\n%s", args, execErr, stdout, stderr)
+		t.Fatalf("%v: %v\nstdout:\n%s\nstderr:\n%s", args, execErr, stdout, stderr)
 	}
 	return stdout, stderr
 }
