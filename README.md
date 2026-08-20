@@ -8,8 +8,8 @@ MCP server, while under the hood it **multiplexes** calls across several
 upstream MCP servers, **aggregates** their tools, prompts and resources into
 one catalog, and **logs** every call.
 
-> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–17b shipped, latest
-> release v0.4.0.** Phase 1 — multiplexing stdio upstreams behind a
+> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–18 shipped, latest
+> release v0.5.0.** Phase 1 — multiplexing stdio upstreams behind a
 > stdio endpoint with a call log; Phase 2 — HTTP/SSE client-facing transport,
 > HTTP upstreams, a CLI log viewer (`mcp-gate logs`); release pipeline
 > (`goreleaser`, cross-compiled for linux/darwin/windows × amd64/arm64, no
@@ -25,7 +25,37 @@ one catalog, and **logs** every call.
 > HTTP on the client side × stdio or HTTP on the upstream side); the gateway now
 > declares to an upstream exactly the capabilities its own client declared
 > instead of a blanket `{}`; the HTTP transport gained server-side
-> `Mcp-Session-Id` sessions with `DELETE /mcp` termination.
+> `Mcp-Session-Id` sessions with `DELETE /mcp` termination. **v0.5.0** adds
+> operator observability (Stage 18): eight event kinds — upstream start
+> failures and supervisor give-ups, dropped notifications and server→client
+> requests, an HTTP upstream with no GET SSE, catalog collisions and bad URI
+> templates, and a result that silently bypassed `max_result_bytes` — now land
+> in the call journal (`mcp-gate logs`) instead of a `stderr` an MCP client
+> usually owns; config parsing became strict (unknown/misspelled keys are
+> fatal). It also closes the client-facing half of the guard/truncation story:
+> a `tools/call` refused by the rate-limit or concurrency guard now returns
+> its own JSON-RPC error code `-32029` with machine-readable
+> `data: {"retryable":true,"reason":...}` instead of an indistinguishable
+> `-32603`, and a non-text result that bypassed `max_result_bytes` carries a
+> `result._meta` marker (`content` stays byte-for-byte untouched). Finally,
+> `auth_token` referencing an unset environment variable now refuses to start
+> the gateway instead of silently disabling HTTP authentication.
+>
+> **Upgrading to v0.5.0 — three behaviour changes, none touch the config file
+> format itself:**
+> - **Config parsing is now strict.** A config with an unknown or misspelled
+>   top-level or per-upstream key, which used to be silently ignored, now
+>   fails to load. Fix the key name (the error names it) or remove it.
+> - **`auth_token: ${VAR}` with an unset `VAR` now refuses to start**, naming
+>   the variable. Before, it silently became an empty token — which, on an
+>   HTTP gateway, disabled the bearer check entirely with no warning. Set the
+>   variable (or pass `--env-file`), or remove `auth_token` to run without
+>   authentication on purpose.
+> - **The call journal (`log_file` / `calls.jsonl`) gained a second record
+>   kind**, `"kind":"event"`, alongside the existing call records. A binary at
+>   v0.4.0 or older reading a v0.5.0 journal renders an event line as a sparse
+>   `ERR` entry rather than failing — read a journal with the same or a newer
+>   binary than the one that wrote it.
 >
 > **Upgrading to v0.4.0:** no config-file change, but two observable HTTP-mode
 > behaviour changes — a session id is now mandatory on `POST /mcp` after
