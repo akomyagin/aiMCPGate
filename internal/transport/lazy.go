@@ -236,7 +236,9 @@ func (d *dispatcher) lazyForwardCall(ctx context.Context, req *mcp.Message, para
 	if err != nil {
 		// Same sanitized-error contract as handleToolsCall: err.Error() names
 		// only the tool the client itself supplied, never arguments/topology.
-		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+		// The shared toolCallError also maps a guard refusal to CodeGatewayBusy
+		// with retryable data, so gate_call and a direct call speak one dialect.
+		return toolCallError(req.ID, err)
 	}
 	if resp.Error != nil {
 		return mcp.NewError(req.ID, resp.Error.Code, resp.Error.Message, resp.Error.Data)

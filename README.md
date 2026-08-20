@@ -500,7 +500,9 @@ log_file: ./logs/calls.jsonl
 #                                   # arguments AND results — can contain secrets
 # Optional global call limits (each can be overridden per upstream):
 # rate_limit: { rps: 5, burst: 2 }  # token bucket per upstream for tools/call
-# max_result_bytes: 65536           # truncate oversized textual results (0 = off)
+#                                   # (refusal → client error -32029, retryable)
+# max_result_bytes: 65536           # truncate oversized textual results (0 = off;
+#                                   # non-text over-limit results get a _meta marker)
 # call_timeout: 30s                 # bounds one upstream request
 # How the catalog is presented to the client (both hot-reloadable):
 # catalog_mode: lazy                # normal (default) | lazy: the client sees only
@@ -531,7 +533,9 @@ upstreams:
     #   describe: { get_issue: "Fetch one issue." }   # replace wholesale
     # Optional per-upstream call limits (override the globals for this upstream):
     # rate_limit: { rps: 1, burst: 1 }  # rps: 0 disables the global limit here
+    #                                   # (refusal → client error -32029, retryable)
     # max_concurrent: 4                 # cap on simultaneous in-flight calls
+    #                                   # (refusal → client error -32029, retryable)
     # max_result_bytes: 32768           # 0 disables the global cap here
     # call_timeout: 120s                # this upstream is slow — give it longer
   - name: remote            # http upstream (Phase 2)
@@ -540,6 +544,30 @@ upstreams:
       Authorization: "Bearer ${REMOTE_MCP_TOKEN}"   # secret, never logged
     enabled: true
 ```
+
+### What the client sees when a call limit bites
+
+Two of the call limits above surface to the MCP client (agent), not just to the
+operator journal:
+
+- **Guard refusals (`rate_limit` / `max_concurrent`).** When the gateway turns a
+  `tools/call` away because the per-upstream rate limiter or concurrency cap
+  could not admit it, the client gets a JSON-RPC error with the gateway's own
+  code **`-32029`** and machine-readable
+  `data: {"retryable": true, "reason": "rate_limit" | "concurrency_limit"}`. The
+  call never reached the upstream, so an agent may wait and retry without risking
+  double execution. Ordinary transport/routing failures keep the historical
+  `-32603`, and an error an *upstream* itself returns is forwarded verbatim,
+  code and data untouched — a `-32029` from an upstream is not a gateway signal.
+- **Oversized results that cannot be truncated (`max_result_bytes`).** Text
+  results are shrunk with an in-content `[truncated by mcp-gate: …]` marker. A
+  non-text / non-standard result that exceeds the limit but has no truncatable
+  text (e.g. images only) is passed through **whole and byte-for-byte** — its
+  `content[]` is never altered — but the result's `_meta` gains the gateway key
+  **`io.github.akomyagin.aimcpgate/result-over-limit`** with
+  `{"limitBytes": N, "resultBytes": M}` so an agent can tell the limit was
+  bypassed. A client that does not know the key simply ignores it. The operator
+  `result_truncation_skipped` journal event still fires as before.
 
 ## License
 

@@ -12,6 +12,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"golang.org/x/sync/semaphore"
@@ -19,6 +20,20 @@ import (
 
 	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
+)
+
+// ErrRateLimited / ErrConcurrencyLimited mark a guard REFUSAL of one
+// tools/call: the gateway itself turned the call away (rate_limit /
+// max_concurrent) and NOTHING was sent to the upstream — which is what makes
+// "retry later" an honest suggestion. CallTool preserves them through its
+// sanitization (the wrapped detail is logged there and dropped), and the
+// dispatcher maps them to mcp.CodeGatewayBusy with retryable error data —
+// the same sentinel→code pattern ErrUnknownResource already established.
+// The error TEXTS double as the client-facing message tail, so they must
+// stay free of upstream names and internals.
+var (
+	ErrRateLimited        = errors.New("gateway rate limit exceeded")
+	ErrConcurrencyLimited = errors.New("gateway concurrency limit exceeded")
 )
 
 // limiterEntry caches one upstream's token-bucket limiter together with the
@@ -94,10 +109,14 @@ func truncationMarker(limit int) string {
 // bytes by cutting the TEXT content blocks (in place, resp.Result is
 // replaced). Results that do not parse into the standard tools/call shape
 // ({"content":[{"type":"text","text":...},...]}) — or that carry no text
-// blocks at all (e.g. pure image content) — are passed through UNCHANGED with
-// a warning: guessing at an unknown format would break the gateway's
-// transparency contract, an honest oversized result beats a mangled one.
-// Errors (resp.Error) are never truncated — only successful results are.
+// blocks at all (e.g. pure image content) — have their content[] passed
+// through UNCHANGED with a warning: guessing at an unknown format would break
+// the gateway's transparency contract, an honest oversized result beats a
+// mangled one. For those un-truncatable results the client is nonetheless
+// notified out-of-band — a marker is added to result._meta (see
+// annotateResultOverLimit) so an agent can tell the limit was bypassed without
+// the content itself being altered. Errors (resp.Error) are never truncated —
+// only successful results are.
 //
 // tool is the upstream's ORIGINAL tool name, not the client-facing namespaced
 // one: the namespaced name is not carried down this call path, and threading it
@@ -109,23 +128,87 @@ func (r *Registry) truncateResult(resp *mcp.Message, upstream, tool string, limi
 	}
 	out, ok := truncateToolResult(resp.Result, limit)
 	if !ok {
-		r.log.Warn("tool result exceeds max_result_bytes but is not truncatable, passing through unchanged",
-			"upstream", upstream, "bytes", len(resp.Result), "limit", limit)
-		// The operator half of the truncation asymmetry: the client still gets
-		// the full oversized result (unchanged contract), but the journal now
-		// says which call slipped past max_result_bytes and why.
+		origBytes := len(resp.Result)
+		// The client half of the truncation asymmetry (the operator half below is
+		// Stage 18): the content is passed through UNCHANGED — an honest oversized
+		// result still beats a mangled one — but the result's _meta now says the
+		// limit was bypassed, in the spec-sanctioned metadata slot (MCP 2025-06-18,
+		// base Result._meta; clients that do not know the key cannot trip over it —
+		// Result carries an open index signature). Annotation failing (non-object
+		// result, unparseable _meta) falls back to the old pure pass-through.
+		annotated, noted := annotateResultOverLimit(resp.Result, limit)
+		detail := fmt.Sprintf("result of %d bytes exceeds max_result_bytes=%d but carries no truncatable text content; passed through unchanged",
+			origBytes, limit)
+		if noted {
+			resp.Result = annotated
+			detail = fmt.Sprintf("result of %d bytes exceeds max_result_bytes=%d but carries no truncatable text content; content passed through unchanged, client notified via result._meta",
+				origBytes, limit)
+		}
+		r.log.Warn("tool result exceeds max_result_bytes but is not truncatable, passing content through unchanged",
+			"upstream", upstream, "bytes", origBytes, "limit", limit, "client_notified", noted)
 		r.emitEvent(logging.EventRecord{
 			Event:    logging.EventResultTruncationSkipped,
 			Upstream: upstream,
 			Subject:  tool,
-			Detail: fmt.Sprintf("result of %d bytes exceeds max_result_bytes=%d but carries no truncatable text content; passed through unchanged",
-				len(resp.Result), limit),
+			Detail:   detail,
 		})
 		return
 	}
 	r.log.Debug("tool result truncated",
 		"upstream", upstream, "bytes", len(resp.Result), "truncated_bytes", len(out), "limit", limit)
 	resp.Result = out
+}
+
+// metaKeyResultOverLimit is the _meta key the gateway sets on a tools/call
+// result that EXCEEDED max_result_bytes but could not be truncated (no text
+// content / unrepresentable under the limit) and was therefore passed through
+// whole. Key format per MCP 2025-06-18 «General fields: _meta»: a non-reserved
+// prefix derived from the module path + a name; only prefixes containing a
+// "modelcontextprotocol" or "mcp" label are reserved. This name is a public
+// client contract from the first release — never rename casually.
+const metaKeyResultOverLimit = "io.github.akomyagin.aimcpgate/result-over-limit"
+
+// resultOverLimit is the value stored under metaKeyResultOverLimit.
+type resultOverLimit struct {
+	LimitBytes  int `json:"limitBytes"`
+	ResultBytes int `json:"resultBytes"`
+}
+
+// annotateResultOverLimit returns a copy of result with
+// _meta[metaKeyResultOverLimit] = {"limitBytes":limit,"resultBytes":len(result)}
+// merged into any existing _meta. Every other top-level key — content included —
+// is preserved byte-for-byte (RawMessage round-trip; only the top object's key
+// order/whitespace may change, same as the truncation path). ok=false — and the
+// caller keeps the original untouched — when the result is not a JSON object or
+// its _meta is present but not an object (never clobber upstream data we cannot
+// parse). No upstream/tool names in the value: the client correlates by request
+// id, and gateway topology must not leak (CallTool's sanitization contract).
+func annotateResultOverLimit(result json.RawMessage, limit int) (out json.RawMessage, ok bool) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(result, &top); err != nil || top == nil {
+		return nil, false
+	}
+	meta := map[string]json.RawMessage{}
+	if raw, has := top["_meta"]; has {
+		if err := json.Unmarshal(raw, &meta); err != nil || meta == nil {
+			return nil, false // _meta present but not an object: do not clobber it.
+		}
+	}
+	val, err := json.Marshal(resultOverLimit{LimitBytes: limit, ResultBytes: len(result)})
+	if err != nil {
+		return nil, false
+	}
+	meta[metaKeyResultOverLimit] = val
+	metaRaw, err := json.Marshal(meta)
+	if err != nil {
+		return nil, false
+	}
+	top["_meta"] = metaRaw
+	out, err = json.Marshal(top)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // truncateToolResult is the pure transformation behind truncateResult: given a
@@ -284,12 +367,12 @@ func trimToEncodedBudget(s string, budget int) string {
 func (r *Registry) guardedCall(ctx context.Context, conn Upstream, rt route, arguments, meta json.RawMessage) (*mcp.Message, error) {
 	if lim := r.limiterFor(rt.upstream); lim != nil {
 		if err := lim.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limit: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrRateLimited, err)
 		}
 	}
 	if sem := r.semFor(rt.upstream); sem != nil {
 		if err := sem.Acquire(ctx, 1); err != nil {
-			return nil, fmt.Errorf("concurrency limit: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrConcurrencyLimited, err)
 		}
 		defer sem.Release(1)
 	}

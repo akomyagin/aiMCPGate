@@ -3,12 +3,14 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -140,6 +142,177 @@ func TestMaxConcurrentCapsParallelCalls(t *testing.T) {
 
 	if got := fake.peakConcurrency(); got != 1 {
 		t.Errorf("peak concurrency = %d, want 1 with max_concurrent: 1", got)
+	}
+}
+
+// A1. TestCallToolRateLimitRefusalCarriesSentinel: a rate-limit refusal reaches
+// CallTool's caller as an error wrapping registry.ErrRateLimited, its text names
+// only the client-supplied namespaced tool (sanitization) and leaks neither the
+// underlying x/time/rate string nor the bare upstream name, and the call never
+// reached the upstream.
+func TestCallToolRateLimitRefusalCarriesSentinel(t *testing.T) {
+	cfg := &config.Config{
+		RateLimit: &config.RateLimit{RPS: 0.001, Burst: 1}, // next token in ~17 minutes
+		Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"t"}}
+	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
+
+	if _, err := r.CallTool(context.Background(), "a__t", nil, nil); err != nil {
+		t.Fatalf("CallTool #1: %v", err)
+	}
+	fake.lastNamed = ""
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := r.CallTool(ctx, "a__t", nil, nil)
+	if err == nil {
+		t.Fatal("CallTool #2: want a rate-limit error under a short deadline, got nil")
+	}
+	if !errors.Is(err, ErrRateLimited) {
+		t.Errorf("error %q does not wrap ErrRateLimited", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "a__t") {
+		t.Errorf("error %q should name the client-supplied tool a__t", msg)
+	}
+	if !strings.Contains(msg, "gateway rate limit exceeded") {
+		t.Errorf("error %q should carry the sanitized sentinel text", msg)
+	}
+	if strings.Contains(msg, "Wait(") {
+		t.Errorf("error %q leaks the internal x/time/rate string", msg)
+	}
+	if fake.lastNamed != "" {
+		t.Errorf("rate-limited call still reached the upstream (called %q)", fake.lastNamed)
+	}
+}
+
+// A2. TestCallToolConcurrencyRefusalCarriesSentinel: a semaphore refusal caused
+// by the caller's own deadline wraps BOTH ErrConcurrencyLimited and
+// context.DeadlineExceeded (Acquire returns ctx.Err()). The guard verdict must
+// win — this pins the check order in CallTool (§3.3): the text must carry the
+// concurrency sentinel and must NOT be the generic "timed out".
+func TestCallToolConcurrencyRefusalCarriesSentinel(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{
+		{Name: "a", Enabled: boolPtr(true), MaxConcurrent: 1},
+	}}
+	fake := &blockingFake{release: make(chan struct{}), entered: make(chan struct{})}
+	r := New(cfg, quietLogger(), nil, noopPayloadLog(), true, "0.0.0-test")
+	r.start = func(context.Context, config.Upstream) (Upstream, error) { return fake, nil }
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer r.Close()
+	defer close(fake.release)
+
+	// First call holds the single permit until we release it.
+	held := make(chan struct{})
+	go func() {
+		close(held)
+		_, _ = r.CallTool(context.Background(), "a__block", nil, nil)
+	}()
+	<-held
+	fake.waitEntered(t) // ensure the first call actually acquired the permit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := r.CallTool(ctx, "a__block", nil, nil)
+	if err == nil {
+		t.Fatal("CallTool #2: want a concurrency refusal under a short deadline, got nil")
+	}
+	if !errors.Is(err, ErrConcurrencyLimited) {
+		t.Errorf("error %q does not wrap ErrConcurrencyLimited", err)
+	}
+	if strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error %q is generic 'timed out'; guard order (§3.3) was not honored", err)
+	}
+}
+
+// blockingFake holds every CallTool open until release is closed, and signals
+// entry so a test can be sure the permit was acquired before it races a second
+// call against the semaphore.
+type blockingFake struct {
+	fakeUpstreamBase
+	release chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingFake) ListTools(context.Context) ([]mcp.Tool, error) {
+	return []mcp.Tool{{Name: "block", InputSchema: json.RawMessage(`{"type":"object"}`)}}, nil
+}
+
+func (f *blockingFake) CallTool(ctx context.Context, _ string, _, _ json.RawMessage) (*mcp.Message, error) {
+	f.once.Do(func() {
+		if f.entered != nil {
+			close(f.entered)
+		}
+	})
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+	}
+	return mcp.NewResult(mcp.IntID(1), json.RawMessage(`{"content":[]}`)), nil
+}
+
+func (f *blockingFake) waitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blockingFake: first call never entered CallTool")
+	}
+}
+
+// A3. TestCallToolPlainFailureNotGuardMarked: an ordinary transport failure is
+// neither guard sentinel, and its text is the generic sanitized failure — the
+// negative that proves guard marking is not universal.
+func TestCallToolPlainFailureNotGuardMarked(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}}}
+	fake := &fakeUpstream{name: "a", tools: []string{"t"}, callErr: errors.New("boom: dialer broke")}
+	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
+
+	_, err := r.CallTool(context.Background(), "a__t", nil, nil)
+	if err == nil {
+		t.Fatal("CallTool: want a transport error, got nil")
+	}
+	if errors.Is(err, ErrRateLimited) || errors.Is(err, ErrConcurrencyLimited) {
+		t.Errorf("plain transport error %q must not be guard-marked", err)
+	}
+	if err.Error() != `call "a__t" failed` {
+		t.Errorf("error = %q, want the generic sanitized failure", err)
+	}
+}
+
+// A6. TestCallToolUpstreamErrorCodeNotRemapped pins the proxying invariant
+// (mcp.message.go:24-26): an upstream that itself returns a JSON-RPC error —
+// even one whose code happens to equal the gateway's own CodeGatewayBusy — is
+// returned by CallTool with err==nil and resp.Error untouched. The gateway's
+// -32029 signal is emitted ONLY on its own guard refusals (err!=nil branch);
+// an identical code from an upstream is NOT a gateway signal and passes
+// verbatim.
+func TestCallToolUpstreamErrorCodeNotRemapped(t *testing.T) {
+	cfg := &config.Config{Upstreams: []config.Upstream{{Name: "a", Enabled: boolPtr(true)}}}
+	upstreamErr := &mcp.Message{
+		JSONRPC: mcp.Version,
+		ID:      mcp.IntID(1),
+		Error:   &mcp.Error{Code: mcp.CodeGatewayBusy, Message: "upstream says", Data: json.RawMessage(`{"upstream":"detail"}`)},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"t"}, callResp: upstreamErr}
+	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
+
+	resp, err := r.CallTool(context.Background(), "a__t", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: want err==nil (upstream error rides in resp), got %v", err)
+	}
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("want resp.Error preserved, got resp=%+v", resp)
+	}
+	if resp.Error.Code != mcp.CodeGatewayBusy {
+		t.Errorf("upstream error code = %d, want it verbatim %d", resp.Error.Code, mcp.CodeGatewayBusy)
+	}
+	if resp.Error.Message != "upstream says" || string(resp.Error.Data) != `{"upstream":"detail"}` {
+		t.Errorf("upstream error message/data remapped: %+v", resp.Error)
 	}
 }
 
@@ -460,6 +633,232 @@ func TestCallToolTruncatesOversizedResult(t *testing.T) {
 			t.Errorf("result size %d changed; explicit 0 must disable truncation (want %d)", len(resp.Result), len(big))
 		}
 	})
+}
+
+// --- Part B: result-over-limit _meta annotation ---
+
+// metaField extracts result._meta[metaKeyResultOverLimit] as its typed value,
+// failing the test if the key is absent or malformed.
+func metaOverLimit(t *testing.T, result json.RawMessage) resultOverLimit {
+	t.Helper()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(result, &top); err != nil {
+		t.Fatalf("result is not a JSON object: %v", err)
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(top["_meta"], &meta); err != nil {
+		t.Fatalf("_meta is not an object: %s", top["_meta"])
+	}
+	raw, ok := meta[metaKeyResultOverLimit]
+	if !ok {
+		t.Fatalf("_meta lacks %q; keys: %v", metaKeyResultOverLimit, meta)
+	}
+	var v resultOverLimit
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("decode over-limit value %s: %v", raw, err)
+	}
+	return v
+}
+
+// B1. TestAnnotateResultOverLimitAddsMetaKey: a pure image result gets the meta
+// key with correct byte counts, and content[] survives byte-for-byte.
+func TestAnnotateResultOverLimitAddsMetaKey(t *testing.T) {
+	src := json.RawMessage(`{"content":[{"type":"image","data":"AAAA"}]}`)
+	out, ok := annotateResultOverLimit(src, 300)
+	if !ok {
+		t.Fatal("annotateResultOverLimit: want ok=true")
+	}
+	v := metaOverLimit(t, out)
+	if v.LimitBytes != 300 || v.ResultBytes != len(src) {
+		t.Errorf("over-limit value = %+v, want limitBytes=300 resultBytes=%d", v, len(src))
+	}
+	var srcTop, outTop map[string]json.RawMessage
+	_ = json.Unmarshal(src, &srcTop)
+	_ = json.Unmarshal(out, &outTop)
+	if string(outTop["content"]) != string(srcTop["content"]) {
+		t.Errorf("content changed:\n src %s\n out %s", srcTop["content"], outTop["content"])
+	}
+}
+
+// B2. TestAnnotateResultOverLimitMergesExistingMeta: an existing _meta key is
+// kept alongside ours.
+func TestAnnotateResultOverLimitMergesExistingMeta(t *testing.T) {
+	src := json.RawMessage(`{"content":[{"type":"image","data":"AAAA"}],"_meta":{"upstream.example/k":1}}`)
+	out, ok := annotateResultOverLimit(src, 300)
+	if !ok {
+		t.Fatal("annotateResultOverLimit: want ok=true")
+	}
+	var top, meta map[string]json.RawMessage
+	_ = json.Unmarshal(out, &top)
+	if err := json.Unmarshal(top["_meta"], &meta); err != nil {
+		t.Fatalf("_meta not an object: %v", err)
+	}
+	if string(meta["upstream.example/k"]) != "1" {
+		t.Errorf("foreign _meta key not preserved: %s", top["_meta"])
+	}
+	if _, ok := meta[metaKeyResultOverLimit]; !ok {
+		t.Errorf("our key missing after merge: %s", top["_meta"])
+	}
+}
+
+// B3. TestAnnotateResultOverLimitRefusesUnparseableMeta: a non-object _meta is
+// never clobbered — ok=false, caller passes original through.
+func TestAnnotateResultOverLimitRefusesUnparseableMeta(t *testing.T) {
+	src := json.RawMessage(`{"content":[{"type":"image","data":"AAAA"}],"_meta":5}`)
+	if _, ok := annotateResultOverLimit(src, 300); ok {
+		t.Error("annotateResultOverLimit: want ok=false for a non-object _meta")
+	}
+}
+
+// B4. TestAnnotateResultOverLimitRefusesNonObjectResult: a non-object result is
+// un-annotatable — ok=false.
+func TestAnnotateResultOverLimitRefusesNonObjectResult(t *testing.T) {
+	if _, ok := annotateResultOverLimit(json.RawMessage(`[1,2]`), 300); ok {
+		t.Error("annotateResultOverLimit: want ok=false for a non-object result")
+	}
+}
+
+// B5. TestCallToolAnnotatesOversizedNonTextResult wires Part B end-to-end
+// through CallTool: an oversized image-only result reaches the client with the
+// content[] intact and the over-limit _meta key, and exactly one truncation
+// event is journaled whose Detail says the client was notified.
+func TestCallToolAnnotatesOversizedNonTextResult(t *testing.T) {
+	imageOnly := json.RawMessage(`{"content":[{"type":"image","data":"` + strings.Repeat("A", 2000) + `"}]}`)
+	j, callLog := newJournal()
+	cfg := &config.Config{
+		MaxResultBytes: 300,
+		Upstreams:      []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"shot"}, callResp: mcp.NewResult(mcp.IntID(1), imageOnly)}
+	r := newTestRegistry(t, cfg, callLog, map[string]*fakeUpstream{"a": fake})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	resp, err := r.CallTool(context.Background(), "a__shot", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	v := metaOverLimit(t, resp.Result)
+	if v.LimitBytes != 300 || v.ResultBytes != len(imageOnly) {
+		t.Errorf("over-limit value = %+v, want limitBytes=300 resultBytes=%d", v, len(imageOnly))
+	}
+	// content[] byte-identical to the upstream's.
+	var srcTop, outTop map[string]json.RawMessage
+	_ = json.Unmarshal(imageOnly, &srcTop)
+	_ = json.Unmarshal(resp.Result, &outTop)
+	if string(outTop["content"]) != string(srcTop["content"]) {
+		t.Errorf("content[] altered:\n src %s\n out %s", srcTop["content"], outTop["content"])
+	}
+	evs := j.events(t, logging.EventResultTruncationSkipped)
+	if len(evs) != 1 {
+		t.Fatalf("got %d truncation-skipped events, want 1; journal:\n%s", len(evs), j.bytes())
+	}
+	if !strings.Contains(evs[0].Detail, "client notified via result._meta") {
+		t.Errorf("detail = %q, want it to say the client was notified", evs[0].Detail)
+	}
+}
+
+// B5b. TestCallToolFallsBackWhenResultIsNotAnnotatable wires Part B's FALLBACK
+// end-to-end through CallTool (test-report gap: B3/B4 pin
+// annotateResultOverLimit's ok=false in isolation, but nothing exercised the
+// real truncateResult branch falling back to a plain, un-annotated
+// passthrough — the same shape B5 pins for the success case). An oversized
+// image result with an unparseable _meta must reach the client BYTE-IDENTICAL
+// to what the upstream sent — no over-limit key, no mangling — while the
+// operator journal still records the skip (Detail must NOT claim the client
+// was notified, since it was not).
+func TestCallToolFallsBackWhenResultIsNotAnnotatable(t *testing.T) {
+	unannotatable := json.RawMessage(`{"content":[{"type":"image","data":"` + strings.Repeat("A", 2000) + `"}],"_meta":5}`)
+	j, callLog := newJournal()
+	cfg := &config.Config{
+		MaxResultBytes: 300,
+		Upstreams:      []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"shot"}, callResp: mcp.NewResult(mcp.IntID(1), unannotatable)}
+	r := newTestRegistry(t, cfg, callLog, map[string]*fakeUpstream{"a": fake})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	resp, err := r.CallTool(context.Background(), "a__shot", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if string(resp.Result) != string(unannotatable) {
+		t.Errorf("un-annotatable result must pass through byte-identical:\n got  %s\n want %s", resp.Result, unannotatable)
+	}
+	evs := j.events(t, logging.EventResultTruncationSkipped)
+	if len(evs) != 1 {
+		t.Fatalf("got %d truncation-skipped events, want 1; journal:\n%s", len(evs), j.bytes())
+	}
+	if strings.Contains(evs[0].Detail, "client notified via result._meta") {
+		t.Errorf("detail must NOT claim the client was notified when annotation failed: %q", evs[0].Detail)
+	}
+}
+
+// B6. TestTruncatedTextResultHasNoOverLimitMeta wires the text path
+// end-to-end through CallTool (review finding: calling truncateToolResult
+// directly cannot fail from a regression in truncateResult's own branching —
+// that function never sets the _meta key regardless, so the assertion proved
+// nothing about the real fork between the text and !ok paths). The in-content
+// marker stays the text path's only signal — no _meta key.
+func TestTruncatedTextResultHasNoOverLimitMeta(t *testing.T) {
+	big := json.RawMessage(`{"content":[{"type":"text","text":"` + strings.Repeat("a", 2000) + `"}]}`)
+	j, callLog := newJournal()
+	cfg := &config.Config{
+		MaxResultBytes: 200,
+		Upstreams:      []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"echo"}, callResp: mcp.NewResult(mcp.IntID(1), big)}
+	r := newTestRegistry(t, cfg, callLog, map[string]*fakeUpstream{"a": fake})
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	resp, err := r.CallTool(context.Background(), "a__echo", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if strings.Contains(string(resp.Result), metaKeyResultOverLimit) {
+		t.Errorf("truncated text result must not carry %q: %s", metaKeyResultOverLimit, resp.Result)
+	}
+	// truncationMarker's own \n is JSON-escaped in the marshaled result, so
+	// match the literal text rather than the raw (unescaped) marker string.
+	if !strings.Contains(string(resp.Result), "truncated by mcp-gate: result exceeded 200 bytes") {
+		t.Errorf("truncated text result must carry the in-content marker: %s", resp.Result)
+	}
+	// The !ok (annotation) journal event must NOT fire on the text path —
+	// only the text-truncation path was taken.
+	if evs := j.events(t, logging.EventResultTruncationSkipped); len(evs) != 0 {
+		t.Errorf("text path must not journal result_truncation_skipped, got %d: %+v", len(evs), evs)
+	}
+}
+
+// B7. TestUnderLimitNonTextResultUntouched: a non-text result SMALLER than the
+// limit passes byte-identical, with no _meta key (early return in truncateResult).
+func TestUnderLimitNonTextResultUntouched(t *testing.T) {
+	small := json.RawMessage(`{"content":[{"type":"image","data":"AAAA"}]}`)
+	cfg := &config.Config{
+		MaxResultBytes: 100000,
+		Upstreams:      []config.Upstream{{Name: "a", Enabled: boolPtr(true)}},
+	}
+	fake := &fakeUpstream{name: "a", tools: []string{"shot"}, callResp: mcp.NewResult(mcp.IntID(1), small)}
+	r := startedRegistry(t, cfg, map[string]*fakeUpstream{"a": fake})
+
+	resp, err := r.CallTool(context.Background(), "a__shot", nil, nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if string(resp.Result) != string(small) {
+		t.Errorf("under-limit result altered:\n src %s\n out %s", small, resp.Result)
+	}
+	if strings.Contains(string(resp.Result), metaKeyResultOverLimit) {
+		t.Errorf("under-limit result must not carry the over-limit key: %s", resp.Result)
+	}
 }
 
 // TestPerUpstreamRateLimitOverridesGlobal: the per-upstream block wins over a
