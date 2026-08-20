@@ -614,8 +614,16 @@ func Load(path string) (*Config, error) {
 	// Anchors and merge keys (<<:) keep working under KnownFields — verified,
 	// including struct elements of the upstreams list. Note the one behavioural
 	// gap between the two APIs: on an EMPTY file Decode returns io.EOF where
-	// Unmarshal left a zero Config, so that case is restored explicitly (the
-	// zero Config then fails validation with its own, clearer message).
+	// Unmarshal left a zero Config, so that case is restored explicitly.
+	//
+	// Be clear about what that restoration means, because the comment here used
+	// to claim the opposite: an empty file yields a VALID config with zero
+	// upstreams (Validate has no "at least one upstream" rule and deliberately
+	// so — an empty gateway is a legitimate starting point, and `doctor` must
+	// stay able to load and explain one). The case where that is dangerous is
+	// hot-reload, since a non-atomic save is momentarily an empty file; it is
+	// caught there, by vetReloadConfig in internal/cli/serve.go, and not here —
+	// Load's other seven callers have no business being restricted for it.
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {

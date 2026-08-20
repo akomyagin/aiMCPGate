@@ -416,8 +416,28 @@ mcp-gate serve --config ./config.yaml --watch-config        # bare flag = poll e
 mcp-gate serve --config ./config.yaml --watch-config=10s    # note the "=", not a space
 ```
 
-It stats the config file's mtime on that interval and applies the same reload
+It fingerprints the config file on that interval and applies the same reload
 path SIGHUP takes. Running it alongside the SIGHUP handler is safe.
+
+The watcher compares the file's **mtime and size**, and waits for that
+fingerprint to repeat on the next tick before it reads the file. That is what
+makes a two-step save (truncate, then fill) safe in practice: a writer has to
+hold the file in a half-written state for longer than a full polling interval to
+fool the check. The price is latency — a reload lands within up to two polling
+intervals (up to 4s on the default 2s).
+
+On stdio the upstreams come up on the client's first request, so an edit made
+before any client has connected cannot be applied yet. The watcher **keeps that
+edit and re-tries it every poll** until the gateway is up, then applies it — you
+never have to save the file a second time to make it take. An edit refused for
+good (unparseable YAML, or the no-`upstreams` guard below) is reported once and
+not retried.
+
+As a backstop on **both** triggers, a reload whose new config declares no
+`upstreams` at all is refused and logged: that is the signature of a
+half-written file, and applying it would tear down every running upstream. To
+remove all upstreams deliberately, restart the gateway. An explicit
+`enabled: false` is unaffected — disabling the last upstream still applies.
 
 ## Configuration
 
