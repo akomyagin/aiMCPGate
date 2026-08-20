@@ -31,6 +31,19 @@ const (
 	CodeInternalError  = -32603
 )
 
+// CodeGatewayBusy is the gateway's OWN implementation-defined JSON-RPC error
+// code (JSON-RPC 2.0 reserves -32000..-32099 for exactly this): a tools/call
+// the gateway REFUSED before forwarding, because a per-upstream guard
+// (rate_limit / max_concurrent) could not admit it within the caller's
+// context. The request never reached the upstream, so retrying is safe; the
+// error's data carries {"retryable":true,"reason":...} as the machine-readable
+// contract. -32000/-32001/-32002 are deliberately avoided (colloquially taken
+// by the official SDKs / spec examples: ConnectionClosed, RequestTimeout,
+// resource-not-found); -32029 is free and mnemonic of HTTP 429. Emitted ONLY
+// for the gateway's own guard refusals — an upstream's error code, whatever it
+// is, still proxies through verbatim per the invariant above.
+const CodeGatewayBusy = -32029
+
 // Message is a single MCP JSON-RPC 2.0 message in its most permissive form.
 //
 // It intentionally models request, response, and notification with one struct

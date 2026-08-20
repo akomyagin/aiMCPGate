@@ -68,7 +68,10 @@ call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 # upstream (the global block is a default each upstream's own bucket is built
 # from — not one shared budget). rps = tokens refilled per second; burst = how
 # many calls may fire back-to-back (0 is treated as 1). Waiting for a token
-# respects the client's own deadline/cancellation.
+# respects the client's own deadline/cancellation. A refusal reaches the client
+# as JSON-RPC error code -32029 with data {"retryable":true,"reason":"rate_limit"}
+# (max_concurrent uses "concurrency_limit"): the call never reached the upstream,
+# so an agent may wait and retry.
 # rate_limit:
 #   rps: 5
 #   burst: 2
@@ -85,7 +88,9 @@ call_timeout: 30s           # bounds one upstream request (handshake/list/call)
 # gateway's transparency contract). That is not silent any more — the gateway
 # writes a `result_truncation_skipped` operator event into log_file naming the
 # upstream, the tool and the size, so `mcp-gate logs --events` shows which calls
-# escaped the limit.
+# escaped the limit; the client is told too, via a _meta key
+# "io.github.akomyagin.aimcpgate/result-over-limit" = {"limitBytes","resultBytes"}
+# added to the (byte-for-byte unchanged) result.
 # max_result_bytes: 65536
 
 # Catalog presentation (Round 8) — both optional, hot-reloadable via SIGHUP.
@@ -166,10 +171,13 @@ upstreams:
     # process restart:
     #   rate_limit — overrides the global bucket parameters (rps: 0 disables
     #     rate limiting for this upstream even when a global limit is set);
+    #     a refusal reaches the client as error -32029, retryable (see above);
     #   max_concurrent — cap on simultaneous in-flight tools/call requests to
     #     this upstream (no global counterpart; 0/omitted = unlimited);
+    #     a refusal reaches the client as error -32029, retryable (see above);
     #   max_result_bytes — overrides the global cap (an explicit 0 disables it
-    #     for this upstream);
+    #     for this upstream); a non-text over-limit result gets the _meta marker
+    #     described above;
     #   call_timeout — overrides the global call_timeout for this upstream.
     # rate_limit:
     #   rps: 1

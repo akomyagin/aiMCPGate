@@ -505,6 +505,32 @@ func (d *dispatcher) handleCancelled(params json.RawMessage) {
 	cancel()
 }
 
+// guardRefusalData renders the machine-readable error data of a gateway guard
+// refusal. reason is one of "rate_limit" | "concurrency_limit" — a fixed
+// vocabulary, part of the client contract (documented in README). retryable is
+// literally the point: the call never reached the upstream, so the agent may
+// wait and repeat without double-execution risk.
+func guardRefusalData(reason string) json.RawMessage {
+	return json.RawMessage(`{"retryable":true,"reason":"` + reason + `"}`)
+}
+
+// toolCallError maps a Registry.CallTool FAILURE (transport/routing/guard —
+// never the upstream's own JSON-RPC error, which forwards verbatim elsewhere)
+// to the client-facing error. Shared by handleToolsCall and lazyForwardCall so
+// gate_call and a direct namespaced call speak one dialect. Guard refusals get
+// the gateway's own CodeGatewayBusy + retryable data (sentinel pattern of
+// ErrUnknownResource); everything else keeps the historical -32603 with
+// CallTool's sanitized text.
+func toolCallError(id json.RawMessage, err error) *mcp.Message {
+	switch {
+	case errors.Is(err, registry.ErrRateLimited):
+		return mcp.NewError(id, mcp.CodeGatewayBusy, err.Error(), guardRefusalData("rate_limit"))
+	case errors.Is(err, registry.ErrConcurrencyLimited):
+		return mcp.NewError(id, mcp.CodeGatewayBusy, err.Error(), guardRefusalData("concurrency_limit"))
+	}
+	return mcp.NewError(id, mcp.CodeInternalError, err.Error(), nil)
+}
+
 // handleToolsCall proxies a call through the registry, which resolves the owning
 // upstream, rewrites the name to the upstream original, mints its own
 // upstream-side id, and audits the call. The upstream's raw result/error is
@@ -547,7 +573,10 @@ func (d *dispatcher) handleToolsCall(ctx context.Context, req *mcp.Message) *mcp
 		// — never the call arguments (which may hold secrets), and never an
 		// upstream name or raw internal error string (gateway topology/
 		// internals), only the tool name the client itself already supplied.
-		return mcp.NewError(req.ID, mcp.CodeInternalError, err.Error(), nil)
+		// A guard refusal (rate_limit / max_concurrent) is mapped to the
+		// gateway's own CodeGatewayBusy with retryable data by toolCallError;
+		// everything else keeps the historical -32603.
+		return toolCallError(req.ID, err)
 	}
 
 	// resp is the upstream's raw response. Its own ID is the gateway's

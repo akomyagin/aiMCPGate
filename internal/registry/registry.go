@@ -2577,7 +2577,22 @@ func (r *Registry) CallTool(ctx context.Context, namespaced string, arguments, m
 		})
 	if err != nil {
 		r.log.Warn("tool call failed", "tool", namespaced, "upstream", rt.upstream, "err", err)
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		// Guard refusals FIRST, deadline second — the order is load-bearing: a
+		// semaphore refusal caused by the client's own deadline wraps BOTH
+		// ErrConcurrencyLimited and context.DeadlineExceeded (Acquire returns
+		// ctx.Err()), and the guard verdict must win: the call was never sent to
+		// the upstream, so "gateway busy, retry later" is both safe and strictly
+		// more actionable than "timed out". A genuine upstream-call timeout
+		// (withCallTimeoutFor) carries no guard sentinel and still maps below —
+		// there a retry is NOT known to be safe (the call may have executed).
+		// The %w keeps the sentinel across this sanitization so the dispatcher
+		// can map it to CodeGatewayBusy; the sentinel text leaks no topology.
+		case errors.Is(err, ErrRateLimited):
+			return nil, fmt.Errorf("call %q refused: %w", namespaced, ErrRateLimited)
+		case errors.Is(err, ErrConcurrencyLimited):
+			return nil, fmt.Errorf("call %q refused: %w", namespaced, ErrConcurrencyLimited)
+		case errors.Is(err, context.DeadlineExceeded):
 			return nil, fmt.Errorf("call %q timed out", namespaced)
 		}
 		return nil, fmt.Errorf("call %q failed", namespaced)
