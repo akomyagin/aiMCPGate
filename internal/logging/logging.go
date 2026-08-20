@@ -107,6 +107,7 @@ const (
 	EventCatalogCollision        = "catalog_collision"         // keep-first: a tool/prompt/resource is hidden from the client
 	EventCatalogBadTemplate      = "catalog_bad_template"      // a URI template is exposed but can never match
 	EventResultTruncationSkipped = "result_truncation_skipped" // max_result_bytes silently did not apply
+	EventUnresolvedSecretVar     = "unresolved_secret_var"     // serve start: an enabled upstream's env/headers value references an UNSET ${VAR}; it expanded to "" — expect an auth failure at that upstream
 )
 
 // UpstreamUnrouted is the CallRecord.Upstream value of a call the gateway could

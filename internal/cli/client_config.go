@@ -37,7 +37,7 @@ func newClientConfigCmd() *cobra.Command {
 			if cfg.Transport == config.TransportHTTP {
 				return printHTTPClientConfig(cmd, cfg)
 			}
-			return printStdioClientConfig(cmd, *configPath)
+			return printStdioClientConfig(cmd, cfg, *configPath)
 		},
 	}
 	configPath = addConfigFlag(cmd)
@@ -211,13 +211,19 @@ func printHTTPClientConfig(cmd *cobra.Command, cfg *config.Config) error {
 // printStdioClientConfig prints snippets that LAUNCH the gateway: in stdio mode
 // there is no endpoint to point at, the client owns the process.
 //
-// No auth_token appears anywhere below — it only guards the HTTP endpoint, so
-// in stdio mode the output is not secret-bearing and needs no warning.
-func printStdioClientConfig(cmd *cobra.Command, configFlag string) error {
+// No auth_token appears in the STDOUT snippets — it only guards the HTTP
+// endpoint, so the piped output stays free of secrets. There is, however, a
+// stderr warning (secretVarRefWarnings) when the config references any ${VAR}:
+// the client launches the gateway in its OWN environment, so the operator's
+// shell variables are not inherited and must be re-declared client-side.
+func printStdioClientConfig(cmd *cobra.Command, cfg *config.Config, configFlag string) error {
 	bin, unusable := gatewayBinaryPath()
 	args := gatewayLaunchArgs(configFlag)
 
 	for _, line := range stdioBinaryWarnings(unusable, args) {
+		fmt.Fprintln(cmd.ErrOrStderr(), line)
+	}
+	for _, line := range secretVarRefWarnings(cfg.SecretVarRefs) {
 		fmt.Fprintln(cmd.ErrOrStderr(), line)
 	}
 
@@ -332,6 +338,36 @@ func stdioBinaryWarnings(reason string, args []string) []string {
 			fallbackBinaryName))
 	}
 	return lines
+}
+
+// secretVarRefWarnings warns that the stdio snippets inherit NONE of the
+// operator's environment: the MCP client spawns the gateway itself, so every
+// ${VAR} the config references — resolved right now or not — must be present
+// in the environment the CLIENT starts the gateway in (e.g. an "env" block in
+// the client's mcpServers entry). Firing on resolved references too is the
+// point: resolution happened in the operator's shell, which proves nothing
+// about the client's environment — a gateway launched from the snippet would
+// come up with those secrets EMPTY and no signal anywhere. Variable NAMES
+// only, never values (they are secrets). Same stderr style as
+// stdioBinaryWarnings: stdout stays clean for piping.
+func secretVarRefWarnings(refs []config.SecretVarRef) []string {
+	if len(refs) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(refs))
+	var names []string
+	for _, ref := range refs {
+		if !seen[ref.Var] {
+			seen[ref.Var] = true
+			names = append(names, ref.Var)
+		}
+	}
+	slices.Sort(names)
+	return []string{
+		fmt.Sprintf("# WARNING: the gateway config references environment variable(s) %s. An MCP client launches the gateway with the client's OWN environment — your shell's variables are NOT inherited.",
+			strings.Join(names, ", ")),
+		"# WARNING: make sure these variables are set where the client runs the gateway (e.g. add an \"env\" block to the mcpServers entry), or the gateway will start with those secrets empty and no error anywhere.",
+	}
 }
 
 // gatewayLaunchArgs builds the argv tail for the stdio snippets.

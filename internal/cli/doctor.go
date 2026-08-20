@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/akomyagin/aiMCPGate/internal/config"
 	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/registry"
 )
@@ -49,6 +50,8 @@ func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
 		return err
 	}
 
+	printUnresolvedSecretVars(cmd, cfg)
+
 	logger := logging.New(cfg.LogLevel, os.Stderr)
 
 	// supervise=false: one pass, no auto-restart goroutines (see the comment on
@@ -83,6 +86,34 @@ func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
 		return startErr
 	}
 	return nil
+}
+
+// printUnresolvedSecretVars prints one line per unresolved ${VAR} reference
+// in upstream env/headers. Unlike serve's journal event it also lists
+// DISABLED upstreams (marked as such) — doctor's whole job is to explain a
+// doubtful config, dormant hazards included. It prints to stdout: these lines
+// are report content, like the table, not slog diagnostics. The exit code is
+// deliberately unaffected — an unresolved variable is a warning (the decided
+// behaviour: the failure itself surfaces as a 401 from the upstream), not a
+// per-upstream FAIL. auth_token cannot appear here: Load already failed on it.
+// Variable NAMES only, never values (they are secrets).
+func printUnresolvedSecretVars(cmd *cobra.Command, cfg *config.Config) {
+	out := cmd.OutOrStdout()
+	enabled := make(map[string]bool, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		enabled[u.Name] = u.IsEnabled()
+	}
+	for _, ref := range cfg.SecretVarRefs {
+		if ref.Resolved || ref.Field == "auth_token" {
+			continue
+		}
+		line := fmt.Sprintf("WARN upstream %q: %s[%s] references unset environment variable %s — the value expanded to empty",
+			ref.Upstream, ref.Field, ref.Key, ref.Var)
+		if !enabled[ref.Upstream] {
+			line += " (upstream disabled)"
+		}
+		fmt.Fprintln(out, line)
+	}
 }
 
 // tableCellSanitizer strips the characters tabwriter treats as structure: a

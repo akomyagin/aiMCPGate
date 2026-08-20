@@ -882,3 +882,362 @@ func TestLoadEmptyFileKeepsOldBehaviour(t *testing.T) {
 		t.Errorf("log_level = %q, want the info default", cfg.LogLevel)
 	}
 }
+
+// T1. TestLoadFailsOnUnsetAuthTokenVar: an auth_token that points at an UNSET
+// environment variable must fail Load, naming the variable and auth_token in
+// the error. The failure is transport-INDEPENDENT (§4.2): a config carrying
+// the key declares the intent "there is a token", and configs get switched
+// between modes. Two unset variables must BOTH be named (Validate collects
+// them, so the operator fixes them in one pass).
+func TestLoadFailsOnUnsetAuthTokenVar(t *testing.T) {
+	for _, transport := range []string{"http", "stdio"} {
+		t.Run(transport, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			yaml := "transport: " + transport + "\nauth_token: ${TEST_AIMCPGATE_UNSET_TOK}\n"
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load accepted an unset auth_token variable (transport %s); want a hard error", transport)
+			}
+			if !strings.Contains(err.Error(), "TEST_AIMCPGATE_UNSET_TOK") {
+				t.Errorf("error must name the variable: %v", err)
+			}
+			if !strings.Contains(err.Error(), "auth_token") {
+				t.Errorf("error must name auth_token: %v", err)
+			}
+		})
+	}
+
+	t.Run("two unset vars both named", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		yaml := "transport: http\nauth_token: ${TEST_AIMCPGATE_UNSET_A}${TEST_AIMCPGATE_UNSET_B}\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("Load accepted two unset auth_token variables; want a hard error")
+		}
+		for _, want := range []string{"TEST_AIMCPGATE_UNSET_A", "TEST_AIMCPGATE_UNSET_B"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error must name %q, got: %v", want, err)
+			}
+		}
+	})
+}
+
+// T2. TestLoadRecordsResolvedAuthTokenRef: a SET auth_token variable resolves,
+// Load succeeds, and SecretVarRefs carries exactly one resolved auth_token ref.
+func TestLoadRecordsResolvedAuthTokenRef(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := "transport: http\nauth_token: ${TEST_AIMCPGATE_SET_TOK}\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_AIMCPGATE_SET_TOK", "t0ken")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthToken != "t0ken" {
+		t.Errorf("auth_token = %q, want expanded 't0ken'", cfg.AuthToken)
+	}
+	want := []SecretVarRef{{Upstream: "", Field: "auth_token", Key: "", Var: "TEST_AIMCPGATE_SET_TOK", Resolved: true}}
+	if !secretRefsEqual(cfg.SecretVarRefs, want) {
+		t.Errorf("SecretVarRefs = %+v, want %+v", cfg.SecretVarRefs, want)
+	}
+}
+
+// T3. TestLoadAcceptsSetButEmptyAuthTokenVar: a variable SET to "" is the
+// operator's deliberate choice (§4.1) — Load passes, the ref is Resolved, and
+// auth_token becomes empty. os.LookupEnv is what tells this apart from unset.
+func TestLoadAcceptsSetButEmptyAuthTokenVar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := "transport: stdio\nauth_token: ${TEST_AIMCPGATE_EMPTY_TOK}\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_AIMCPGATE_EMPTY_TOK", "")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load rejected a set-but-empty auth_token variable: %v", err)
+	}
+	if cfg.AuthToken != "" {
+		t.Errorf("auth_token = %q, want empty", cfg.AuthToken)
+	}
+	if len(cfg.SecretVarRefs) != 1 || !cfg.SecretVarRefs[0].Resolved {
+		t.Errorf("SecretVarRefs = %+v, want one Resolved ref", cfg.SecretVarRefs)
+	}
+}
+
+// T4. TestLoadRecordsUnresolvedUpstreamEnvAndHeaderRefs: unset variables in an
+// upstream's env and another's headers do NOT fail Load; the values become
+// empty and the refs carry full coordinates with Resolved=false.
+func TestLoadRecordsUnresolvedUpstreamEnvAndHeaderRefs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: gh
+    command: github-mcp-server
+    env:
+      GITHUB_TOKEN: ${TEST_AIMCPGATE_UNSET_GH}
+    enabled: true
+  - name: remote
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${TEST_AIMCPGATE_UNSET_HDR}"
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load must not fail on unset upstream env/headers: %v", err)
+	}
+	if got := cfg.Upstreams[0].Env["GITHUB_TOKEN"]; got != "" {
+		t.Errorf("env value = %q, want empty", got)
+	}
+	if got := cfg.Upstreams[1].Headers["Authorization"]; got != "Bearer " {
+		t.Errorf("header value = %q, want 'Bearer '", got)
+	}
+	wantEnv := SecretVarRef{Upstream: "gh", Field: "env", Key: "GITHUB_TOKEN", Var: "TEST_AIMCPGATE_UNSET_GH", Resolved: false}
+	wantHdr := SecretVarRef{Upstream: "remote", Field: "headers", Key: "Authorization", Var: "TEST_AIMCPGATE_UNSET_HDR", Resolved: false}
+	if !containsRef(cfg.SecretVarRefs, wantEnv) {
+		t.Errorf("missing env ref %+v in %+v", wantEnv, cfg.SecretVarRefs)
+	}
+	if !containsRef(cfg.SecretVarRefs, wantHdr) {
+		t.Errorf("missing header ref %+v in %+v", wantHdr, cfg.SecretVarRefs)
+	}
+}
+
+// T5. TestLoadRecordsRefsOfDisabledUpstreams: a disabled upstream's unset env
+// variable is still recorded (§4.4) — Load collects refs for ALL upstreams,
+// symmetrically with Validate; consumers filter by enablement when reading.
+func TestLoadRecordsRefsOfDisabledUpstreams(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: off
+    command: some-server
+    env:
+      TOKEN: ${TEST_AIMCPGATE_UNSET_OFF}
+    enabled: false
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := SecretVarRef{Upstream: "off", Field: "env", Key: "TOKEN", Var: "TEST_AIMCPGATE_UNSET_OFF", Resolved: false}
+	if !containsRef(cfg.SecretVarRefs, want) {
+		t.Errorf("disabled upstream ref not recorded: %+v not in %+v", want, cfg.SecretVarRefs)
+	}
+}
+
+// T6. TestExpandSecretMultipleVarsInOneValue: one value with a set and an unset
+// variable yields two refs (Resolved true/false) and the value uses the set one.
+func TestExpandSecretMultipleVarsInOneValue(t *testing.T) {
+	t.Setenv("TEST_AIMCPGATE_SET_A", "aaa")
+	var refs []SecretVarRef
+	got := expandSecret("Bearer ${TEST_AIMCPGATE_SET_A}${TEST_AIMCPGATE_UNSET_B}", "u", "headers", "Authorization", &refs)
+	if got != "Bearer aaa" {
+		t.Errorf("expanded = %q, want 'Bearer aaa'", got)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want two", refs)
+	}
+	if !refs[0].Resolved || refs[0].Var != "TEST_AIMCPGATE_SET_A" {
+		t.Errorf("first ref = %+v, want resolved SET_A", refs[0])
+	}
+	if refs[1].Resolved || refs[1].Var != "TEST_AIMCPGATE_UNSET_B" {
+		t.Errorf("second ref = %+v, want unresolved UNSET_B", refs[1])
+	}
+}
+
+// T7. TestExpandSecretIgnoresShellSpecials: shell-special names ($$, $5, ${5})
+// are NOT variable references — Load does not fail, no refs are recorded, and
+// the expansion result matches the old os.ExpandEnv byte-for-byte (§4.3).
+func TestExpandSecretIgnoresShellSpecials(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: http
+auth_token: "p$$w"
+upstreams:
+  - name: remote
+    url: https://example.com/mcp
+    headers:
+      A: "$5"
+      B: "${5}"
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load must not fail on shell specials: %v", err)
+	}
+	// os.ExpandEnv("p$$w") == "pw" (the "$$" -> "$"... actually $$ is $-then-$,
+	// os.Expand consumes "$$" as the special "$" mapping to ""). Match the
+	// live os.ExpandEnv on the same inputs to pin "no behaviour change".
+	if want := os.ExpandEnv("p$$w"); cfg.AuthToken != want {
+		t.Errorf("auth_token = %q, want os.ExpandEnv-equivalent %q", cfg.AuthToken, want)
+	}
+	if want := os.ExpandEnv("$5"); cfg.Upstreams[0].Headers["A"] != want {
+		t.Errorf("header A = %q, want %q", cfg.Upstreams[0].Headers["A"], want)
+	}
+	if want := os.ExpandEnv("${5}"); cfg.Upstreams[0].Headers["B"] != want {
+		t.Errorf("header B = %q, want %q", cfg.Upstreams[0].Headers["B"], want)
+	}
+	if len(cfg.SecretVarRefs) != 0 {
+		t.Errorf("shell specials must record no refs, got %+v", cfg.SecretVarRefs)
+	}
+}
+
+// T8. TestLoadNoRefsYieldsEmptySlice: a config with no '$' records no refs.
+func TestLoadNoRefsYieldsEmptySlice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: local
+    command: /usr/bin/mcp
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.SecretVarRefs) != 0 {
+		t.Errorf("SecretVarRefs = %+v, want empty", cfg.SecretVarRefs)
+	}
+}
+
+// T9. TestLoadRejectsSecretVarRefsKey pins the mandatory `yaml:"-"` tag (§3):
+// a YAML file spelling `secretvarrefs:` must be rejected as an unknown key by
+// KnownFields(true) — proving the diagnostic field cannot be populated from
+// the file. Without the tag yaml.v3 would map the key by lowercased name and
+// accept it.
+func TestLoadRejectsSecretVarRefsKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+secretvarrefs: []
+upstreams:
+  - name: local
+    command: /usr/bin/mcp
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a `secretvarrefs:` YAML key; the yaml:\"-\" tag must make it unknown")
+	}
+	if !strings.Contains(err.Error(), "secretvarrefs") {
+		t.Errorf("error should name the unknown key: %v", err)
+	}
+}
+
+// T10. TestValidateFailsOnUnresolvedAuthTokenRef is table-driven and constructs
+// Config with refs DIRECTLY (no files, no env), exercising Validate's hard-fail
+// in isolation: an unresolved auth_token ref fails (naming the var); an
+// unresolved env ref does not; a resolved auth_token ref does not; several
+// unresolved auth_token refs all get named.
+func TestValidateFailsOnUnresolvedAuthTokenRef(t *testing.T) {
+	tests := []struct {
+		name      string
+		refs      []SecretVarRef
+		wantErr   bool
+		wantNamed []string
+	}{
+		{
+			name:      "unresolved auth_token fails",
+			refs:      []SecretVarRef{{Field: "auth_token", Var: "TOK", Resolved: false}},
+			wantErr:   true,
+			wantNamed: []string{"TOK"},
+		},
+		{
+			name:    "unresolved env passes",
+			refs:    []SecretVarRef{{Upstream: "u", Field: "env", Key: "K", Var: "ENVV", Resolved: false}},
+			wantErr: false,
+		},
+		{
+			name:    "resolved auth_token passes",
+			refs:    []SecretVarRef{{Field: "auth_token", Var: "TOK", Resolved: true}},
+			wantErr: false,
+		},
+		{
+			name: "several unresolved auth_token all named",
+			refs: []SecretVarRef{
+				{Field: "auth_token", Var: "A", Resolved: false},
+				{Field: "auth_token", Var: "B", Resolved: false},
+			},
+			wantErr:   true,
+			wantNamed: []string{"A", "B"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Transport: TransportStdio, SecretVarRefs: tt.refs}
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatalf("Validate accepted refs %+v; want an error", tt.refs)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate rejected refs %+v: %v", tt.refs, err)
+			}
+			for _, name := range tt.wantNamed {
+				if !strings.Contains(err.Error(), name) {
+					t.Errorf("error must name %q, got: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// secretRefsEqual reports slice equality for SecretVarRef (order-sensitive).
+func secretRefsEqual(a, b []SecretVarRef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// containsRef reports whether want appears anywhere in refs.
+func containsRef(refs []SecretVarRef, want SecretVarRef) bool {
+	for _, r := range refs {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}

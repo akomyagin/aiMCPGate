@@ -475,10 +475,26 @@ env/`.env`** (`${VAR}` expansion at load time), never committed in the config.
 Each upstream sets **exactly one** of `command` (stdio subprocess) or `url`
 (HTTP server, Streamable HTTP) — the connection kind is inferred automatically.
 
+Unset `${VAR}` references behave differently per field:
+
+- **`auth_token`** referencing an unset variable **fails startup**, naming the
+  variable — an empty `auth_token` would silently disable the HTTP bearer check,
+  so this is never allowed to happen quietly. To run without authentication,
+  remove the `auth_token` key entirely.
+- An unset variable in an upstream's **`env`/`headers`** is **not** an error:
+  the value becomes empty and the missing secret surfaces later as a 401 from
+  that upstream. The gateway reports it ahead of time — an
+  `unresolved_secret_var` event in the journal (`mcp-gate logs`) and a `WARN`
+  line in `mcp-gate doctor`.
+- In stdio mode `mcp-gate client-config` warns (on stderr) that the operator's
+  environment variables are **not inherited** by the MCP client, which launches
+  the gateway in its own environment — set them where the client runs it.
+
 ```yaml
 transport: stdio            # stdio (Phase 1) | http (Phase 2)
 listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default
-# auth_token: ${AIMCPGATE_TOKEN}  # required if you widen listen_addr past loopback
+# auth_token: ${AIMCPGATE_TOKEN}  # required if you widen listen_addr past loopback;
+#                                 # the variable must be set or startup fails
 log_file: ./logs/calls.jsonl
 # debug_payload_log: ./logs/payloads.jsonl  # OPT-IN, off by default: logs raw
 #                                   # arguments AND results — can contain secrets

@@ -608,3 +608,108 @@ func TestClientConfigSnippetDoesNotHTMLEscape(t *testing.T) {
 		t.Errorf("the config path with & < > is missing from the output:\n%s", out)
 	}
 }
+
+// C1. TestClientConfigStdioWarnsAboutEnvVarRefs is the key case of this change:
+// a stdio config with a RESOLVED env ref (the operator's shell HAS the variable)
+// must STILL warn on stderr, because the client launches the gateway in its own
+// environment and does not inherit the operator's shell. The variable NAME must
+// appear; its VALUE must not, on either stream.
+func TestClientConfigStdioWarnsAboutEnvVarRefs(t *testing.T) {
+	const val = "resolved-value-must-not-appear"
+	t.Setenv("TEST_AIMCPGATE_CC_TOKEN", val)
+	cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: gh
+    command: /bin/true
+    enabled: true
+    env:
+      GITHUB_TOKEN: ${TEST_AIMCPGATE_CC_TOKEN}
+`)
+
+	out, errOut, err := execRootStreams(t, "client-config", "-c", cfgPath)
+	if err != nil {
+		t.Fatalf("client-config failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(errOut, "WARNING") {
+		t.Errorf("stderr must warn that the client does not inherit env vars:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "TEST_AIMCPGATE_CC_TOKEN") {
+		t.Errorf("the warning must name the variable:\n%s", errOut)
+	}
+	if strings.Contains(out+errOut, val) {
+		t.Errorf("the resolved VALUE leaked into the output:\n%s", out+errOut)
+	}
+	// The warning belongs on stderr only — stdout is meant to be piped.
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("the env-var warning must not pollute stdout:\n%s", out)
+	}
+
+	t.Run("unresolved ref also warns", func(t *testing.T) {
+		cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: gh
+    command: /bin/true
+    enabled: true
+    env:
+      GITHUB_TOKEN: ${TEST_AIMCPGATE_CC_UNSET}
+`)
+		_, errOut, err := execRootStreams(t, "client-config", "-c", cfgPath)
+		if err != nil {
+			t.Fatalf("client-config failed: %v", err)
+		}
+		if !strings.Contains(errOut, "TEST_AIMCPGATE_CC_UNSET") {
+			t.Errorf("an unresolved env ref must warn too:\n%s", errOut)
+		}
+	})
+}
+
+// C2. TestClientConfigStdioNoRefsNoWarning: a config with no ${VAR} at all must
+// not emit the new env-var warning.
+func TestClientConfigStdioNoRefsNoWarning(t *testing.T) {
+	cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: local
+    command: /bin/true
+    enabled: true
+`)
+	_, errOut, err := execRootStreams(t, "client-config", "-c", cfgPath)
+	if err != nil {
+		t.Fatalf("client-config failed: %v", err)
+	}
+	if strings.Contains(errOut, "NOT inherited") || strings.Contains(errOut, "references environment variable") {
+		t.Errorf("a config with no ${VAR} must not emit the env-var warning:\n%s", errOut)
+	}
+}
+
+// C3. TestClientConfigHTTPUnaffected: the HTTP branch must NOT gain the new
+// env-var warning (§4.7) — it hands the client an endpoint of a gateway already
+// running in the operator's environment. Only the pre-existing secret warning
+// (about the embedded auth_token) may appear.
+func TestClientConfigHTTPUnaffected(t *testing.T) {
+	const val = "http-resolved-value"
+	t.Setenv("TEST_AIMCPGATE_CC_HTTP", val)
+	cfgPath := writeDoctorConfig(t, `
+transport: http
+listen_addr: "127.0.0.1:29098"
+log_level: error
+upstreams:
+  - name: remote
+    url: https://example.com/mcp
+    enabled: true
+    headers:
+      Authorization: "Bearer ${TEST_AIMCPGATE_CC_HTTP}"
+`)
+	_, errOut, err := execRootStreams(t, "client-config", "-c", cfgPath)
+	if err != nil {
+		t.Fatalf("client-config failed: %v", err)
+	}
+	if strings.Contains(errOut, "references environment variable") || strings.Contains(errOut, "NOT inherited") {
+		t.Errorf("the HTTP branch must not carry the stdio env-var warning:\n%s", errOut)
+	}
+}
