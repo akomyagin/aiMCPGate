@@ -120,6 +120,8 @@ func runServe(parent context.Context, configPath, envFile string, watchConfig ti
 		logger.Warn("payload logging ENABLED: request/response bodies (incl. possible secrets) are written to disk; disable in production", "path", cfg.DebugPayloadLog)
 	}
 
+	reportUnresolvedSecretVars(cfg, callLog, logger)
+
 	reg := registry.New(cfg, logger, callLog, payloadLog, true, version)
 	srv := transport.NewServer(cfg, reg, logger, version)
 
@@ -146,6 +148,40 @@ func runServe(parent context.Context, configPath, envFile string, watchConfig ti
 	// catalog — the gateway cannot declare what its own client supports to its
 	// upstreams before that client's initialize has been parsed (Stage 15).
 	return srv.Serve(ctx)
+}
+
+// reportUnresolvedSecretVars journals one event per unresolved ${VAR}
+// reference in the env/headers of ENABLED upstreams, plus a logger.Warn for
+// each. It lives here, in runServe, and not in config.Load, because Load runs
+// long before the journal exists — Load therefore returns what it saw on the
+// Config (SecretVarRefs) and the emitting happens at the first point both the
+// facts and the journal are in hand. Disabled upstreams are skipped: their
+// env is never used, so the event would warn about a hazard that cannot fire
+// (doctor still lists them). Time and Kind are stamped explicitly — the
+// stamping in registry.emitEvent is private to the registry. auth_token needs
+// no handling here: an unresolved auth_token never gets this far (Validate
+// fails the load). Variable NAMES only, never values.
+func reportUnresolvedSecretVars(cfg *config.Config, callLog logging.CallLog, logger *slog.Logger) {
+	enabled := make(map[string]bool, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		enabled[u.Name] = u.IsEnabled()
+	}
+	for _, ref := range cfg.SecretVarRefs {
+		if ref.Resolved || ref.Field == "auth_token" || !enabled[ref.Upstream] {
+			continue
+		}
+		subject := ref.Field + "[" + ref.Key + "]"
+		detail := "references unset environment variable " + ref.Var + "; the value expanded to an empty string"
+		logger.Warn("unresolved secret variable", "upstream", ref.Upstream, "subject", subject, "var", ref.Var)
+		callLog.RecordEvent(logging.EventRecord{
+			Time:     time.Now(),
+			Kind:     logging.KindEvent,
+			Event:    logging.EventUnresolvedSecretVar,
+			Upstream: ref.Upstream,
+			Subject:  subject,
+			Detail:   detail,
+		})
+	}
 }
 
 // watchReload listens for reload signals (SIGHUP) and applies a reload on

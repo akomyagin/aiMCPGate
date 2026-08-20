@@ -6,11 +6,15 @@
 //
 // Secrets (upstream API keys / tokens) are never stored inline in the committed
 // YAML: the values of auth_token and upstream env/headers entries are expanded
-// with os.ExpandEnv, so a config carries "${GITHUB_TOKEN}" and the real value
-// comes from the environment / a local .env, never from a file under git
-// (SKILL §2/§6). Expansion is scoped to exactly those fields — not the whole
-// file — so a literal '$' anywhere else (a URL, a password, a path) is never
-// misread as a variable reference.
+// against the environment (expandSecret, on os.Expand + os.LookupEnv), so a
+// config carries "${GITHUB_TOKEN}" and the real value comes from the
+// environment / a local .env, never from a file under git (SKILL §2/§6).
+// Expansion is scoped to exactly those fields — not the whole file — so a
+// literal '$' anywhere else (a URL, a password, a path) is never misread as a
+// variable reference. Every reference seen while expanding is recorded on
+// Config.SecretVarRefs (diagnostic only) so Load/Validate and the CLI can tell
+// an operator which variable a field points at — and, for auth_token, hard-fail
+// when it is unset (see expandSecret and Validate).
 package config
 
 import (
@@ -287,6 +291,17 @@ func (u Upstream) ResolveKind() UpstreamKind {
 	return UpstreamStdio
 }
 
+// SecretVarRef records one ${VAR} reference found while expanding a
+// secret-carrying field (auth_token, an upstream's env or headers value).
+// Diagnostic only — never round-trips through YAML, populated solely by Load.
+type SecretVarRef struct {
+	Upstream string // "" for the gateway's own auth_token
+	Field    string // "auth_token" | "env" | "headers"
+	Key      string // map key for env/headers, "" for auth_token
+	Var      string // the variable name referenced
+	Resolved bool   // false = os.LookupEnv found nothing
+}
+
 // Config is the fully-parsed gateway configuration.
 type Config struct {
 	// Transport selects the client-facing transport.
@@ -297,6 +312,19 @@ type Config struct {
 	// "Authorization: Bearer <token>". Use ${ENV_VAR} — never commit the value.
 	// Only meaningful for TransportHTTP; ignored for stdio.
 	AuthToken string `yaml:"auth_token"`
+
+	// SecretVarRefs is the diagnostic list of every ${VAR} reference seen while
+	// expanding secret-carrying fields (auth_token, upstream env/headers). It is
+	// populated SOLELY by Load and is NOT part of the declarative config — hence
+	// the mandatory `yaml:"-"` tag: without it yaml.v3 would map the field by its
+	// lowercased name ("secretvarrefs"), so a YAML file could inject entries into
+	// a diagnostic-only field, and under KnownFields(true) that same key is
+	// instead correctly rejected as unknown. Consumers: Validate hard-fails an
+	// unresolved auth_token ref; serve journals an event and doctor prints a line
+	// for unresolved env/headers refs; client-config warns the stdio snippet does
+	// not inherit these variables. Never carries a secret VALUE — only names and
+	// the config coordinates (upstream/field/key).
+	SecretVarRefs []SecretVarRef `yaml:"-"`
 
 	// Upstreams is the ordered set of MCP servers to aggregate.
 	Upstreams []Upstream `yaml:"upstreams"`
@@ -646,13 +674,25 @@ func Load(path string) (*Config, error) {
 	// (the previous approach) silently mangled any literal '$' anywhere in
 	// the YAML — a password, a URL, a path — since os.ExpandEnv has no way
 	// to tell "meant as a variable" from "just a dollar sign" (found by code
-	// review). An unset variable silently becomes the empty string (nothing
-	// currently validates these fields as non-empty) — a genuinely unset
-	// secret surfaces later as an upstream auth failure, not a config error.
-	cfg.AuthToken = os.ExpandEnv(cfg.AuthToken)
+	// review). Every reference is recorded on cfg.SecretVarRefs (diagnostic
+	// only) via expandSecret.
+	//
+	// An unset variable becomes the empty string for env/headers (nothing
+	// validates these as non-empty) — a genuinely unset upstream secret
+	// surfaces later as a 401 from that upstream, not a config error, and is
+	// reported ahead of time (serve's journal event, doctor's line). For
+	// auth_token the rule is DIFFERENT: an unset variable there is a hard
+	// error in Validate, because an empty auth_token silently disables the
+	// HTTP bearer check entirely (internal/transport/http.go).
+	cfg.AuthToken = expandSecret(cfg.AuthToken, "", "auth_token", "", &cfg.SecretVarRefs)
 	for i := range cfg.Upstreams {
-		expandMapValues(cfg.Upstreams[i].Env)
-		expandMapValues(cfg.Upstreams[i].Headers)
+		u := &cfg.Upstreams[i]
+		for k, v := range u.Env {
+			u.Env[k] = expandSecret(v, u.Name, "env", k, &cfg.SecretVarRefs)
+		}
+		for k, v := range u.Headers {
+			u.Headers[k] = expandSecret(v, u.Name, "headers", k, &cfg.SecretVarRefs)
+		}
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportStdio
@@ -675,13 +715,37 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// expandMapValues expands ${VAR}/$VAR in each value of m against the
-// environment, in place. Keys (header/env-var names) are left untouched —
-// only values are meant to carry secrets.
-func expandMapValues(m map[string]string) {
-	for k, v := range m {
-		m[k] = os.ExpandEnv(v)
-	}
+// envVarNameRe matches names that can actually denote an environment variable.
+// Anything os.Expand extracts that does NOT match (shell specials: "$", "5",
+// "#"…) is replaced with "" exactly as os.ExpandEnv used to do, and is NOT
+// recorded — it cannot be a variable the operator meant (see the plan, §4.3).
+var envVarNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// expandSecret expands ${VAR}/$VAR in value against the environment and
+// appends one SecretVarRef per reference to *refs. os.Expand + os.LookupEnv
+// instead of os.ExpandEnv, for two reasons ExpandEnv cannot serve: it never
+// says WHICH variable it failed to find, and it cannot tell "unset" from
+// "set but empty" — an unset variable must hard-fail auth_token (Validate),
+// while an explicitly empty one is the operator's call and passes.
+//
+// upstream/field/key locate the reference for diagnostics: upstream is "" for
+// the gateway's own auth_token; key is the map key for env/headers and "" for
+// auth_token. Shell-special names ($$, $5, $#…) that os.Expand hands us are
+// replaced with "" — byte-for-byte the old os.ExpandEnv behaviour — and are
+// deliberately NOT recorded: they cannot be a real variable, and recording
+// "$$" as an unset ref would turn a literal auth_token like "p$$w" into a hard
+// failure.
+func expandSecret(value, upstream, field, key string, refs *[]SecretVarRef) string {
+	return os.Expand(value, func(name string) string {
+		if !envVarNameRe.MatchString(name) {
+			return ""
+		}
+		v, ok := os.LookupEnv(name)
+		*refs = append(*refs, SecretVarRef{
+			Upstream: upstream, Field: field, Key: key, Var: name, Resolved: ok,
+		})
+		return v
+	})
 }
 
 // resolveRelative joins path onto dir when path is relative and non-empty;
@@ -710,6 +774,29 @@ func (c *Config) Validate() error {
 	// listen address, so the check applies to TransportHTTP only.
 	if c.Transport == TransportHTTP && c.AuthToken == "" && !isLoopbackAddr(c.EffectiveListenAddr()) {
 		return fmt.Errorf("listen_addr %q is not loopback-only but auth_token is empty: the HTTP endpoint would be reachable from the network without authentication — set auth_token or bind to a loopback address (127.0.0.1/::1/localhost)", c.EffectiveListenAddr())
+	}
+
+	// auth_token that references an UNSET environment variable is a hard error:
+	// to run without auth the key is REMOVED, so "key present but its variable
+	// is unset" is never intentional — and an empty auth_token silently disables
+	// the HTTP bearer check entirely (internal/transport/http.go, the
+	// token == "" branch), i.e. the cost is not "an auth failure at an
+	// upstream" but an access control that quietly ceased to exist. The check is
+	// transport-independent on purpose: configs get switched between modes, and
+	// the intent the key declares does not depend on today's transport.
+	// env/headers refs are deliberately NOT failed here: an empty value can be
+	// meaningful there and a genuinely missing secret surfaces addressably as a
+	// 401 from that upstream — they are reported instead (serve's journal event,
+	// doctor's report line). Decision log: docs/POST_MVP_PLAN.md, «Принятые
+	// решения» 2026-08-15.
+	var unsetAuthVars []string
+	for _, ref := range c.SecretVarRefs {
+		if ref.Field == "auth_token" && !ref.Resolved {
+			unsetAuthVars = append(unsetAuthVars, ref.Var)
+		}
+	}
+	if len(unsetAuthVars) > 0 {
+		return fmt.Errorf("auth_token references unset environment variable(s) %s — set them (or pass --env-file), or remove auth_token to run without authentication", strings.Join(unsetAuthVars, ", "))
 	}
 
 	if err := c.Restart.validate(); err != nil {

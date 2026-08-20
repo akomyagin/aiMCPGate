@@ -321,3 +321,55 @@ upstreams:
 		t.Errorf("broken row = %q, want FAIL with the command-not-found reason", row)
 	}
 }
+
+// D1. TestDoctorPrintsUnresolvedSecretVars: a config where an ENABLED upstream
+// carries an unresolved env ref and a DISABLED one carries its own. doctor's
+// stdout must show BOTH WARN lines — naming the variables, never a value —
+// with the disabled one marked "(upstream disabled)". The exit code is still
+// driven only by the OK/FAIL table (the enabled upstream is healthy → nil).
+func TestDoctorPrintsUnresolvedSecretVars(t *testing.T) {
+	bin := buildFakeServer(t)
+	cfgPath := writeDoctorConfig(t, `
+transport: stdio
+log_level: error
+upstreams:
+  - name: gh
+    command: `+bin+`
+    enabled: true
+    env:
+      FAKE_TOOLS: "ping"
+      GITHUB_TOKEN: ${TEST_AIMCPGATE_UNSET_GH}
+  - name: old
+    command: `+bin+`
+    enabled: false
+    headers:
+      Authorization: ${TEST_AIMCPGATE_UNSET_OLD}
+`)
+
+	root := Build("test")
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"doctor", "-c", cfgPath})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("doctor exit code must be driven by the table (enabled upstream healthy → nil), got: %v\n%s", err, out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "TEST_AIMCPGATE_UNSET_GH") {
+		t.Errorf("stdout must name the enabled upstream's unresolved variable:\n%s", s)
+	}
+	if !strings.Contains(s, "TEST_AIMCPGATE_UNSET_OLD") {
+		t.Errorf("stdout must name the disabled upstream's unresolved variable:\n%s", s)
+	}
+	// The disabled upstream's warning must carry the marker; the enabled one
+	// must NOT. Find the two lines and check each.
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "TEST_AIMCPGATE_UNSET_OLD") && !strings.Contains(line, "(upstream disabled)") {
+			t.Errorf("disabled upstream's WARN line must carry the marker:\n%s", line)
+		}
+		if strings.Contains(line, "TEST_AIMCPGATE_UNSET_GH") && strings.Contains(line, "(upstream disabled)") {
+			t.Errorf("enabled upstream's WARN line must NOT carry the disabled marker:\n%s", line)
+		}
+	}
+}
