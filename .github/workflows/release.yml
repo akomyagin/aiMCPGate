@@ -29,14 +29,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Kept in lockstep with the `go` directive in go.mod (currently 1.23.4)
+      # Kept in lockstep with the `go` directive in go.mod (currently 1.26.7)
       # and with the Go version in the Glama.ai build spec. setup-go v6 changed
       # toolchain selection, which only bites when go.mod declares a `toolchain`
       # line different from the pinned version — we have none, the versions
       # match exactly.
+      #
+      # Bumped 2026-08-20 from 1.23.4: govulncheck found 34 reachable stdlib
+      # vulnerabilities (net/http request smuggling, crypto/x509 IPv6-zone
+      # constraint bypass, and others with real call traces into
+      # internal/mcp/codec.go, internal/upstream/http.go,
+      # internal/transport/http.go) — none had a fix released in the 1.23.x
+      # line because it had already aged out of Go's security-support window
+      # (last two majors only). Verified clean (`govulncheck ./...` reports
+      # "No vulnerabilities found") and `go build`/`go test -race ./...` green
+      # on 1.26.7 before this bump, with zero source changes required.
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.23.4"
+          go-version: "1.26.7"
 
       # qemu + buildx let goreleaser build the linux/arm64 image on the amd64
       # runner; the login lets it push both images and the multi-arch manifests
