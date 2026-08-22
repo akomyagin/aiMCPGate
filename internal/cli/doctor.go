@@ -51,6 +51,7 @@ func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
 	}
 
 	printUnresolvedSecretVars(cmd, cfg)
+	printCleartextSecretWarnings(cmd, cfg)
 
 	logger := logging.New(cfg.LogLevel, os.Stderr)
 
@@ -110,6 +111,28 @@ func printUnresolvedSecretVars(cmd *cobra.Command, cfg *config.Config) {
 		line := fmt.Sprintf("WARN upstream %q: %s[%s] references unset environment variable %s — the value expanded to empty",
 			ref.Upstream, ref.Field, ref.Key, ref.Var)
 		if !enabled[ref.Upstream] {
+			line += " (upstream disabled)"
+		}
+		fmt.Fprintln(out, line)
+	}
+}
+
+// printCleartextSecretWarnings prints one line per config.CleartextSecretWarnings
+// finding (security brainstorm 2026-08-20, S5/S6) — a secret travelling over
+// plain HTTP to a non-loopback host. Unlike serve's Warn log, this includes
+// DISABLED upstreams: doctor's whole job is to explain a doubtful config,
+// dormant hazards included (mirrors printUnresolvedSecretVars). Exit code is
+// unaffected — same reasoning as unresolved-var warnings: a warning, not a
+// per-upstream FAIL.
+func printCleartextSecretWarnings(cmd *cobra.Command, cfg *config.Config) {
+	out := cmd.OutOrStdout()
+	enabled := make(map[string]bool, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		enabled[u.Name] = u.IsEnabled()
+	}
+	for _, w := range cfg.CleartextSecretWarnings() {
+		line := "WARN " + w.Message
+		if w.Upstream != "" && !enabled[w.Upstream] {
 			line += " (upstream disabled)"
 		}
 		fmt.Fprintln(out, line)

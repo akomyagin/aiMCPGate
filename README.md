@@ -536,6 +536,15 @@ knows the exact value, and it **redacts that value to `***`** in operator-facing
 free text — the journal (`mcp-gate logs`) and crash logs. With no secrets
 configured this costs nothing.
 
+A secret travelling over **plain, unencrypted HTTP to a non-loopback host**
+gets a `WARN` at startup and a line in `mcp-gate doctor` (never a hard
+failure — cleartext on trusted infrastructure, e.g. a VPN or an isolated LAN,
+can be a deliberate choice the gateway cannot second-guess from the config
+alone): a non-empty `auth_token` bound past loopback, or an upstream's
+`headers` sent to a non-`https://` non-loopback `url`. TLS itself is not
+built into the gateway — put a TLS-terminating reverse proxy in front if you
+need it, the same pattern already recommended for mutual TLS.
+
 ```yaml
 transport: stdio            # stdio (Phase 1) | http (Phase 2)
 listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default

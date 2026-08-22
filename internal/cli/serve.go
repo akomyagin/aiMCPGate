@@ -121,6 +121,7 @@ func runServe(parent context.Context, configPath, envFile string, watchConfig ti
 	}
 
 	reportUnresolvedSecretVars(cfg, callLog, logger)
+	reportCleartextSecretWarnings(cfg, logger)
 
 	reg := registry.New(cfg, logger, callLog, payloadLog, true, version)
 	srv := transport.NewServer(cfg, reg, logger, version)
@@ -181,6 +182,27 @@ func reportUnresolvedSecretVars(cfg *config.Config, callLog logging.CallLog, log
 			Subject:  subject,
 			Detail:   detail,
 		})
+	}
+}
+
+// reportCleartextSecretWarnings logs one Warn per config.CleartextSecretWarnings
+// finding (security brainstorm 2026-08-20, S5/S6) — a secret travelling over
+// plain HTTP to a non-loopback host. Filtered to ENABLED upstreams (the
+// gateway's own auth_token finding always passes: Upstream == "" is never
+// filtered out) — a disabled upstream makes no live call, so its finding
+// describes a hazard that cannot fire yet; doctor lists it anyway (dormant
+// hazards included, see printCleartextSecretWarnings). No journal event: this
+// is operator-facing at startup, not a per-call audit fact.
+func reportCleartextSecretWarnings(cfg *config.Config, logger *slog.Logger) {
+	enabled := make(map[string]bool, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		enabled[u.Name] = u.IsEnabled()
+	}
+	for _, w := range cfg.CleartextSecretWarnings() {
+		if w.Upstream != "" && !enabled[w.Upstream] {
+			continue
+		}
+		logger.Warn(w.Message, "upstream", w.Upstream)
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -956,6 +957,63 @@ func isLoopbackAddr(addr string) bool {
 		host = addr
 	}
 	return IsLoopbackHost(host)
+}
+
+// CleartextSecretWarning is one finding from CleartextSecretWarnings: a
+// secret that would travel over plain, unencrypted HTTP to a non-loopback
+// host. Message never carries a secret value, only the shape of the risk.
+type CleartextSecretWarning struct {
+	Upstream string // "" for the gateway's own auth_token
+	Message  string
+}
+
+// CleartextSecretWarnings reports every place a secret would travel over
+// PLAIN, unencrypted HTTP to a NON-loopback host. Two sources, both
+// deliberately WARNINGS, not Validate errors: unlike the auth_token-empty
+// case (EffectiveListenAddr check above), a real secret over
+// cleartext-but-trusted infrastructure (a VPN, an isolated LAN) can be a
+// legitimate operator choice — the gateway cannot tell "trusted network" from
+// "hostile network" from the config alone, so it informs rather than
+// refuses. Consumers: serve logs one Warn per finding at startup (filtered to
+// ENABLED upstreams — mirroring reportUnresolvedSecretVars, a disabled
+// upstream makes no live call so the hazard cannot fire yet), doctor prints
+// one report line per finding INCLUDING disabled ones (mirroring
+// printUnresolvedSecretVars — doctor's job is to explain the config as
+// written, dormant hazards included); that split is why Upstream is
+// returned structured rather than baked into Message. TLS itself is
+// deliberately NOT built into the gateway — same reasoning already applied to
+// mTLS (docs/POST_MVP_PLAN.md, «Рассмотрено и отклонено»): put a
+// TLS-terminating reverse proxy in front instead.
+//
+//   - S5 — the gateway's OWN auth_token: HTTP transport, a non-empty token,
+//     and a non-loopback listen_addr. (An EMPTY token on non-loopback is
+//     already a hard Validate error, above — that case never reaches here.)
+//   - S6 — an upstream's Headers (typically an Authorization bearer token):
+//     an HTTP-kind upstream whose URL scheme is "http" (not "https") and
+//     whose host is non-loopback, with a non-empty Headers map.
+func (c *Config) CleartextSecretWarnings() []CleartextSecretWarning {
+	var warnings []CleartextSecretWarning
+	if c.Transport == TransportHTTP && c.AuthToken != "" && !isLoopbackAddr(c.EffectiveListenAddr()) {
+		warnings = append(warnings, CleartextSecretWarning{Message: fmt.Sprintf(
+			"auth_token is sent over plain HTTP to a non-loopback listen_addr (%q) — anyone on the network path can read it; put a TLS-terminating reverse proxy in front, or bind to a loopback address",
+			c.EffectiveListenAddr())})
+	}
+	for _, u := range c.Upstreams {
+		if u.ResolveKind() != UpstreamHTTP || len(u.Headers) == 0 {
+			continue
+		}
+		parsed, err := url.Parse(u.URL)
+		if err != nil || parsed.Scheme != "http" || IsLoopbackHost(parsed.Hostname()) {
+			continue
+		}
+		warnings = append(warnings, CleartextSecretWarning{
+			Upstream: u.Name,
+			Message: fmt.Sprintf(
+				"upstream %q sends secret headers over plain HTTP to a non-loopback host (%s) — anyone on the network path can read them; use https:// or move it to a trusted network",
+				u.Name, parsed.Hostname()),
+		})
+	}
+	return warnings
 }
 
 // validateToolFilter checks one upstream's tools filter and claims its
