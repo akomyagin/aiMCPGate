@@ -167,6 +167,37 @@ func TestSessionStoreStreamEndedRestoresMortality(t *testing.T) {
 	}
 }
 
+// TestSessionStoreStreamCap503 (security brainstorm 2026-08-20, S8): once a
+// session holds maxStreams open streams, streamStarted must refuse the next
+// one (false, no increment) rather than let the tally grow without bound —
+// the store-level counterpart of TestSessionStoreCapAndSweep, but per-session
+// rather than store-wide. streamEnded freeing a slot must let a later call
+// succeed again.
+func TestSessionStoreStreamCap503(t *testing.T) {
+	st, _ := testStore(t, 5*time.Minute, 8)
+	st.maxStreams = 2
+
+	sess, _ := st.create("streamer/1", nil)
+
+	if ok := st.streamStarted(sess); !ok {
+		t.Fatal("first stream refused, want ok=true (cap is 2)")
+	}
+	if ok := st.streamStarted(sess); !ok {
+		t.Fatal("second stream refused, want ok=true (cap is 2)")
+	}
+	if ok := st.streamStarted(sess); ok {
+		t.Fatal("third stream admitted past the cap, want ok=false (503)")
+	}
+	if n := st.streamCount(sess); n != 2 {
+		t.Fatalf("stream tally after the refused 3rd = %d, want 2 (refusal must not increment)", n)
+	}
+
+	st.streamEnded(sess)
+	if ok := st.streamStarted(sess); !ok {
+		t.Fatal("stream refused after a slot freed up, want ok=true")
+	}
+}
+
 func TestSessionStoreCapAndSweep(t *testing.T) {
 	const ttl = 5 * time.Minute
 	st, advance := testStore(t, ttl, 2)

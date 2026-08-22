@@ -43,6 +43,18 @@ const sessionIdleTimeout = 30 * time.Minute
 // honestly refusing a new one.
 const maxSessions = 256
 
+// maxStreamsPerSession caps how many open GET SSE streams a single session
+// may hold at once (security brainstorm 2026-08-20, S8): nothing previously
+// bounded this, so one Mcp-Session-Id spamming GET /mcp could grow
+// httpSession.streams and .reqStreams without limit, each open stream
+// costing a goroutine (handleSSE's own, parked in its select loop) plus two
+// registry subscriptions and a buffered channel. 16 is well above any real
+// client's reconnect/multi-tab overlap — the gateway is single-user by
+// design — while still bounding the cost of one misbehaving or hostile
+// client. Same overflow answer as maxSessions: 503, not silently dropping an
+// existing stream to make room.
+const maxStreamsPerSession = 16
+
 // httpSession is the state of one client HTTP session. Every field except id
 // and done is read and written ONLY under sessionStore.mu.
 type httpSession struct {
@@ -93,11 +105,12 @@ type httpSession struct {
 // lock, handlers run concurrently, and a single lock makes the "no field of
 // httpSession is touched outside it" rule checkable by eye (and by -race).
 type sessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*httpSession
-	idleTTL  time.Duration    // = sessionIdleTimeout; tests shorten it
-	max      int              // = maxSessions; tests shrink it
-	now      func() time.Time // = time.Now; test hook for expiry without sleeping
+	mu         sync.Mutex
+	sessions   map[string]*httpSession
+	idleTTL    time.Duration    // = sessionIdleTimeout; tests shorten it
+	max        int              // = maxSessions; tests shrink it
+	maxStreams int              // = maxStreamsPerSession; tests shrink it
+	now        func() time.Time // = time.Now; test hook for expiry without sleeping
 
 	// reqOwners maps a gateway-minted server→client request id to the session
 	// it was delivered to (Stage 17a). It lives HERE, under the same mutex as
@@ -126,11 +139,12 @@ type sessionStore struct {
 
 func newSessionStore() *sessionStore {
 	return &sessionStore{
-		sessions:  map[string]*httpSession{},
-		reqOwners: map[string]*httpSession{},
-		idleTTL:   sessionIdleTimeout,
-		max:       maxSessions,
-		now:       time.Now,
+		sessions:   map[string]*httpSession{},
+		reqOwners:  map[string]*httpSession{},
+		idleTTL:    sessionIdleTimeout,
+		max:        maxSessions,
+		maxStreams: maxStreamsPerSession,
+		now:        time.Now,
 	}
 }
 
@@ -246,12 +260,18 @@ func (st *sessionStore) terminate(id string) bool {
 }
 
 // streamStarted / streamEnded track open GET SSE streams of a session, which
-// hold off expiry while they live.
-func (st *sessionStore) streamStarted(s *httpSession) {
+// hold off expiry while they live. streamStarted reports false, without
+// incrementing the tally, once the session already holds maxStreamsPerSession
+// open streams — the caller must not proceed to open one (§ maxStreamsPerSession).
+func (st *sessionStore) streamStarted(s *httpSession) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if s.streams >= st.maxStreams {
+		return false
+	}
 	s.streams++
 	s.lastSeen = st.now()
+	return true
 }
 
 func (st *sessionStore) streamEnded(s *httpSession) {

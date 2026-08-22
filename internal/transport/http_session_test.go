@@ -693,3 +693,63 @@ func TestHTTPClosedStreamLetsSessionExpireAgain(t *testing.T) {
 		t.Fatalf("POST on a session idle past the TTL after its stream closed: status = %d, want 404 (a closed stream must stop pinning the session alive)", late.StatusCode)
 	}
 }
+
+// H18. TestHTTPSSEStreamCap503 (security brainstorm 2026-08-20, S8): one
+// session opening more than maxStreamsPerSession concurrent GET SSE streams
+// is refused 503 on the overflow attempt — mirrors H11's maxSessions
+// coverage, but per-session rather than store-wide. The two EXISTING open
+// streams must be left running (same "honest refusal, not eviction" contract
+// as H11), and once one of them closes and the tally drops, a new stream must
+// be admitted again.
+func TestHTTPSSEStreamCap503(t *testing.T) {
+	srv, hs, cleanup := startSessionGateway(t, "")
+	defer cleanup()
+
+	hs.sessions.maxStreams = 2 // set before any request is served
+
+	sid := initSession(t, srv, nil)
+
+	resp1 := openSSE(t, srv.URL, sessionHeaders(sid))
+	defer func() { _ = resp1.Body.Close() }()
+	requireSSEOpen(t, resp1)
+
+	resp2 := openSSE(t, srv.URL, sessionHeaders(sid))
+	defer func() { _ = resp2.Body.Close() }()
+	requireSSEOpen(t, resp2)
+
+	over := openSSE(t, srv.URL, sessionHeaders(sid))
+	_ = over.Body.Close()
+	if over.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /mcp opening a 3rd stream over a cap of 2: status = %d, want 503", over.StatusCode)
+	}
+
+	// The two already-open streams must be untouched by the refused 3rd: the
+	// cap rejects the newcomer, it does not evict an incumbent.
+	sess, _, ok := hs.sessions.touch(sid)
+	if !ok {
+		t.Fatal("session vanished while its SSE streams were open")
+	}
+	if n := hs.sessions.streamCount(sess); n != 2 {
+		t.Fatalf("stream tally after the refused 3rd stream = %d, want 2 (the refusal must not touch the existing streams)", n)
+	}
+
+	// Free a slot and confirm a new stream is admitted again.
+	_ = resp1.Body.Close()
+	events1 := sseEvents(resp1.Body)
+	for range events1 { // drain until the SSE reader sees the close
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if hs.sessions.streamCount(sess) < 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream tally stuck at 2 after a stream closed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	resp3 := openSSE(t, srv.URL, sessionHeaders(sid))
+	defer func() { _ = resp3.Body.Close() }()
+	requireSSEOpen(t, resp3)
+}

@@ -345,7 +345,14 @@ func (s *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.sessions.streamStarted(sess)
+	if !s.sessions.streamStarted(sess) {
+		// § maxStreamsPerSession (S8): this session already holds the cap's
+		// worth of open GET streams. Refusing a new one is the same overflow
+		// answer as maxSessions — 503, not silently dropping an existing
+		// stream to make room for this one.
+		http.Error(w, "too many concurrent streams for this session", http.StatusServiceUnavailable)
+		return
+	}
 	defer s.sessions.streamEnded(sess)
 
 	flusher, ok := w.(http.Flusher)
