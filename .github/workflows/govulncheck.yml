@@ -1,0 +1,53 @@
+name: govulncheck
+
+# Weekly, NOT on every push — this project's CI policy is release-tag-only by
+# explicit user decision (build/test-on-push was declined). This workflow does
+# not violate that: it is a scheduled security scan, not build/test-on-commit,
+# and it runs nothing the developer didn't already ask for once, globally.
+#
+# Why this exists: 2026-08-20, a manual govulncheck on master found 34
+# REACHABLE stdlib CVEs that had sat in already-published v0.5.0 binaries for
+# weeks — the Go toolchain pin (go.mod's `go` directive) had aged out of Go's
+# security-support window (only the last two majors receive backports) between
+# releases, and nothing had noticed. A weekly scan catches that class of drift
+# within days instead of at the next release, with zero noise on commits.
+on:
+  schedule:
+    # 06:00 UTC every Monday — arbitrary but fixed, so a failure has a
+    # predictable weekly cadence rather than firing at a different hour each
+    # time cron's minute-level jitter lands.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {} # manual trigger, e.g. right after bumping go.mod
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Kept in lockstep with the `go` directive in go.mod (currently 1.26.7),
+      # same reasoning as release.yml's setup-go step — a mismatched toolchain
+      # here would scan a DIFFERENT Go version's stdlib than the one that
+      # actually builds the release binaries.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.7"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      # Two scans, not one: plain `./...` misses vulnerabilities reachable
+      # only from _test.go files — internal/interop imports the official MCP
+      # Go SDK ONLY in its test file (by design: the SDK dependency never
+      # touches prod code), and govulncheck without -test silently excludes
+      # that import from its build graph entirely (found the hard way
+      # 2026-08-20: a vulnerable test-only dependency would pass a plain scan
+      # clean while still being present in `go.sum`).
+      - name: govulncheck (production code)
+        run: govulncheck ./...
+
+      - name: govulncheck (including test-only dependencies)
+        run: govulncheck -test ./...
