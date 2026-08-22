@@ -13,11 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE (not merge with) the workflow-level block,
     # so contents: write must be repeated here. packages: write is scoped to
-    # this job only: goreleaser pushes the OCI images to ghcr.io (Stage 12);
-    # npm-publish never touches GitHub Packages.
+    # this job only: goreleaser pushes the OCI images to ghcr.io (Stage 12).
+    # id-token: write (security brainstorm 2026-08-20, S4) lets cosign mint a
+    # keyless OIDC identity from THIS job run for sigstore's Fulcio/Rekor — no
+    # stored key, no secret to rotate or leak. npm-publish never touches
+    # GitHub Packages or signs anything, so neither permission is repeated there.
     permissions:
       contents: write
       packages: write
+      id-token: write
     # Action majors are floated (`@v7`), not SHA-pinned: this is a solo repo
     # publishing from a tag we cut by hand, so a compromised-tag window is a
     # worse trade than never noticing a deprecation again. All actions below sit
@@ -60,6 +64,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # syft + cosign (security brainstorm 2026-08-20, S4): goreleaser shells
+      # out to both binaries by name (`sboms:`/`signs:`/`docker_signs:` in
+      # .goreleaser.yaml default to `cmd: syft`/`cmd: cosign`), so they must
+      # already be on PATH before goreleaser-action runs — neither ships
+      # bundled with it. Both actions are the tool vendors' own (anchore,
+      # sigstore), matching this workflow's existing preference for
+      # official/vendor actions over third-party marketplace ones.
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - uses: sigstore/cosign-installer@v3
 
       # goreleaser-action v7 is the Node 24 / ESM rebuild; the goreleaser CLI
       # version it installs is a separate axis and stays on `~> v2`.

@@ -149,6 +149,55 @@ checksum:
   name_template: SHA256SUMS
   algorithm: sha256
 
+# SBOM (Software Bill of Materials) + cosign keyless signing (security
+# brainstorm 2026-08-20, finding S4): SHA256SUMS alone sits on the same
+# GitHub Release it is meant to verify — it protects against a corrupted
+# download, not against a compromised publishing account/CI. Both mechanisms
+# below are $0/мес and add no secrets to manage: cosign's KEYLESS mode signs
+# using the GitHub Actions OIDC token as identity (sigstore's Fulcio/Rekor
+# public-good instances), never a private key stored anywhere.
+#
+# One archive SBOM (SPDX JSON — syft's default output format when invoked
+# this way, verified locally: `goreleaser release --snapshot --clean
+# --skip=docker,publish,sign` produces spdxVersion "SPDX-2.3" documents, not
+# CycloneDX) per release artifact — what's IN each downloadable binary/
+# archive, for anyone doing dependency review before running it.
+sboms:
+  - id: archive
+    artifacts: archive
+
+# Sign the checksum file, not every archive individually: SHA256SUMS already
+# covers every archive by hash, so one signature transitively vouches for all
+# of them — goreleaser's own recommended pattern for this exact shape.
+# "--yes" is required for cosign 2.x running non-interactively (no TTY to
+# confirm the Rekor transparency-log write). The workflow
+# (.github/workflows/release.yml) grants id-token: write so cosign can mint
+# its OIDC identity; nothing here reads a stored key or secret.
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+# Sign the ghcr.io multi-arch manifests directly in the registry (cosign
+# `sign`, not `sign-blob` — the artifact is a remote image reference, not a
+# local file). `all` covers all configured docker_manifests entries
+# ({{ .Version }} AND latest) in one pass.
+docker_signs:
+  - cmd: cosign
+    artifacts: all
+    output: true
+    args:
+      - "sign"
+      - "${artifact}"
+      - "--yes"
+
 changelog:
   use: github
 
