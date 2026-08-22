@@ -118,3 +118,62 @@ func TestHTTPStderrTailReportsAbsence(t *testing.T) {
 		t.Fatalf("httpTransport.StderrTail() = %v, %v; want nil, false", tail, ok)
 	}
 }
+
+// U4. TestIsolatedEnvAllowlistNames pins the isolated-mode allowlist by name —
+// the Windows entries cannot be checked by a live run in this Linux-only
+// session, so this list is their only guard. Keep it synchronized with the
+// isolatedEnvAllowlist doc-comment (plan §3.3): change both together.
+func TestIsolatedEnvAllowlistNames(t *testing.T) {
+	want := []string{
+		"PATH", "HOME", "TMPDIR",
+		"SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE",
+	}
+	if len(isolatedEnvAllowlist) != len(want) {
+		t.Fatalf("isolatedEnvAllowlist = %v, want %v", isolatedEnvAllowlist, want)
+	}
+	for i, w := range want {
+		if isolatedEnvAllowlist[i] != w {
+			t.Errorf("isolatedEnvAllowlist[%d] = %q, want %q", i, isolatedEnvAllowlist[i], w)
+		}
+	}
+}
+
+// U5. TestBaseEnvironOnlySetAllowlisted: baseEnviron includes an allowlisted
+// variable that IS set (PATH), omits allowlisted names that are NOT set, and
+// never emits a variable outside the allowlist.
+func TestBaseEnvironOnlySetAllowlisted(t *testing.T) {
+	const marker = "TEST-AIMCPGATE-FAKE-PATH-BASE-0001"
+	t.Setenv("PATH", marker)
+	// A non-allowlisted variable that is set must not appear in the base.
+	t.Setenv("TEST_AIMCPGATE_NOT_ALLOWLISTED", "TEST-AIMCPGATE-FAKE-OUTSIDE-0002")
+
+	base := baseEnviron()
+
+	allowed := make(map[string]struct{}, len(isolatedEnvAllowlist))
+	for _, k := range isolatedEnvAllowlist {
+		allowed[k] = struct{}{}
+	}
+	foundPath := false
+	for _, kv := range base {
+		eq := -1
+		for i := 0; i < len(kv); i++ {
+			if kv[i] == '=' {
+				eq = i
+				break
+			}
+		}
+		if eq < 0 {
+			t.Fatalf("baseEnviron entry %q has no '='", kv)
+		}
+		key := kv[:eq]
+		if _, ok := allowed[key]; !ok {
+			t.Errorf("baseEnviron leaked a non-allowlisted variable %q", key)
+		}
+		if kv == "PATH="+marker {
+			foundPath = true
+		}
+	}
+	if !foundPath {
+		t.Errorf("baseEnviron must carry the set PATH; got %v", base)
+	}
+}

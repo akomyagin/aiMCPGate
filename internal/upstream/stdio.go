@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -135,13 +136,53 @@ func (c *stdioTransport) Name() string { return c.name }
 // true here: a stdio upstream always has a long-lived process to watch.
 func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 
+// isolatedEnvAllowlist is the minimal environment a stdio upstream receives
+// under env_isolation: strict, instead of inheriting the gateway's full
+// environment (which carries every OTHER upstream's secrets loaded via
+// --env-file). Unix entries: PATH (child processes of the upstream resolve
+// their own binaries — `npx` finds `node`), HOME (config dirs of most tools),
+// TMPDIR (os.TempDir and equivalents). Windows entries, per Microsoft's
+// CreateProcess/environment documentation and the de-facto contract of the
+// Win32 loader: SystemRoot and windir (many Win32 APIs, including WinSock,
+// fail without them), ComSpec (cmd.exe location for shell-outs), PATHEXT
+// (executable resolution — Go's own exec.LookPath consults it), TEMP/TMP,
+// USERPROFILE. Variables absent from the gateway's environment are simply
+// skipped, so the one list serves every GOOS. NOT verified by a live Windows
+// run in this session (Linux-only test environment) — the list is pinned by a
+// unit test on the names and by the cited documentation only.
+var isolatedEnvAllowlist = []string{
+	"PATH", "HOME", "TMPDIR",
+	"SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE",
+}
+
+// baseEnviron returns the isolated-mode base as KEY=VALUE pairs — only the
+// allowlisted variables that are actually set in the gateway's environment.
+func baseEnviron() []string {
+	base := make([]string, 0, len(isolatedEnvAllowlist))
+	for _, k := range isolatedEnvAllowlist {
+		if v, ok := os.LookupEnv(k); ok {
+			base = append(base, k+"="+v)
+		}
+	}
+	return base
+}
+
 // StartStdio launches command with args/env as a child process and starts the
 // reader goroutine. It does NOT perform the MCP handshake — call Initialize.
 //
 // ctx is bound to the process via exec.CommandContext, so cancelling ctx (e.g.
-// on Ctrl-C) terminates the child. env entries are "KEY=VALUE"; they are
-// appended to the current environment. gatewayVersion is the gateway's build
-// version, reported to the upstream as clientInfo.version in the handshake.
+// on Ctrl-C) terminates the child. env entries are "KEY=VALUE".
+//
+// isolate selects the environment the child receives. When false (the default,
+// env_isolation: ""), env is appended to the gateway's FULL current environment
+// — today's behaviour, unchanged. When true (env_isolation: strict), the child
+// gets only the minimal isolated base (baseEnviron: PATH/HOME/... that are
+// actually set) plus env; the gateway's environment — every OTHER upstream's
+// secrets and its own auth_token, all loaded via --env-file — is deliberately
+// NOT inherited. env is applied on top of the base either way, so an operator
+// can re-expose a specific gateway variable by listing it in the upstream's
+// env: block. gatewayVersion is the gateway's build version, reported to the
+// upstream as clientInfo.version in the handshake.
 //
 // onNotify, when non-nil, is invoked (from the reader goroutine) for each
 // notification the upstream sends, with the method and raw params. It must be
@@ -155,13 +196,19 @@ func (c *stdioTransport) Done() (<-chan struct{}, bool) { return c.done, true }
 // contract) for each server-initiated REQUEST the upstream sends mid-call,
 // with the method, the upstream's original id and raw params. nil means such
 // requests are ignored (log-and-drop), the pre-Round 14 behaviour.
-func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage)) (*Conn, error) {
+func StartStdio(ctx context.Context, log *slog.Logger, name, command string, args, env []string, isolate bool, gatewayVersion string, onNotify func(method string, params json.RawMessage), onRequest func(method string, id, params json.RawMessage)) (*Conn, error) {
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, fmt.Errorf("upstream %q: command %q not found: %w", name, command, err)
 	}
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	if len(env) > 0 {
+	switch {
+	case isolate:
+		// strict isolation: minimal base + the upstream's OWN env block only.
+		// The gateway's environment (other upstreams' secrets, its auth token,
+		// everything --env-file loaded) is deliberately NOT inherited.
+		cmd.Env = append(baseEnviron(), env...)
+	case len(env) > 0:
 		cmd.Env = append(cmd.Environ(), env...)
 	}
 

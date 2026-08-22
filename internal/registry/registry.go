@@ -227,9 +227,17 @@ type Registry struct {
 	// reading it (call timeout, restart policy). An atomic pointer gives those
 	// readers a consistent snapshot without a lock on the hot path. Access it
 	// only through r.config().
-	cfg     atomic.Pointer[config.Config]
-	log     *slog.Logger
-	callLog logging.CallLog
+	cfg atomic.Pointer[config.Config]
+	// scrubber redacts known secret values (config.ResolvedSecretValues) from
+	// operator-facing free text before it reaches slog or the journal: the
+	// crashed-upstream stderr tail, CallRecord.Err, EventRecord.Detail. Behind
+	// an atomic pointer for the same reason cfg is: Reload swaps it together with
+	// the config (env values may have changed), while readers run on supervisor
+	// and call goroutines. Never nil after New; Scrub itself is also nil-safe by
+	// design. Access it only through r.scrub.
+	scrubber atomic.Pointer[logging.Scrubber]
+	log      *slog.Logger
+	callLog  logging.CallLog
 	// payloadLog is the OPT-IN payload debug log (Stage 10). It is never nil —
 	// New always sets it (a no-op implementation when disabled) so CallTool can
 	// call Record unconditionally. Unlike callLog it carries raw arguments and
@@ -597,6 +605,7 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		procCancel:        procCancel,
 	}
 	r.cfg.Store(cfg)
+	r.scrubber.Store(logging.NewScrubber(cfg.ResolvedSecretValues()))
 	r.start = r.startUpstream
 	return r
 }
@@ -604,6 +613,11 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 // config returns the current configuration snapshot. It never returns nil after
 // New. Callers get a consistent pointer even while Reload swaps the config.
 func (r *Registry) config() *config.Config { return r.cfg.Load() }
+
+// scrub redacts known secret values from operator-facing free text. Nil-safe by
+// construction (the stored Scrubber is never nil after New, and Scrub itself is
+// nil-receiver-safe).
+func (r *Registry) scrub(s string) string { return r.scrubber.Load().Scrub(s) }
 
 // ConfigSnapshot returns the current config, safe to call from any goroutine.
 // It exists so other components (the HTTP transport) can read live config
@@ -645,7 +659,7 @@ func (r *Registry) startStdio(ctx context.Context, u config.Upstream) (Upstream,
 	onRequest := func(method string, id, params json.RawMessage) {
 		r.onUpstreamRequest(name, method, id, params)
 	}
-	conn, err := upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.version, onNotify, onRequest)
+	conn, err := upstream.StartStdio(ctx, r.log, u.Name, u.Command, u.Args, env, r.config().EnvIsolationStrict(), r.version, onNotify, onRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,7 +1022,7 @@ func (r *Registry) supervise(u config.Upstream, conn Upstream, done <-chan struc
 			// re-running at debug level and reproducing the crash.
 			if tail, ok := conn.StderrTail(); ok && len(tail) > 0 {
 				r.log.Warn("stdio upstream stderr before exit",
-					"upstream", u.Name, "lines", len(tail), "stderr_tail", strings.Join(tail, "\n"))
+					"upstream", u.Name, "lines", len(tail), "stderr_tail", r.scrub(strings.Join(tail, "\n")))
 			}
 			r.log.Warn("stdio upstream exited, attempting restart", "upstream", u.Name)
 			newConn, newDone, ok := r.restart(u, conn, supCtx)
@@ -1933,6 +1947,9 @@ func (r *Registry) Reload(ctx context.Context, newCfg *config.Config) error {
 
 	oldCfg := r.config()
 	r.cfg.Store(newCfg)
+	// Rebuild the value-scrubber from the reloaded config: Load re-read the
+	// environment, so a ${VAR} may now resolve to a different secret value.
+	r.scrubber.Store(logging.NewScrubber(newCfg.ResolvedSecretValues()))
 
 	// Index old and new enabled upstreams by name.
 	oldEnabled := enabledByName(oldCfg)
@@ -2697,7 +2714,7 @@ func (r *Registry) audit(ctx context.Context, up, method, tool string, start tim
 		Client:   ClientFromContext(ctx),
 		Duration: time.Since(start),
 		OK:       ok,
-		Err:      errMsg, // transport error or upstream error message; no arguments
+		Err:      r.scrub(errMsg), // transport/upstream error; known secret values redacted
 	})
 }
 
