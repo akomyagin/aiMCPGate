@@ -85,6 +85,11 @@ func (r *Registry) emitEvent(e logging.EventRecord) {
 	if e.Count == 1 {
 		e.Count = 0
 	}
+	// Redact known secret values from the free-text Detail here — the single
+	// choke point through which emitEvents, noteThrottled, flushEvents and every
+	// direct call flow (plan §5.4), so one scrub covers them all. Subject is
+	// gateway/upstream-minted method/tool/URI names and is left as-is (§11).
+	e.Detail = r.scrub(e.Detail)
 	r.callLog.RecordEvent(e)
 }
 

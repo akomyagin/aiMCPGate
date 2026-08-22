@@ -1241,3 +1241,138 @@ func containsRef(refs []SecretVarRef, want SecretVarRef) bool {
 	}
 	return false
 }
+
+// C1. TestValidateEnvIsolation: "" and "strict" pass; anything else is a
+// startup error naming the field and value.
+func TestValidateEnvIsolation(t *testing.T) {
+	mk := func(v string) *Config {
+		return &Config{
+			Transport:    TransportStdio,
+			EnvIsolation: v,
+			Upstreams:    []Upstream{{Name: "a", Command: "x"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		val     string
+		wantErr bool
+	}{
+		{"unset defaults", "", false},
+		{"strict", EnvIsolationStrict, false},
+		{"unknown value", "loose", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mk(tt.val).Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate(env_isolation=%q) err = %v, wantErr %v", tt.val, err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "env_isolation") {
+				t.Errorf("error %q must name the field", err)
+			}
+		})
+	}
+}
+
+// C2. TestLoadParsesEnvIsolation: the YAML key round-trips into the strict
+// helper; an absent key leaves the default (non-strict).
+func TestLoadParsesEnvIsolation(t *testing.T) {
+	load := func(t *testing.T, body string) *Config {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+
+	strict := load(t, `
+transport: stdio
+env_isolation: strict
+upstreams:
+  - name: a
+    command: /usr/bin/mcp
+    enabled: true
+`)
+	if !strict.EnvIsolationStrict() {
+		t.Error("env_isolation: strict must report EnvIsolationStrict() == true")
+	}
+
+	def := load(t, `
+transport: stdio
+upstreams:
+  - name: a
+    command: /usr/bin/mcp
+    enabled: true
+`)
+	if def.EnvIsolationStrict() {
+		t.Error("absent env_isolation must report EnvIsolationStrict() == false")
+	}
+}
+
+// C3. TestResolvedSecretValues pins §5.1: the returned values are the BARE
+// variable values, not the composite field text ("Bearer <secret>"), and an
+// unset variable contributes nothing.
+func TestResolvedSecretValues(t *testing.T) {
+	const secretA = "TEST-AIMCPGATE-FAKE-SECRET-ENV-A-0001"
+	const secretB = "TEST-AIMCPGATE-FAKE-SECRET-HDR-B-0002"
+	t.Setenv("TEST_AIMCPGATE_RESOLVED_A", secretA)
+	t.Setenv("TEST_AIMCPGATE_RESOLVED_B", secretB)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+transport: stdio
+upstreams:
+  - name: a
+    command: /usr/bin/mcp
+    env:
+      T: ${TEST_AIMCPGATE_RESOLVED_A}
+    enabled: true
+  - name: b
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${TEST_AIMCPGATE_RESOLVED_B}"
+    enabled: true
+  - name: c
+    command: /usr/bin/mcp
+    env:
+      U: ${TEST_AIMCPGATE_UNSET_X}
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	vals := cfg.ResolvedSecretValues()
+	has := func(s string) bool {
+		for _, v := range vals {
+			if v == s {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(secretA) {
+		t.Errorf("ResolvedSecretValues missing env value; got %v", vals)
+	}
+	if !has(secretB) {
+		t.Errorf("ResolvedSecretValues missing header value (bare, not composite); got %v", vals)
+	}
+	for _, v := range vals {
+		if strings.HasPrefix(v, "Bearer ") {
+			t.Errorf("ResolvedSecretValues returned composite field text %q, want bare value", v)
+		}
+		if v == "" {
+			t.Error("ResolvedSecretValues returned an empty string")
+		}
+	}
+}

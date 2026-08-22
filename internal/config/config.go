@@ -68,6 +68,24 @@ const (
 	CatalogModeLazy = "lazy"
 )
 
+// EnvIsolationStrict is the opt-in env_isolation value that stops stdio
+// upstreams from inheriting the gateway's full environment. THREAT: without it,
+// every stdio child inherits the gateway process environment — which carries
+// EVERY OTHER upstream's secrets and the gateway's own auth_token, all loaded
+// into the process by --env-file (os.Setenv, before config load). A single
+// captured "trusted" npx package would then read them all. Under "strict" the
+// child gets only a minimal cross-platform base (PATH/HOME/... — see
+// internal/upstream.baseEnviron) plus its OWN env: block; nothing else crosses.
+//
+// DEFAULT ("") preserves today's full-inheritance behaviour byte for byte, so
+// configs relying on an implicit PATH/HOME keep working. RELOAD SEMANTICS: the
+// value is read at process-launch time. A SIGHUP change takes effect for
+// upstreams (re)started afterwards (auto-restart, reload-diff added/changed);
+// already-live children keep the environment they were exec'd with — a process
+// environment cannot be rewritten after exec. Changing a security policy is a
+// legitimate reason to restart the gateway by hand.
+const EnvIsolationStrict = "strict"
+
 // upstreamNameRe restricts upstream names to characters that survive namespacing
 // into "<upstream>__<tool>" without breaking clients that expect tool names to
 // match ^[a-zA-Z0-9_-]+$ (Claude Code and friends). See docs/MCP_NOTES.md §6.
@@ -383,6 +401,13 @@ type Config struct {
 	// config on every request, so a SIGHUP reload switches modes without
 	// relaunching anything.
 	CatalogMode string `yaml:"catalog_mode"`
+	// EnvIsolation controls what environment a stdio upstream inherits. "" (the
+	// default) inherits the gateway's full environment, exactly as before. See
+	// EnvIsolationStrict for the "strict" opt-in, the threat it closes, and the
+	// reload semantics (the value is read at process-launch time; a SIGHUP change
+	// takes effect only for upstreams (re)started afterwards, never for already-
+	// live children). An unknown value is rejected by Validate.
+	EnvIsolation string `yaml:"env_isolation"`
 	// PageSize, when > 0, paginates tools/list responses into pages of at
 	// most this many tools, linked by an opaque nextCursor (MCP pagination).
 	// 0 (the default) keeps the old behaviour: the whole catalog in a single
@@ -529,6 +554,34 @@ func (c *Config) EffectiveCallTimeoutFor(name string) time.Duration {
 // the one place the string comparison lives, so the dispatcher never spells
 // "lazy" itself.
 func (c *Config) LazyCatalog() bool { return c.CatalogMode == CatalogModeLazy }
+
+// EnvIsolationStrict reports whether stdio upstreams run under strict
+// environment isolation (env_isolation: strict) — the one place the string
+// comparison lives, so callers never spell "strict" themselves.
+func (c *Config) EnvIsolationStrict() bool { return c.EnvIsolation == EnvIsolationStrict }
+
+// ResolvedSecretValues returns the VALUES of every environment variable a
+// secret-carrying config field resolved from (${VAR} with Resolved == true) —
+// the exact strings a value-scrubber must redact from operator-facing free
+// text. Looked up by variable NAME at call time, not read off the config
+// fields: a composite field value ("Bearer ${TOK}") differs from the secret
+// itself, and it is the bare secret that leaks into a child's stderr. The same
+// process environment expandSecret resolved from is still in place (applyEnvFile
+// Setenv'ed it before Load), so the lookup cannot disagree with the expansion.
+// Duplicates and empty strings may appear — the caller (logging.NewScrubber)
+// filters and dedupes. SecretVarRef itself stays value-free by contract.
+func (c *Config) ResolvedSecretValues() []string {
+	var out []string
+	for _, ref := range c.SecretVarRefs {
+		if !ref.Resolved {
+			continue
+		}
+		if v, ok := os.LookupEnv(ref.Var); ok && v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
 
 // EffectiveListenAddr returns ListenAddr or DefaultListenAddr if unset.
 func (c *Config) EffectiveListenAddr() string {
@@ -817,6 +870,12 @@ func (c *Config) Validate() error {
 	case "", CatalogModeNormal, CatalogModeLazy:
 	default:
 		return fmt.Errorf("unknown catalog_mode %q (want %q or %q)", c.CatalogMode, CatalogModeNormal, CatalogModeLazy)
+	}
+
+	switch c.EnvIsolation {
+	case "", EnvIsolationStrict:
+	default:
+		return fmt.Errorf("unknown env_isolation %q (want %q or %q)", c.EnvIsolation, "", EnvIsolationStrict)
 	}
 	if c.PageSize < 0 {
 		return fmt.Errorf("page_size must not be negative (0 disables tools/list pagination)")

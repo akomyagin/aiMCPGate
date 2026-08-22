@@ -520,6 +520,22 @@ Unset `${VAR}` references behave differently per field:
   environment variables are **not inherited** by the MCP client, which launches
   the gateway in its own environment — set them where the client runs it.
 
+By default every stdio upstream inherits the gateway's **full** process
+environment — including the secrets and `auth_token` that `--env-file` loaded
+for *other* upstreams. Set **`env_isolation: strict`** (global) so each stdio
+upstream instead receives only a minimal base (`PATH`, `HOME`, `TMPDIR`, and the
+Windows equivalents) plus its **own** `env:` block, which always reaches the
+child. Recommended when you run upstreams from open registries (`npx`-launched
+packages you do not fully trust). A gateway variable you *do* want a strict
+upstream to see, list explicitly in its `env:` (e.g. `PYTHONPATH: ${PYTHONPATH}`).
+The value is read at launch time: a live upstream keeps the environment it
+started with until it is (re)started.
+
+Separately, and always on: once the gateway has expanded a `${VAR}` secret it
+knows the exact value, and it **redacts that value to `***`** in operator-facing
+free text — the journal (`mcp-gate logs`) and crash logs. With no secrets
+configured this costs nothing.
+
 ```yaml
 transport: stdio            # stdio (Phase 1) | http (Phase 2)
 listen_addr: "127.0.0.1:28080"  # only used for transport: http; loopback by default
@@ -541,6 +557,10 @@ log_file: ./logs/calls.jsonl
 #                                   # ignored in lazy mode)
 # Auto-restart policy for crashed stdio upstreams (defaults: on, 1s→30s, 5 tries):
 # restart: { enabled: true, initial_backoff: 1s, max_backoff: 30s, max_attempts: 5 }
+# env_isolation: strict             # opt-in ("" default = inherit the gateway's full
+#                                   # env): a stdio upstream then gets only a minimal
+#                                   # base (PATH/HOME/...) plus its own env: block —
+#                                   # NOT other upstreams' secrets or the auth token
 upstreams:
   - name: filesystem        # stdio upstream
     command: npx
