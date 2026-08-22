@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -50,6 +51,14 @@ func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
 		return err
 	}
 
+	// Resolved AFTER loadConfig succeeded, so config.ResolvePath's own failure
+	// mode (os.Executable, only reachable when configPath == "") already would
+	// have surfaced as loadConfig's error above — this call is now infallible
+	// in practice. envFile needs no resolution: applyEnvFile reads it as given.
+	if resolvedConfigPath, rerr := config.ResolvePath(configPath); rerr == nil {
+		checkFilePerms(cmd, resolvedConfigPath, envFile)
+	}
+
 	printUnresolvedSecretVars(cmd, cfg)
 
 	logger := logging.New(cfg.LogLevel, os.Stderr)
@@ -86,6 +95,44 @@ func runDoctor(cmd *cobra.Command, configPath, envFile, version string) error {
 		return startErr
 	}
 	return nil
+}
+
+// checkFilePerms prints one WARN per path that is readable by group or others
+// under a POSIX permission model (security brainstorm 2026-08-20, S7):
+// config.yaml MAY hold a secret literal (env-substitution is a convention,
+// not enforced), and --env-file exists specifically to hold secrets. Neither
+// is checked anywhere else — the operator sets the file's mode once at
+// creation and nothing revisits it afterward.
+//
+// Windows is skipped entirely, not just "checked leniently": os.FileMode's
+// Unix permission bits there are a Go-synthesized approximation of the real
+// ACL (typically all-or-nothing read/write, unrelated to actual per-user
+// access control) — reporting them as if they meant something would be
+// actively misleading, worse than saying nothing.
+//
+// A missing/unreadable path is silently skipped — that is a DIFFERENT
+// problem doctor already surfaces elsewhere (loadConfig's own error for
+// config.yaml; applyEnvFile's for --env-file), not this check's job. A
+// directory is skipped too: the "consider chmod 600" wording only makes
+// sense for a file, and both paths are meant to name one (a misconfigured
+// --env-file pointing at a directory is a usage error, not this check's).
+func checkFilePerms(cmd *cobra.Command, paths ...string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	out := cmd.OutOrStdout()
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			fmt.Fprintf(out, "WARN %s is readable by group/others (mode %04o) — it may hold secrets; consider chmod 600 %s\n", p, perm, p)
+		}
+	}
 }
 
 // printUnresolvedSecretVars prints one line per unresolved ${VAR} reference
