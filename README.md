@@ -232,7 +232,9 @@ mcp-gate serve --config ./config-http.yaml
 
 # check every enabled upstream once (launch → handshake → tools/list) and print
 # a per-upstream OK/FAIL table; exit code is non-zero if any upstream failed
-# (scriptable for CI/cron), no auto-restart, no call logging — one pass then exit:
+# (scriptable for CI/cron), no auto-restart, no call logging — one pass then exit.
+# It also WARNs (POSIX only) if config.yaml or --env-file is readable by
+# group/others — either may hold a secret literal, and nothing else checks:
 mcp-gate doctor --config ./config.yaml
 
 # call one aggregated tool once from the shell (single bring-up, no supervisor —
