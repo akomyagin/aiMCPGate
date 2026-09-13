@@ -565,6 +565,13 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 	// buffering 4 MiB for a request that cannot be served), but a request with
 	// NO header still gets decoded first, so a malformed body keeps answering
 	// with the JSON-RPC parse error it always did rather than a bare 400.
+	//
+	// This pre-body 404 is a LEGACY-only fact and stays that way (Stage 19b): a
+	// conformant modern client sends NO Mcp-Session-Id at all (sessions were
+	// removed on the modern revision), so it never trips the check. Only a
+	// legacy client — or a modern client that wrongly re-sent a stale id — reach
+	// it, and rejecting the latter's stale id early is harmless. The era of a
+	// no-session-id request is then decided from its body's _meta, below.
 	sid := r.Header.Get(sessionHeader)
 	var sess *httpSession
 	var sessClient string
@@ -584,6 +591,15 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		// Malformed body: a JSON-RPC parse error with a null id (we could not
 		// read one), returned as 400 per the transport spec.
 		writeJSON(w, http.StatusBadRequest, mcp.NewError(nil, mcp.CodeParseError, "parse error: "+err.Error(), nil))
+		return
+	}
+
+	// Era branch (Stage 19b): a request carrying modern _meta is served
+	// stateless, off the whole session path below. Any Mcp-Session-Id it carries
+	// is ignored (never echoed) — a live session it happened to match is simply
+	// not touched further here.
+	if meta := mcp.ParseRequestMeta(msg.Params); meta.Modern() {
+		s.handleModernPost(w, r, &msg, meta)
 		return
 	}
 
@@ -695,6 +711,167 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, reply)
+}
+
+// Modern (2026-07-28) request headers, spelled as the spec does. Go's
+// http.Header canonicalizes on get/set, so the casing is for humans.
+const (
+	protocolVersionHeader = "MCP-Protocol-Version"
+	methodHeader          = "Mcp-Method"
+	nameHeader            = "Mcp-Name"
+)
+
+// handleModernPost serves one stateless modern (2026-07-28) request. It runs
+// off the whole session path: Mcp-Session-Id is ignored (streamable-http.mdx:
+// "ignore it, and do not mint or echo session IDs"), no session is created or
+// touched, and no session header is written back.
+//
+// The flow mirrors the legacy handlePost with the era-specific gates layered
+// in: validate the modern headers against the body (400 + -32020 on mismatch),
+// reject an unsupported version (400 + -32022), reject an unknown method (404 +
+// -32601 so a client can tell a modern server apart from a legacy HTTP+SSE 404),
+// lazily bring the registry up (declaring the request's own clientCapabilities),
+// then dispatch and map the reply's JSON-RPC error code to the HTTP status the
+// spec prescribes.
+func (s *httpServer) handleModernPost(w http.ResponseWriter, r *http.Request, msg *mcp.Message, meta mcp.RequestMeta) {
+	// 1. Headers against body. A conformant modern client mirrors method/name
+	//    and the protocol version into headers; a mismatch is a hard 400.
+	if code, ok := validateModernHeaders(r, msg, meta); !ok {
+		writeJSON(w, http.StatusBadRequest, mcp.NewError(msg.ID, mcp.CodeHeaderMismatch, code, nil))
+		return
+	}
+
+	// 2. Unsupported version → HTTP 400. dispatchModern also rejects it with
+	//    -32022, but the HTTP status for a version mismatch MUST be 400 (not the
+	//    200 an application-level error otherwise gets on this transport), so the
+	//    check is repeated here before the dispatch to set the right status.
+	if meta.ProtocolVersion != mcp.ProtocolVersionModern {
+		writeJSON(w, http.StatusBadRequest, mcp.NewError(msg.ID, mcp.CodeUnsupportedProtocolVersion,
+			"unsupported protocol version",
+			mcp.MustParams(mcp.UnsupportedVersionData{Supported: mcp.SupportedVersions, Requested: meta.ProtocolVersion})))
+		return
+	}
+
+	// 3. Unknown method → HTTP 404 + -32601 (streamable-http.mdx). The known set
+	//    is modernMethodKnown, the single source shared with the stdio lazy-start
+	//    decision and with routeModern's 200-vs-404 semantics.
+	if msg.IsRequest() && !modernMethodKnown(msg.Method) {
+		writeJSON(w, http.StatusNotFound, mcp.NewError(msg.ID, mcp.CodeMethodNotFound,
+			"method not found: "+msg.Method, nil))
+		return
+	}
+
+	// 4. Lazy registry bring-up (Stage 17a semantics), with the capabilities
+	//    taken from THIS request's _meta.clientCapabilities. ping does not exist
+	//    on the modern revision, so the "not ping" carve-out degenerates to
+	//    "is a request".
+	if msg.IsRequest() {
+		if err := s.ensureRegistry(serverReqCapsFromModernMeta(meta)); err != nil {
+			writeJSON(w, http.StatusOK, mcp.NewError(msg.ID, mcp.CodeInternalError,
+				"gateway failed to start its upstreams", nil))
+			return
+		}
+	}
+
+	// 5. Dispatch. The client identity comes from _meta.clientInfo (clientFromMeta),
+	//    the modern counterpart of the session-borne clientString.
+	ctx := registry.WithClient(r.Context(), clientFromMeta(meta))
+	reply := s.d.dispatch(ctx, msg)
+	if reply == nil {
+		// The modern revision does not define client notifications over HTTP, but
+		// if one arrives (nil reply) answer 202 as the legacy path does.
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	// 6. Map the reply's error code to the HTTP status the spec prescribes:
+	//    -32020/-32022 → 400, -32601 → 404, everything else (including ordinary
+	//    application-level errors) → 200, as on this transport it always was.
+	writeJSON(w, modernStatus(reply), reply)
+}
+
+// modernStatus maps a modern reply's JSON-RPC error code to its HTTP status.
+// The spec ties three codes to non-200 statuses (a header/version problem is a
+// 400, an unknown method a 404); every other reply — a success or an ordinary
+// application error — keeps the 200 this transport has always used for
+// protocol-level results.
+func modernStatus(reply *mcp.Message) int {
+	if reply.Error == nil {
+		return http.StatusOK
+	}
+	switch reply.Error.Code {
+	case mcp.CodeHeaderMismatch, mcp.CodeUnsupportedProtocolVersion:
+		return http.StatusBadRequest
+	case mcp.CodeMethodNotFound:
+		return http.StatusNotFound
+	default:
+		return http.StatusOK
+	}
+}
+
+// validateModernHeaders checks the modern per-request headers against the body
+// (streamable-http.mdx). On a mismatch it returns a human-readable message and
+// ok=false; the caller answers 400 + -32020. The checks:
+//   - MCP-Protocol-Version present and equal to _meta's protocolVersion;
+//   - Mcp-Method present and equal to msg.Method;
+//   - Mcp-Name (only on tools/call, prompts/get, resources/read) equal to the
+//     body's name/uri after DecodeHeaderSentinel; a broken sentinel is a 400,
+//     and on any other method Mcp-Name is not required (a stray one is ignored).
+func validateModernHeaders(r *http.Request, msg *mcp.Message, meta mcp.RequestMeta) (msgText string, ok bool) {
+	pv := r.Header.Get(protocolVersionHeader)
+	if pv == "" || pv != meta.ProtocolVersion {
+		return "header " + protocolVersionHeader + " does not match _meta protocolVersion", false
+	}
+	if h := r.Header.Get(methodHeader); h == "" || h != msg.Method {
+		return "header " + methodHeader + " does not match the request method", false
+	}
+	// Mcp-Name is required only on the three methods that carry a name/uri.
+	nameField, wantName := modernNameField(msg)
+	if !wantName {
+		return "", true
+	}
+	decoded, sentinelOK := mcp.DecodeHeaderSentinel(r.Header.Get(nameHeader))
+	if !sentinelOK {
+		return "header " + nameHeader + " has a malformed base64 sentinel", false
+	}
+	if decoded != nameField {
+		return "header " + nameHeader + " does not match the request " + nameHeaderTarget(msg.Method), false
+	}
+	return "", true
+}
+
+// modernNameField extracts the value Mcp-Name must mirror for the methods that
+// require it: params.name for tools/call and prompts/get, params.uri for
+// resources/read. want is false for every other method (Mcp-Name not required).
+// A params object that fails to parse yields ("", true) so the mismatch surfaces
+// as a header mismatch rather than a panic — the dispatcher will reject the
+// malformed params on its own path anyway.
+func modernNameField(msg *mcp.Message) (value string, want bool) {
+	switch msg.Method {
+	case mcp.MethodToolsCall, mcp.MethodPromptsGet:
+		var p struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		return p.Name, true
+	case mcp.MethodResourceRead:
+		var p struct {
+			URI string `json:"uri"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		return p.URI, true
+	default:
+		return "", false
+	}
+}
+
+// nameHeaderTarget names, for the mismatch message, which body field Mcp-Name
+// should have matched.
+func nameHeaderTarget(method string) string {
+	if method == mcp.MethodResourceRead {
+		return "uri"
+	}
+	return "name"
 }
 
 // authMiddleware rejects requests without a valid "Authorization: Bearer <token>"
