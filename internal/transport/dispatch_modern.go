@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 	"github.com/akomyagin/aiMCPGate/internal/registry"
@@ -34,7 +35,7 @@ func (d *dispatcher) dispatchModern(ctx context.Context, msg *mcp.Message, meta 
 			}))
 	}
 
-	reply := d.routeModern(ctx, msg)
+	reply := d.routeModern(ctx, msg, meta)
 
 	// Decorate only a successful result; an error is left exactly as built.
 	if reply != nil && reply.Error == nil && reply.Result != nil {
@@ -49,7 +50,7 @@ func (d *dispatcher) dispatchModern(ctx context.Context, msg *mcp.Message, meta 
 // until 19d, subscriptions/listen) are rejected -32601; server/discover is the
 // one genuinely new handler; everything else reuses the legacy handlers, which
 // are era-agnostic (they read only params.name/arguments/uri, never _meta).
-func (d *dispatcher) routeModern(ctx context.Context, msg *mcp.Message) *mcp.Message {
+func (d *dispatcher) routeModern(ctx context.Context, msg *mcp.Message, meta mcp.RequestMeta) *mcp.Message {
 	switch msg.Method {
 	case mcp.MethodServerDiscover:
 		return d.handleDiscover(msg)
@@ -71,15 +72,15 @@ func (d *dispatcher) routeModern(ctx context.Context, msg *mcp.Message) *mcp.Mes
 	case mcp.MethodToolsList:
 		return d.handleToolsList(msg)
 	case mcp.MethodToolsCall:
-		return d.dispatchToolsCall(ctx, msg)
+		return d.dispatchToolsCallModern(ctx, msg, meta)
 	case mcp.MethodPromptsList:
 		return d.handlePromptsList(msg)
 	case mcp.MethodPromptsGet:
-		return d.handlePromptsGet(ctx, msg)
+		return d.handlePromptsGetModern(ctx, msg, meta)
 	case mcp.MethodResourceList:
 		return d.handleResourcesList(msg)
 	case mcp.MethodResourceRead:
-		return d.handleResourcesRead(ctx, msg)
+		return d.handleResourcesReadModern(ctx, msg, meta)
 	case mcp.MethodResourceTemplatesList:
 		return d.handleResourceTemplatesList(msg)
 	case mcp.MethodCompletionComplete:
@@ -167,6 +168,127 @@ func serverReqCapsFromModernMeta(meta mcp.RequestMeta) map[string]json.RawMessag
 		}
 	}
 	return out
+}
+
+// dispatchToolsCallModern is tools/call for a modern client, routed through the
+// MRTR bridge: if the owning upstream asks the client for input mid-call
+// (elicitation/create, sampling/createMessage, roots/list), the client is not
+// sent a counter-request — it receives an InputRequiredResult and retries with
+// inputResponses (spec basic/patterns/mrtr.mdx). A retry (carrying requestState
+// or inputResponses) resumes the parked call; a first call starts it.
+//
+// The verbatim-proxy contract is unchanged from handleToolsCall: the upstream's
+// final result/error is forwarded under the CLIENT's id; params.Meta rides
+// along untouched. The MRTR fields are extracted separately (ExtractMRTRRetry)
+// so the Arguments/Meta verbatim contract is not diluted.
+func (d *dispatcher) dispatchToolsCallModern(ctx context.Context, msg *mcp.Message, meta mcp.RequestMeta) *mcp.Message {
+	var params mcp.ToolsCallParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "invalid tools/call params: "+err.Error(), nil)
+	}
+	if params.Name == "" {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "tools/call missing tool name", nil)
+	}
+	caps := serverReqCapsFromModernMeta(meta)
+	retry := mcp.ExtractMRTRRetry(msg.Params)
+	var out registry.MRTROutcome
+	var err error
+	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
+		out, err = d.reg.ResumeToolModern(ctx, params.Name, retry, caps)
+	} else {
+		out, err = d.reg.CallToolModern(ctx, params.Name, params.Arguments, params.Meta, caps)
+	}
+	return d.mrtrReply(msg.ID, out, err)
+}
+
+// handlePromptsGetModern is prompts/get through the MRTR bridge — the prompts
+// twin of dispatchToolsCallModern.
+func (d *dispatcher) handlePromptsGetModern(ctx context.Context, msg *mcp.Message, meta mcp.RequestMeta) *mcp.Message {
+	var params mcp.PromptsGetParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "invalid prompts/get params: "+err.Error(), nil)
+	}
+	if params.Name == "" {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "prompts/get missing prompt name", nil)
+	}
+	caps := serverReqCapsFromModernMeta(meta)
+	retry := mcp.ExtractMRTRRetry(msg.Params)
+	var out registry.MRTROutcome
+	var err error
+	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
+		out, err = d.reg.ResumeToolModern(ctx, params.Name, retry, caps)
+	} else {
+		out, err = d.reg.GetPromptModern(ctx, params.Name, params.Arguments, caps)
+	}
+	return d.mrtrReply(msg.ID, out, err)
+}
+
+// handleResourcesReadModern is resources/read through the MRTR bridge — the
+// resources twin. A URI no upstream owns follows ReadResource's
+// ErrUnknownResource → Invalid params contract via mrtrReply.
+func (d *dispatcher) handleResourcesReadModern(ctx context.Context, msg *mcp.Message, meta mcp.RequestMeta) *mcp.Message {
+	var params mcp.ResourceReadParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "invalid resources/read params: "+err.Error(), nil)
+	}
+	if params.URI == "" {
+		return mcp.NewError(msg.ID, mcp.CodeInvalidParams, "resources/read missing uri", nil)
+	}
+	caps := serverReqCapsFromModernMeta(meta)
+	retry := mcp.ExtractMRTRRetry(msg.Params)
+	var out registry.MRTROutcome
+	var err error
+	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
+		out, err = d.reg.ResumeToolModern(ctx, params.URI, retry, caps)
+	} else {
+		out, err = d.reg.ReadResourceModern(ctx, params.URI, caps)
+	}
+	return d.mrtrReply(msg.ID, out, err)
+}
+
+// mrtrReply turns an MRTROutcome into the client-facing reply under the
+// client's id:
+//
+//   - an error is mapped like the legacy handlers (guard refusals →
+//     CodeGatewayBusy via toolCallError; ErrUnknownRequestState → Invalid params
+//     so a stale/duplicate/forged retry is a client mistake, not a gateway
+//     fault; ErrUnknownResource → Invalid params; everything else → -32603);
+//   - InputRequests → an InputRequiredResult (resultType input_required, the
+//     gateway-minted keys the client echoes on retry, the opaque requestState);
+//   - Final → the upstream's raw result/error re-wrapped under the client's id,
+//     exactly as handleToolsCall does.
+//
+// dispatchModern decorates a successful result afterwards; an input_required
+// result already carries its resultType, which DecorateModernResult leaves
+// untouched (it only adds missing fields), and picks up _meta.serverInfo like
+// any other result.
+func (d *dispatcher) mrtrReply(id json.RawMessage, out registry.MRTROutcome, err error) *mcp.Message {
+	if err != nil {
+		if errors.Is(err, registry.ErrUnknownRequestState) {
+			return mcp.NewError(id, mcp.CodeInvalidParams, err.Error(), nil)
+		}
+		if errors.Is(err, registry.ErrUnknownResource) {
+			return mcp.NewError(id, mcp.CodeInvalidParams, err.Error(), nil)
+		}
+		return toolCallError(id, err)
+	}
+	if len(out.InputRequests) > 0 {
+		return mcp.NewResult(id, mcp.MustParams(mcp.InputRequiredResult{
+			ResultType:    mcp.ResultTypeInputRequired,
+			InputRequests: out.InputRequests,
+			RequestState:  out.RequestState,
+		}))
+	}
+	resp := out.Final
+	if resp == nil {
+		// Defence: a nil final with no questions and no error should not happen,
+		// but never panic — answer an internal error rather than dereference.
+		return mcp.NewError(id, mcp.CodeInternalError, "the tool call produced no response", nil)
+	}
+	if resp.Error != nil {
+		return mcp.NewError(id, resp.Error.Code, resp.Error.Message, resp.Error.Data)
+	}
+	return mcp.NewResult(id, resp.Result)
 }
 
 // clientFromMeta renders the modern client's identity as "name/version" for
