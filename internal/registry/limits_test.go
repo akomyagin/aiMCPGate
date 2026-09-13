@@ -288,7 +288,7 @@ func TestCallToolPlainFailureNotGuardMarked(t *testing.T) {
 // (mcp.message.go:24-26): an upstream that itself returns a JSON-RPC error —
 // even one whose code happens to equal the gateway's own CodeGatewayBusy — is
 // returned by CallTool with err==nil and resp.Error untouched. The gateway's
-// -32029 signal is emitted ONLY on its own guard refusals (err!=nil branch);
+// -32009 signal is emitted ONLY on its own guard refusals (err!=nil branch);
 // an identical code from an upstream is NOT a gateway signal and passes
 // verbatim.
 func TestCallToolUpstreamErrorCodeNotRemapped(t *testing.T) {

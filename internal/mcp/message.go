@@ -32,17 +32,25 @@ const (
 )
 
 // CodeGatewayBusy is the gateway's OWN implementation-defined JSON-RPC error
-// code (JSON-RPC 2.0 reserves -32000..-32099 for exactly this): a tools/call
-// the gateway REFUSED before forwarding, because a per-upstream guard
-// (rate_limit / max_concurrent) could not admit it within the caller's
-// context. The request never reached the upstream, so retrying is safe; the
-// error's data carries {"retryable":true,"reason":...} as the machine-readable
-// contract. -32000/-32001/-32002 are deliberately avoided (colloquially taken
-// by the official SDKs / spec examples: ConnectionClosed, RequestTimeout,
-// resource-not-found); -32029 is free and mnemonic of HTTP 429. Emitted ONLY
-// for the gateway's own guard refusals — an upstream's error code, whatever it
-// is, still proxies through verbatim per the invariant above.
-const CodeGatewayBusy = -32029
+// code: a tools/call the gateway REFUSED before forwarding, because a
+// per-upstream guard (rate_limit / max_concurrent) could not admit it within
+// the caller's context. The request never reached the upstream, so retrying is
+// safe; the error's data carries {"retryable":true,"reason":...} as the
+// machine-readable contract. Emitted ONLY for the gateway's own guard
+// refusals — an upstream's error code, whatever it is, still proxies through
+// verbatim per the invariant above.
+//
+// Value renumbered -32029 → -32009 (Stage 19a, 2026-09-13). MCP revision
+// 2026-07-28 tightened the JSON-RPC private range split: -32000..-32019 is
+// implementation-defined, but -32020..-32099 is now RESERVED for the MCP spec
+// itself (which already assigns -32020/-32021/-32022 there — see spec2026.go).
+// The old -32029 sat inside that reserved band; -32009 is the corrected slot,
+// still implementation-defined, still free of the colloquial SDK/spec values
+// (-32000/-32001/-32002: ConnectionClosed, RequestTimeout, resource-not-found),
+// and its trailing "9" keeps the HTTP-429 mnemonic. This is a deliberate
+// client-facing contract change (the numeric code moved); the error's data
+// (retryable/reason) is unchanged, so a matcher keyed on data still works.
+const CodeGatewayBusy = -32009
 
 // Message is a single MCP JSON-RPC 2.0 message in its most permissive form.
 //
