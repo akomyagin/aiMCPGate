@@ -244,6 +244,20 @@ func (r *Registry) onUpstreamRequest(name, method string, originalID, params jso
 		r.log.Debug("upstream request ignored", "upstream", name, "method", method)
 		return
 	}
+
+	// MRTR interception (Stage 19c) comes FIRST, before the legacy conveyor: a
+	// modern tools/call in flight on this upstream must convert the question into
+	// an InputRequiredResult for its client, never a counter-request. The gate is
+	// PER-REQUEST here (the waiter's own declared capabilities), not the
+	// process-wide clientDeclared the legacy path below uses — that is the whole
+	// point of modern honesty (plan §6.1 п.3). handleMRTRIfWaiting reports whether
+	// a modern call claimed the question; if it did, the legacy path is not
+	// touched, so a legacy client on a neighbouring session keeps working exactly
+	// as before (TestMRTRLegacyCoexistence).
+	if r.handleMRTRIfWaiting(name, method, spec, originalID, params) {
+		return
+	}
+
 	if !r.clientDeclared(spec.capability) {
 		spec.refuse(r, name, originalID,
 			"the gateway's client did not declare the "+spec.capability+" capability")
