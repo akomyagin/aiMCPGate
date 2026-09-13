@@ -1,5 +1,5 @@
 // Part A of fix/client-facing-guard-signals: a per-upstream guard refusal of a
-// tools/call reaches the client as the gateway's own CodeGatewayBusy (-32029)
+// tools/call reaches the client as the gateway's own CodeGatewayBusy (-32009)
 // with machine-readable retryable data, both on the direct namespaced path
 // (handleToolsCall) and through gate_call (lazyForwardCall).
 
@@ -92,7 +92,7 @@ func rateLimitedDispatcher(t *testing.T, catalogMode string) *dispatcher {
 
 // A5. TestDispatchToolsCallRateLimitedRetryable: two direct tools/call requests
 // under a burst-1 limiter; the second is refused by the gateway and returns
-// -32029 with retryable data, under the client's own id.
+// -32009 with retryable data, under the client's own id.
 func TestDispatchToolsCallRateLimitedRetryable(t *testing.T) {
 	d := rateLimitedDispatcher(t, "")
 
@@ -127,7 +127,7 @@ func TestDispatchToolsCallRateLimitedRetryable(t *testing.T) {
 }
 
 // A7. TestLazyGateCallGuardRefusalRetryable: the same refusal reached through
-// the gate_call meta-tool (lazy catalog mode) also yields -32029 + retryable
+// the gate_call meta-tool (lazy catalog mode) also yields -32009 + retryable
 // data — pinning the shared toolCallError in lazyForwardCall.
 func TestLazyGateCallGuardRefusalRetryable(t *testing.T) {
 	d := rateLimitedDispatcher(t, config.CatalogModeLazy)
