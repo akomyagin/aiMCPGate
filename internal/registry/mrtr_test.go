@@ -1,14 +1,17 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/akomyagin/aiMCPGate/internal/config"
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -50,6 +53,20 @@ func (f *mrtrFakeUpstream) RespondUpstreamRequest(msg *mcp.Message) error {
 }
 
 func (f *mrtrFakeUpstream) CallTool(ctx context.Context, name string, _, _ json.RawMessage) (*mcp.Message, error) {
+	return f.serve(ctx, name)
+}
+
+// GetPrompt/ReadResource route through the same onCall hook as CallTool, so the
+// prompts/get and resources/read MRTR smokes reuse the elicitation machinery.
+func (f *mrtrFakeUpstream) GetPrompt(ctx context.Context, _ string, _ json.RawMessage) (*mcp.Message, error) {
+	return f.serve(ctx, "prompt")
+}
+
+func (f *mrtrFakeUpstream) ReadResource(ctx context.Context, uri string) (*mcp.Message, error) {
+	return f.serve(ctx, uri)
+}
+
+func (f *mrtrFakeUpstream) serve(ctx context.Context, what string) (*mcp.Message, error) {
 	f.mu.Lock()
 	f.callCount++
 	n := f.callCount
@@ -57,7 +74,7 @@ func (f *mrtrFakeUpstream) CallTool(ctx context.Context, name string, _, _ json.
 	if f.onCall != nil {
 		return f.onCall(ctx, n), nil
 	}
-	return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[{"type":"text","text":"ok `+name+`"}]}`)), nil
+	return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[{"type":"text","text":"ok `+what+`"}]}`)), nil
 }
 
 // newMRTRTestRegistry wires one mrtrFakeUpstream under name with a single tool
@@ -72,10 +89,15 @@ func newMRTRTestRegistry(t *testing.T, name string) (*Registry, *mrtrFakeUpstrea
 	r.conns[name] = fake
 	r.toolRoute[name+"__tool"] = route{upstream: name, original: "tool"}
 	r.promptRoute[name+"__prompt"] = route{upstream: name, original: "prompt"}
+	r.resourceRoute[mrtrTestResourceURI(name)] = name
 	r.mu.Unlock()
 	t.Cleanup(func() { _ = r.Close() })
 	return r, fake
 }
+
+// mrtrTestResourceURI is the concrete resource URI newMRTRTestRegistry routes
+// to the fake upstream (exact-match resourceRoute entry).
+func mrtrTestResourceURI(name string) string { return "mcp://" + name + "/doc" }
 
 // awaitMRTRResponse takes the next response routed back to the fake upstream.
 func awaitMRTRResponse(t *testing.T, fake *mrtrFakeUpstream, what string) *mcp.Message {
@@ -149,7 +171,7 @@ func TestMRTRElicitationRoundtrip(t *testing.T) {
 		RequestState:   out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(answer)},
 	}
-	resumeOut, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps)
+	resumeOut, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps)
 	if err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
@@ -188,7 +210,7 @@ func TestMRTRElicitationUpstreamGetsOriginalID(t *testing.T) {
 	const answer = `{"action":"accept"}`
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(answer)}}
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); err != nil {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
 
@@ -234,7 +256,7 @@ func TestMRTRSampling(t *testing.T) {
 	}
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"role":"assistant","content":{"type":"text","text":"ok"},"model":"m"}`)}}
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); err != nil {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
 }
@@ -304,7 +326,7 @@ func TestMRTRRootsCacheMiss(t *testing.T) {
 	const answer = `{"roots":[{"uri":"file:///x","name":"x"}]}`
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(answer)}}
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); err != nil {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
 
@@ -348,7 +370,7 @@ func TestMRTRCapabilityGate(t *testing.T) {
 func TestMRTRUnknownState(t *testing.T) {
 	r, _ := newMRTRTestRegistry(t, "web")
 	retry := mcp.MRTRRetry{RequestState: "deadbeef", InputResponses: map[string]json.RawMessage{"mrtr-9": json.RawMessage(`{}`)}}
-	_, err := r.ResumeToolModern(context.Background(), "web__tool", retry, declaredCaps(mcp.CapElicitation))
+	_, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, declaredCaps(mcp.CapElicitation))
 	if !errors.Is(err, ErrUnknownRequestState) {
 		t.Errorf("resume with an unknown state = %v, want ErrUnknownRequestState", err)
 	}
@@ -378,12 +400,12 @@ func TestMRTRStateSingleUse(t *testing.T) {
 	}
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"action":"accept"}`)}}
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); err != nil {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); err != nil {
 		t.Fatalf("first ResumeToolModern: %v", err)
 	}
 	<-resumed
 	// Second retry of the same state finds nothing.
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); !errors.Is(err, ErrUnknownRequestState) {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); !errors.Is(err, ErrUnknownRequestState) {
 		t.Errorf("second resume of the same state = %v, want ErrUnknownRequestState", err)
 	}
 }
@@ -416,7 +438,7 @@ func TestMRTRParkTimeout(t *testing.T) {
 	// A late retry finds nothing.
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{"mrtr-1": json.RawMessage(`{"action":"accept"}`)}}
-	if _, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps); !errors.Is(err, ErrUnknownRequestState) {
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps); !errors.Is(err, ErrUnknownRequestState) {
 		t.Errorf("late retry after sweep = %v, want ErrUnknownRequestState", err)
 	}
 }
@@ -444,7 +466,7 @@ func TestMRTRSequentialQuestions(t *testing.T) {
 	firstID := onlyKey(t, out.InputRequests)
 	retry1 := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
-	out2, err := r.ResumeToolModern(context.Background(), "web__tool", retry1, caps)
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry1, caps)
 	if err != nil {
 		t.Fatalf("first ResumeToolModern: %v", err)
 	}
@@ -454,7 +476,7 @@ func TestMRTRSequentialQuestions(t *testing.T) {
 	secondID := onlyKey(t, out2.InputRequests)
 	retry2 := mcp.MRTRRetry{RequestState: out2.RequestState,
 		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
-	out3, err := r.ResumeToolModern(context.Background(), "web__tool", retry2, caps)
+	out3, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry2, caps)
 	if err != nil {
 		t.Fatalf("second ResumeToolModern: %v", err)
 	}
@@ -517,7 +539,7 @@ func TestMRTRLegacyCoexistence(t *testing.T) {
 	gatewayID := onlyKey(t, out.InputRequests)
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"action":"accept"}`)}}
-	if _, err := r.ResumeToolModern(context.Background(), "modern__tool", retry, caps); err != nil {
+	if _, err := r.ResumeToolModern(context.Background(), "modern__tool", mcp.MethodToolsCall, retry, caps); err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
 	// The legacy upstream got its answer under its own id.
@@ -563,7 +585,7 @@ func TestMRTRPartialResponses(t *testing.T) {
 	}
 	retry := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
-	out2, err := r.ResumeToolModern(context.Background(), "web__tool", retry, caps)
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps)
 	if err != nil {
 		t.Fatalf("ResumeToolModern: %v", err)
 	}
@@ -583,7 +605,7 @@ func TestMRTRPartialResponses(t *testing.T) {
 	}
 	retry2 := mcp.MRTRRetry{RequestState: out2.RequestState,
 		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
-	out3, err := r.ResumeToolModern(context.Background(), "web__tool", retry2, caps)
+	out3, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry2, caps)
 	if err != nil {
 		t.Fatalf("second ResumeToolModern: %v", err)
 	}
@@ -639,7 +661,7 @@ func TestMRTRDeliverAfterCallFinished(t *testing.T) {
 	resultCh := make(chan mrtrCallResult, 1)
 	_, cancel := context.WithCancel(context.Background())
 	resultCh <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(1), json.RawMessage(`{"content":[]}`))}
-	out, err := r.collectMRTR("web", waiter, resultCh, cancel)
+	out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter, resultCh, cancel)
 	if err != nil {
 		t.Fatalf("collectMRTR: %v", err)
 	}
@@ -698,7 +720,7 @@ func TestMRTRDeliverRootsAfterCallFinished(t *testing.T) {
 	resultCh := make(chan mrtrCallResult, 1)
 	_, cancel := context.WithCancel(context.Background())
 	resultCh <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(1), json.RawMessage(`{"content":[]}`))}
-	out, err := r.collectMRTR("web", waiter, resultCh, cancel)
+	out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter, resultCh, cancel)
 	if err != nil {
 		t.Fatalf("collectMRTR: %v", err)
 	}
@@ -755,4 +777,137 @@ func onlyKey(t *testing.T, m map[string]json.RawMessage) string {
 		return k
 	}
 	return ""
+}
+
+// TestMRTRAuditRecordsClient is the regression for review finding 1 (fix in
+// callModern): the detached call context keeps r.procCtx as its CANCELLATION
+// parent but must re-attach the caller ctx's VALUES — the client identity rides
+// registry.WithClient on the request ctx, and r.audit reads it back via
+// ClientFromContext. Before the fix every modern tools/call journaled an empty
+// CallRecord.Client, silently reverting what Stage 19b had fixed for the legacy
+// path (cf. TestAuditRecordsClientFromContext).
+func TestMRTRAuditRecordsClient(t *testing.T) {
+	var buf bytes.Buffer
+	r := New(&config.Config{}, quietLogger(), logging.NewCallLogWriter(&buf), noopPayloadLog(), false, "0.0.0-test")
+	fake := &mrtrFakeUpstream{name: "web", responses: make(chan *mcp.Message, 8)}
+	r.mu.Lock()
+	r.conns["web"] = fake
+	r.toolRoute["web__tool"] = route{upstream: "web", original: "tool"}
+	r.mu.Unlock()
+	t.Cleanup(func() { _ = r.Close() })
+
+	ctx := WithClient(context.Background(), "modern-client/1.2.3")
+	out, err := r.CallToolModern(ctx, "web__tool", nil, nil, declaredCaps(mcp.CapElicitation))
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	if out.Final == nil {
+		t.Fatalf("want a final response, got %+v", out)
+	}
+	if !strings.Contains(buf.String(), `"client":"modern-client/1.2.3"`) {
+		t.Errorf("modern call's audit record is missing the client identity:\n%s", buf.String())
+	}
+}
+
+// TestMRTRResumeBindsMethodAndIdentity pins review finding 6 (fix in
+// ResumeToolModern): a park is bound to the method+identity that created it. A
+// valid tools/call token presented under a different method — or a different
+// tool name — is ErrUnknownRequestState, and the mismatched retry must NOT
+// consume the park: the correct retry afterwards still resumes and completes.
+func TestMRTRResumeBindsMethodAndIdentity(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	fake.onCall = func(_ context.Context, n int) *mcp.Message {
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{"message":"?"}`))
+		<-fake.responses
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[]}`))
+	}
+
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.CallToolModern(context.Background(), "web__tool", nil, nil, caps)
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	gatewayID := onlyKey(t, out.InputRequests)
+	retry := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"action":"accept"}`)}}
+
+	// The same valid token under a foreign method...
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodPromptsGet, retry, caps); !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("resuming a tools/call park as prompts/get = %v, want ErrUnknownRequestState", err)
+	}
+	// ...and under a foreign identity are both refused.
+	if _, err := r.ResumeToolModern(context.Background(), "web__other", mcp.MethodToolsCall, retry, caps); !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("resuming under a foreign name = %v, want ErrUnknownRequestState", err)
+	}
+	// The refused retries consumed nothing: the correct retry still works.
+	resumeOut, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps)
+	if err != nil {
+		t.Fatalf("correct retry after mismatched ones: %v", err)
+	}
+	if resumeOut.Final == nil {
+		t.Errorf("correct retry returned no final: %+v", resumeOut)
+	}
+}
+
+// TestMRTRGetPromptRoundtrip is the prompts/get smoke for review finding 7: an
+// elicitation in the middle of GetPromptModern surfaces as input_required, and
+// the retry (bound to prompts/get + the prompt name) completes the call.
+func TestMRTRGetPromptRoundtrip(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	fake.onCall = func(_ context.Context, n int) *mcp.Message {
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(21), json.RawMessage(`{"message":"prompt input"}`))
+		<-fake.responses
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"description":"d","messages":[]}`))
+	}
+
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.GetPromptModern(context.Background(), "web__prompt", nil, caps)
+	if err != nil {
+		t.Fatalf("GetPromptModern: %v", err)
+	}
+	if out.Final != nil || len(out.InputRequests) != 1 {
+		t.Fatalf("want exactly one input request, got %+v", out)
+	}
+	gatewayID := onlyKey(t, out.InputRequests)
+	retry := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"action":"accept"}`)}}
+	resumeOut, err := r.ResumeToolModern(context.Background(), "web__prompt", mcp.MethodPromptsGet, retry, caps)
+	if err != nil {
+		t.Fatalf("ResumeToolModern: %v", err)
+	}
+	if resumeOut.Final == nil || resumeOut.Final.Error != nil {
+		t.Fatalf("prompts/get resume returned no clean final: %+v", resumeOut)
+	}
+}
+
+// TestMRTRReadResourceRoundtrip is the resources/read smoke for review finding
+// 7 — the same round trip over the URI route (exact-match resourceRoute), with
+// the retry bound to resources/read + the URI.
+func TestMRTRReadResourceRoundtrip(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	uri := mrtrTestResourceURI("web")
+	fake.onCall = func(_ context.Context, n int) *mcp.Message {
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(31), json.RawMessage(`{"message":"resource input"}`))
+		<-fake.responses
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"contents":[]}`))
+	}
+
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.ReadResourceModern(context.Background(), uri, caps)
+	if err != nil {
+		t.Fatalf("ReadResourceModern: %v", err)
+	}
+	if out.Final != nil || len(out.InputRequests) != 1 {
+		t.Fatalf("want exactly one input request, got %+v", out)
+	}
+	gatewayID := onlyKey(t, out.InputRequests)
+	retry := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{gatewayID: json.RawMessage(`{"action":"accept"}`)}}
+	resumeOut, err := r.ResumeToolModern(context.Background(), uri, mcp.MethodResourceRead, retry, caps)
+	if err != nil {
+		t.Fatalf("ResumeToolModern: %v", err)
+	}
+	if resumeOut.Final == nil || resumeOut.Final.Error != nil {
+		t.Fatalf("resources/read resume returned no clean final: %+v", resumeOut)
+	}
 }
