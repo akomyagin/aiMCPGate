@@ -194,7 +194,7 @@ func (d *dispatcher) dispatchToolsCallModern(ctx context.Context, msg *mcp.Messa
 	var out registry.MRTROutcome
 	var err error
 	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
-		out, err = d.reg.ResumeToolModern(ctx, params.Name, retry, caps)
+		out, err = d.reg.ResumeToolModern(ctx, params.Name, mcp.MethodToolsCall, retry, caps)
 	} else {
 		out, err = d.reg.CallToolModern(ctx, params.Name, params.Arguments, params.Meta, caps)
 	}
@@ -216,7 +216,7 @@ func (d *dispatcher) handlePromptsGetModern(ctx context.Context, msg *mcp.Messag
 	var out registry.MRTROutcome
 	var err error
 	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
-		out, err = d.reg.ResumeToolModern(ctx, params.Name, retry, caps)
+		out, err = d.reg.ResumeToolModern(ctx, params.Name, mcp.MethodPromptsGet, retry, caps)
 	} else {
 		out, err = d.reg.GetPromptModern(ctx, params.Name, params.Arguments, caps)
 	}
@@ -239,7 +239,7 @@ func (d *dispatcher) handleResourcesReadModern(ctx context.Context, msg *mcp.Mes
 	var out registry.MRTROutcome
 	var err error
 	if retry.RequestState != "" || len(retry.InputResponses) > 0 {
-		out, err = d.reg.ResumeToolModern(ctx, params.URI, retry, caps)
+		out, err = d.reg.ResumeToolModern(ctx, params.URI, mcp.MethodResourceRead, retry, caps)
 	} else {
 		out, err = d.reg.ReadResourceModern(ctx, params.URI, caps)
 	}

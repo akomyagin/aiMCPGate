@@ -33,3 +33,8 @@ CLAUDE.md
 
 # Generated shell completions (goreleaser before-hook)
 /completions/
+
+# Local node experiments в корне репо (публичный npm-пакет — в tracked npm/)
+/node_modules/
+/package.json
+/package-lock.json

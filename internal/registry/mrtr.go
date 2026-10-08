@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/akomyagin/aiMCPGate/internal/logging"
 	"github.com/akomyagin/aiMCPGate/internal/mcp"
 )
 
@@ -157,6 +158,14 @@ type mrtrOpenQuestion struct {
 // upstream's next move. Guarded by serverReqMu.
 type mrtrParkedCall struct {
 	upstream string
+	// method/identity bind the park to the request that created it: the MCP
+	// method ("tools/call", "prompts/get", "resources/read") and the tool name /
+	// prompt name / resource URI. A retry must repeat the ORIGINAL request (spec
+	// basic/patterns/mrtr.mdx); ResumeToolModern refuses a valid token presented
+	// under a different method or identity, so one call's final can never be
+	// served as another method's result.
+	method   string
+	identity string
 	waiter   *mrtrWaiter
 	// result is the channel the detached CallTool goroutine will send its final
 	// response on. Shared across resume rounds — the same CallTool runs until it
@@ -192,7 +201,7 @@ func (r *Registry) CallToolModern(ctx context.Context, name string,
 	arguments, meta json.RawMessage, clientCaps map[string]json.RawMessage) (MRTROutcome, error) {
 	owner, ok := r.toolOwner(name)
 	run := func(c context.Context) (*mcp.Message, error) { return r.CallTool(c, name, arguments, meta) }
-	return r.callModern(ctx, owner, ok, clientCaps, run)
+	return r.callModern(ctx, mcp.MethodToolsCall, name, owner, ok, clientCaps, run)
 }
 
 // GetPromptModern is prompts/get for a modern client — the same MRTR bridge as
@@ -202,7 +211,7 @@ func (r *Registry) GetPromptModern(ctx context.Context, name string,
 	arguments json.RawMessage, clientCaps map[string]json.RawMessage) (MRTROutcome, error) {
 	owner, ok := r.promptOwner(name)
 	run := func(c context.Context) (*mcp.Message, error) { return r.GetPrompt(c, name, arguments) }
-	return r.callModern(ctx, owner, ok, clientCaps, run)
+	return r.callModern(ctx, mcp.MethodPromptsGet, name, owner, ok, clientCaps, run)
 }
 
 // ReadResourceModern is resources/read for a modern client — the same MRTR
@@ -212,16 +221,18 @@ func (r *Registry) ReadResourceModern(ctx context.Context, uri string,
 	clientCaps map[string]json.RawMessage) (MRTROutcome, error) {
 	owner, ok := r.resourceOwner(uri)
 	run := func(c context.Context) (*mcp.Message, error) { return r.ReadResource(c, uri) }
-	return r.callModern(ctx, owner, ok, clientCaps, run)
+	return r.callModern(ctx, mcp.MethodResourceRead, uri, owner, ok, clientCaps, run)
 }
 
 // callModern is the shared MRTR machinery behind the three permitted methods.
-// owner/ownerOK is the upstream the call routes to (from the method's route
-// table); run performs the actual verbatim proxy on a given context. If the
-// route is unknown, run is executed directly so the underlying method produces
-// its own sanitized error/audit exactly as the legacy path would (no waiter,
-// nothing to intercept).
-func (r *Registry) callModern(ctx context.Context, owner string, ownerOK bool,
+// method/identity ("tools/call"+tool name, "prompts/get"+prompt name,
+// "resources/read"+URI) are recorded on the park so a retry is bound to the
+// original request. owner/ownerOK is the upstream the call routes to (from the
+// method's route table); run performs the actual verbatim proxy on a given
+// context. If the route is unknown, run is executed directly so the underlying
+// method produces its own sanitized error/audit exactly as the legacy path
+// would (no waiter, nothing to intercept).
+func (r *Registry) callModern(ctx context.Context, method, identity, owner string, ownerOK bool,
 	clientCaps map[string]json.RawMessage, run func(context.Context) (*mcp.Message, error)) (MRTROutcome, error) {
 	if !ownerOK {
 		resp, err := run(ctx)
@@ -236,15 +247,25 @@ func (r *Registry) callModern(ctx context.Context, owner string, ownerOK bool,
 
 	// Detach from the caller's context: the call must survive the client's HTTP
 	// request scope. It is bounded by the park deadline instead (armed only if
-	// it actually parks; a call that never asks finishes long before).
+	// it actually parks; a call that never asks finishes long before). Detaching
+	// means giving up CANCELLATION only, not the ctx VALUES: the client identity
+	// (registry.WithClient) rides the request ctx, so it is re-attached here —
+	// otherwise every modern call's audit record would lose its Client field.
+	//
+	// A consequence of detaching, deliberately accepted: a modern client that
+	// disconnects BEFORE any question was asked no longer interrupts the
+	// upstream call (the legacy path cancels it via the request ctx). The call
+	// runs to its call_timeout and the result is discarded — the price of a
+	// park that can survive the request scope at all.
 	callCtx, cancel := context.WithCancel(r.procCtx)
+	callCtx = WithClient(callCtx, ClientFromContext(ctx))
 	resultCh := make(chan mrtrCallResult, 1)
 	go func() {
 		resp, err := run(callCtx)
 		resultCh <- mrtrCallResult{resp: resp, err: err}
 	}()
 
-	return r.collectMRTR(owner, waiter, resultCh, cancel)
+	return r.collectMRTR(owner, method, identity, waiter, resultCh, cancel)
 }
 
 // ResumeToolModern resumes a parked modern call from the client's retry. It
@@ -255,15 +276,31 @@ func (r *Registry) callModern(ctx context.Context, owner string, ownerOK bool,
 // lets a server return input_required repeatedly). Questions left unanswered by
 // this retry stay open and are re-surfaced with a fresh state.
 //
-// name/clientCaps are carried through only for symmetry with CallToolModern and
-// future validation; a resume neither re-resolves the tool (the parked CallTool
-// already owns it) nor re-gates already-open questions (their capability was
-// checked when they were intercepted).
-func (r *Registry) ResumeToolModern(ctx context.Context, name string,
+// method/name bind the retry to the ORIGINAL request: the spec says the client
+// repeats the request it got input_required for, so a park created by
+// tools/call must not be resumable as prompts/get (or under a different
+// tool/prompt/URI). A mismatch is reported as ErrUnknownRequestState WITHOUT
+// consuming the park — the token is 128 bits of entropy known only to its
+// owner, so this is protocol strictness, not theft defence; a false sense of
+// uncertainty beats serving one call's final as another method's result. The
+// park is left untouched so the correct retry still works.
+//
+// clientCaps is carried through only for symmetry with CallToolModern: a
+// resume does not re-gate the already-open questions — their capability was
+// checked against the FIRST request's caps when they were intercepted, and
+// re-gating on retry could refuse questions the client already saw.
+func (r *Registry) ResumeToolModern(ctx context.Context, name, method string,
 	retry mcp.MRTRRetry, clientCaps map[string]json.RawMessage) (MRTROutcome, error) {
+	// ctx is deliberately NOT honoured: by the time a retry arrives the park is
+	// about to be taken (token + sweep timer consumed), so binding the wait to
+	// the retry request's ctx would orphan the parked upstream call if the
+	// client drops mid-retry — exactly the bug class §16 of the plan fixed.
+	// The wait is bounded from above by the detached call's own timeout.
 	_ = ctx
-	_ = name
 	_ = clientCaps
+	if !r.mrtrParkMatches(retry.RequestState, method, name) {
+		return MRTROutcome{}, ErrUnknownRequestState
+	}
 	parked, ok := r.takeMRTRParked(retry.RequestState)
 	if !ok {
 		return MRTROutcome{}, ErrUnknownRequestState
@@ -288,28 +325,50 @@ func (r *Registry) ResumeToolModern(ctx context.Context, name string,
 	// a fresh token, rather than waiting on the upstream (which is still blocked
 	// on those very answers). The spec SHOULD-re-asks; this is that (plan §6.1).
 	if remaining := parked.waiter.stillOpen(); len(remaining) > 0 {
-		return r.reparkMRTR(parked.upstream, parked.waiter, parked.result, parked.cancel, remaining), nil
+		return r.reparkMRTR(parked.upstream, parked.method, parked.identity,
+			parked.waiter, parked.result, parked.cancel, remaining), nil
 	}
 
 	// Wait for the upstream's next move — final response, or another question.
-	return r.collectMRTR(parked.upstream, parked.waiter, parked.result, parked.cancel)
+	return r.collectMRTR(parked.upstream, parked.method, parked.identity,
+		parked.waiter, parked.result, parked.cancel)
+}
+
+// mrtrParkMatches reports whether a park exists under token AND was created by
+// the same method/identity the retry claims. A peek, not a take: a mismatched
+// (or unknown) token must leave the park — and its sweep timer — untouched so
+// the correct retry still finds it. Reading method/identity under serverReqMu
+// is race-free: both fields are written once, before the park is inserted. The
+// subsequent takeMRTRParked stays the single-use arbiter — a concurrent correct
+// retry that wins the take leaves this one with ErrUnknownRequestState.
+func (r *Registry) mrtrParkMatches(token, method, identity string) bool {
+	if token == "" {
+		return false
+	}
+	r.serverReqMu.Lock()
+	defer r.serverReqMu.Unlock()
+	parked, ok := r.mrtrParked[token]
+	return ok && parked.method == method && parked.identity == identity
 }
 
 // reparkMRTR re-parks a call whose client answered only some of its open
 // questions, re-surfacing the rest under a fresh token. The questions are
 // already tracked and already have pending entries (they never left); only the
 // park record and token are new.
-func (r *Registry) reparkMRTR(upstream string, waiter *mrtrWaiter,
+func (r *Registry) reparkMRTR(upstream, method, identity string, waiter *mrtrWaiter,
 	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, remaining []mrtrOpenQuestion) MRTROutcome {
 	token := newMRTRState()
 	inputRequests := make(map[string]json.RawMessage, len(remaining))
 	for _, q := range remaining {
 		inputRequests[q.gatewayID] = q.envelope
 	}
-	parked := &mrtrParkedCall{upstream: upstream, waiter: waiter, result: resultCh, cancel: cancel}
-	parked.timer = time.AfterFunc(r.serverReqTimeout, func() { r.sweepMRTRParked(token) })
+	parked := &mrtrParkedCall{upstream: upstream, method: method, identity: identity,
+		waiter: waiter, result: resultCh, cancel: cancel}
+	// Insert FIRST, arm the sweep timer SECOND — both under serverReqMu (see
+	// parkMRTR for why the ordering and the lock matter).
 	r.serverReqMu.Lock()
 	r.mrtrParked[token] = parked
+	parked.timer = time.AfterFunc(r.serverReqTimeout, func() { r.sweepMRTRParked(token) })
 	r.serverReqMu.Unlock()
 	return MRTROutcome{InputRequests: inputRequests, RequestState: token}
 }
@@ -323,7 +382,7 @@ func (r *Registry) reparkMRTR(upstream string, waiter *mrtrWaiter,
 // finishing or the window elapsing both end collection. A call that never asks
 // blocks only on resultCh — it returns the instant CallTool returns, paying no
 // window at all.
-func (r *Registry) collectMRTR(upstream string, waiter *mrtrWaiter,
+func (r *Registry) collectMRTR(upstream, method, identity string, waiter *mrtrWaiter,
 	resultCh <-chan mrtrCallResult, cancel context.CancelFunc) (MRTROutcome, error) {
 	var questions []mrtrQuestion
 	var windowCh <-chan time.Time
@@ -358,7 +417,7 @@ func (r *Registry) collectMRTR(upstream string, waiter *mrtrWaiter,
 			// the client its InputRequiredResult. The waiter stays registered so
 			// a further question on this upstream (after the client answers these)
 			// is still intercepted for the SAME call.
-			return r.parkMRTR(upstream, waiter, resultCh, cancel, questions), nil
+			return r.parkMRTR(upstream, method, identity, waiter, resultCh, cancel, questions), nil
 		}
 	}
 }
@@ -366,7 +425,7 @@ func (r *Registry) collectMRTR(upstream string, waiter *mrtrWaiter,
 // parkMRTR suspends the call under a fresh opaque token, arms its sweep
 // deadline, and returns the questions to the client. Called under no lock;
 // takes serverReqMu to record the park.
-func (r *Registry) parkMRTR(upstream string, waiter *mrtrWaiter,
+func (r *Registry) parkMRTR(upstream, method, identity string, waiter *mrtrWaiter,
 	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, questions []mrtrQuestion) MRTROutcome {
 	token := newMRTRState()
 	inputRequests := make(map[string]json.RawMessage, len(questions))
@@ -374,13 +433,20 @@ func (r *Registry) parkMRTR(upstream string, waiter *mrtrWaiter,
 		inputRequests[q.gatewayID] = q.envelope
 	}
 
-	parked := &mrtrParkedCall{upstream: upstream, waiter: waiter, result: resultCh, cancel: cancel}
+	parked := &mrtrParkedCall{upstream: upstream, method: method, identity: identity,
+		waiter: waiter, result: resultCh, cancel: cancel}
+	// Insert the park BEFORE arming its sweep timer, and assign parked.timer
+	// under the same serverReqMu: a timer armed first could fire before the
+	// insert (sweepMRTRParked → takeMRTRParked finds nothing → no-op), leaving a
+	// park nobody ever sweeps. The callback itself takes serverReqMu, so it
+	// cannot run past this critical section either way, and takeMRTRParked reads
+	// parked.timer outside the lock — hence the assignment under it (a write
+	// after Unlock would be a data race).
+	r.serverReqMu.Lock()
+	r.mrtrParked[token] = parked
 	parked.timer = time.AfterFunc(r.serverReqTimeout, func() {
 		r.sweepMRTRParked(token)
 	})
-
-	r.serverReqMu.Lock()
-	r.mrtrParked[token] = parked
 	r.serverReqMu.Unlock()
 
 	return MRTROutcome{InputRequests: inputRequests, RequestState: token}
@@ -519,6 +585,10 @@ func (r *Registry) deliverMRTRQuestion(w *mrtrWaiter, upstream, method string,
 		delete(r.pendingServerReqs, gatewayID)
 		r.serverReqMu.Unlock()
 		go refuse(r, upstream, originalID, "the modern call finished before its question could be delivered")
+		// Stage 18 parity: from the operator's side this looks like a tool that
+		// quietly failed — journal why (as the legacy publishServerReq arm does).
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, method,
+			"the modern call finished before its question could be delivered; the upstream was refused on the modern client's behalf", 1)
 		return
 	}
 
@@ -529,11 +599,17 @@ func (r *Registry) deliverMRTRQuestion(w *mrtrWaiter, upstream, method string,
 	select {
 	case w.questions <- mrtrQuestion{gatewayID: gatewayID, envelope: envelope}:
 	default:
+		// Undeliverable. Do NOT delete the pending entry and refuse directly:
+		// between trackOpen above and this point, takeOpen may have run (the
+		// call finished on another goroutine) and already refused this question
+		// — a second, direct refuse would answer the upstream's originalID
+		// TWICE. RefusePendingServerReq is the arbiter: it refuses exactly once
+		// (whoever still owns the pending entry) and its expire hook is the very
+		// same spec.refuse this arm would have called.
 		w.forgetOpen(gatewayID)
-		r.serverReqMu.Lock()
-		delete(r.pendingServerReqs, gatewayID)
-		r.serverReqMu.Unlock()
-		go refuse(r, upstream, originalID, "the modern call's question buffer was full")
+		go r.RefusePendingServerReq(gatewayID, "the modern call's question buffer was full")
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, method,
+			"the modern call's question buffer was full; the upstream was refused on the modern client's behalf", 1)
 	}
 }
 
@@ -636,6 +712,10 @@ func (r *Registry) handleMRTRIfWaiting(name, method string, spec *serverReqSpec,
 		}
 		spec.refuse(r, name, originalID,
 			"the modern client did not declare the "+spec.capability+" capability")
+		// Stage 18 parity: journal the capability-gated drop for the operator
+		// (the legacy conveyor journals its own undeliverable cases).
+		r.noteThrottled(logging.EventServerRequestDropped, name, method,
+			"the modern client did not declare the "+spec.capability+" capability; the upstream was refused on the modern client's behalf", 1)
 		return true
 	}
 
@@ -698,9 +778,15 @@ func (r *Registry) deliverMRTRRoots(w *mrtrWaiter, upstream string, originalID j
 		delete(r.pendingServerReqs, gatewayID)
 		r.serverReqMu.Unlock()
 		go rootsExpire(r, gatewayID, "the modern call finished before its roots/list question could be delivered")
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, mcp.MethodRootsList,
+			"the modern call finished before its roots/list question could be delivered; the upstream was refused on the modern client's behalf", 1)
 		return
 	}
 
+	// The buffer-full arm keeps delete+rootsExpire (unlike deliverMRTRQuestion's,
+	// which delegates to RefusePendingServerReq): rootsExpire is id-guarded by
+	// rootsFetchID, so a takeOpen that already ran makes this a no-op — no double
+	// answer is possible here.
 	select {
 	case w.questions <- mrtrQuestion{gatewayID: gatewayID, envelope: envelope}:
 	default:
@@ -709,6 +795,8 @@ func (r *Registry) deliverMRTRRoots(w *mrtrWaiter, upstream string, originalID j
 		delete(r.pendingServerReqs, gatewayID)
 		r.serverReqMu.Unlock()
 		go rootsExpire(r, gatewayID, "the modern call's question buffer was full")
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, mcp.MethodRootsList,
+			"the modern call's question buffer was full; the upstream was refused on the modern client's behalf", 1)
 	}
 }
 
