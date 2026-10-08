@@ -433,6 +433,19 @@ type Registry struct {
 	nextServerReqSub  int
 	serverReqID       atomic.Int64
 
+	// mrtrWaiters and mrtrParked are the MRTR bridge's state (Stage 19c),
+	// guarded by the SAME serverReqMu as pendingServerReqs — the interception in
+	// onUpstreamRequest and the generic park run on the same goroutine and must
+	// see one consistent view. mrtrWaiters maps an upstream name to the LIFO
+	// stack of modern tools/calls in flight on it, ready to intercept that
+	// upstream's counter-requests into InputRequiredResults; mrtrParked maps an
+	// opaque requestState token to a suspended call awaiting the client's retry.
+	// See mrtr.go for the pipeline. Both are laid on TOP of the legacy
+	// serverreq.go plumbing (same id minting, same RouteUpstreamResponse), not
+	// beside it (invariant §12.3 — one id system).
+	mrtrWaiters map[string][]*mrtrWaiter
+	mrtrParked  map[string]*mrtrParkedCall
+
 	// serverReqTimeout is how long ONE proxied server→client request may stay
 	// pending before the gateway stops waiting for its client and refuses the
 	// upstream (defaultServerReqTimeout). A field rather than the constant
@@ -595,6 +608,8 @@ func New(cfg *config.Config, logger *slog.Logger, callLog logging.CallLog, paylo
 		notifSubs:         map[int]chan mcp.Message{},
 		pendingServerReqs: map[string]pendingServerReq{},
 		serverReqSubs:     map[int]chan UpstreamRequest{},
+		mrtrWaiters:       map[string][]*mrtrWaiter{},
+		mrtrParked:        map[string]*mrtrParkedCall{},
 		serverReqTimeout:  defaultServerReqTimeout,
 		relistTimers:      map[string]*time.Timer{},
 		relistStates:      map[string]*relistState{},
@@ -2877,6 +2892,12 @@ func (r *Registry) Close() error {
 	// not outlive the shutdown that is about to remove every upstream they
 	// could answer to (Stage 15 — see closeServerReqs).
 	r.closeServerReqs()
+
+	// The MRTR bridge's parked calls carry a detached CallTool goroutine and a
+	// sweep timer each (Stage 19c); forget them and cancel them so nothing
+	// outlives the shutdown (procCancel above already aborted the calls' ctx,
+	// this stops their timers and clears the tables).
+	r.closeMRTR()
 
 	// Wait (bounded) for in-flight re-lists: a runRelist may still be inside a
 	// blocking ListTools against a connection we are about to Close below, and
