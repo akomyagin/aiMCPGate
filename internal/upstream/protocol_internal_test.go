@@ -370,3 +370,47 @@ func TestForwardRootsListChangedHonoursDeclaration(t *testing.T) {
 		t.Errorf("notifications sent = %v by an undeclaring conn, want none", tr.notifs)
 	}
 }
+
+// errInitTransport answers initialize with a JSON-RPC error carrying the given
+// code — the wire-level probe for how Conn.Initialize classifies a rejection.
+type errInitTransport struct{ code int }
+
+func (e *errInitTransport) call(context.Context, string, json.RawMessage) (*mcp.Message, error) {
+	return mcp.NewError(mcp.IntID(1), e.code, "nope", nil), nil
+}
+func (e *errInitTransport) notify(context.Context, string, json.RawMessage) error { return nil }
+func (e *errInitTransport) respond(*mcp.Message) error                            { return nil }
+func (e *errInitTransport) Name() string                                          { return "modern-only" }
+func (e *errInitTransport) Close() error                                          { return nil }
+func (e *errInitTransport) Done() (<-chan struct{}, bool)                         { return nil, false }
+func (e *errInitTransport) StderrTail() ([]string, bool)                          { return nil, false }
+
+// TestUpstreamModernOnlyDiagnostic (Stage 19b §5.4): an upstream that rejects
+// the gateway's legacy initialize with -32022 (a modern-only server) yields an
+// ACTIONABLE error naming the 2026-07-28 version and the plan — the text doctor
+// prints in its FAIL column — instead of the bare "initialize rejected". A
+// different rejection code keeps the generic message. Mutation: drop the
+// -32022 branch → the modern-only text disappears → red.
+func TestUpstreamModernOnlyDiagnostic(t *testing.T) {
+	c := &Conn{transport: &errInitTransport{code: mcp.CodeUnsupportedProtocolVersion}}
+	_, err := c.Initialize(context.Background())
+	if err == nil {
+		t.Fatal("Initialize succeeded against a modern-only upstream, want an error")
+	}
+	if !strings.Contains(err.Error(), "2026-07-28") {
+		t.Errorf("error %q does not name the modern version 2026-07-28", err)
+	}
+	if !strings.Contains(err.Error(), "only") {
+		t.Errorf("error %q does not read as a modern-only diagnosis", err)
+	}
+
+	// A different rejection is left generic.
+	c = &Conn{transport: &errInitTransport{code: mcp.CodeInvalidRequest}}
+	_, err = c.Initialize(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "initialize rejected") {
+		t.Errorf("non-32022 rejection = %v, want the generic \"initialize rejected\"", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "2026-07-28") {
+		t.Errorf("non-32022 rejection wrongly got the modern-only diagnosis: %v", err)
+	}
+}

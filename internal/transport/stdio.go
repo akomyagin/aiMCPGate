@@ -222,11 +222,28 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 			// which therefore still gets the full aggregated catalog — it just
 			// degrades to today's behaviour of declaring exactly {} upstream,
 			// since no capabilities have been seen yet.
-			needsRegistry := fr.msg.IsRequest() && fr.msg.Method != mcp.MethodPing
+			//
+			// Modern era (Stage 19b): a modern request also needs the registry
+			// (it routes into the same handlers), EXCEPT an UNKNOWN modern method,
+			// which dispatchModern answers -32601 without ever consulting the
+			// catalog — waking every upstream just to say "method not found" would
+			// be wasteful and, worse, would freeze the declaration set for a
+			// client whose first frame is a stray/removed method. So an unknown
+			// modern method is excluded from the trigger, mirroring how legacy
+			// ping is excluded.
+			meta := mcp.ParseRequestMeta(fr.msg.Params)
+			needsRegistry := fr.msg.IsRequest() && fr.msg.Method != mcp.MethodPing &&
+				!(meta.Modern() && !modernMethodKnown(fr.msg.Method))
 			if needsRegistry && !started {
 				var caps map[string]json.RawMessage
-				if fr.msg.Method == mcp.MethodInitialize {
+				switch {
+				case fr.msg.Method == mcp.MethodInitialize:
 					caps = clientServerRequestCaps(fr.msg.Params)
+				case meta.Modern():
+					// The modern request carries its own clientCapabilities in
+					// _meta; declare exactly those to the upstreams (the modern
+					// counterpart of reading them from initialize).
+					caps = serverReqCapsFromModernMeta(meta)
 				}
 				s.reg.SetClientServerRequestCaps(caps) // strictly BEFORE Start
 				if err := s.reg.Start(ctx); err != nil {
@@ -250,6 +267,18 @@ func (s *stdioServer) Serve(ctx context.Context) error {
 				}
 				started = true
 				s.log.Info("stdio transport ready", "tools", s.reg.ToolCount())
+			}
+			// Attach the modern client's identity to dispatchCtx from its FIRST
+			// modern request (Stage 19b). A pure-modern client never sends an
+			// initialize, so without this every CallRecord.Client for it would be
+			// empty. Wrap the BASE ctx (like the initialize branch) so a later
+			// frame cannot stack values; done once, and only while dispatchCtx is
+			// still the bare ctx (a legacy initialize, if one somehow preceded,
+			// keeps its own identity).
+			if meta.Modern() && dispatchCtx == ctx {
+				if client := clientFromMeta(meta); client != "" {
+					dispatchCtx = registry.WithClient(ctx, client)
+				}
 			}
 			if fr.msg.IsRequest() && fr.msg.Method == mcp.MethodToolsCall {
 				// tools/call — and ONLY tools/call — dispatches on its own

@@ -118,10 +118,10 @@ func TestDispatchToolsCallDuplicateIDRejected(t *testing.T) {
 // of the structural capability builder with the raw literals it replaced: this
 // round it must produce exactly the tools-only object, per listChanged flavour.
 func TestBuildCapabilitiesMatchesFormerLiteral(t *testing.T) {
-	if got := string(buildCapabilities(nil, true)); got != `{"tools":{"listChanged":true}}` {
+	if got := string(buildCapabilities(nil, true, false)); got != `{"tools":{"listChanged":true}}` {
 		t.Errorf("buildCapabilities(true) = %s", got)
 	}
-	if got := string(buildCapabilities(nil, false)); got != `{"tools":{"listChanged":false}}` {
+	if got := string(buildCapabilities(nil, false, false)); got != `{"tools":{"listChanged":false}}` {
 		t.Errorf("buildCapabilities(false) = %s", got)
 	}
 }

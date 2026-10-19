@@ -144,6 +144,18 @@ func (c *Conn) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
 		return nil, fmt.Errorf("upstream %q: initialize: %w", c.Name(), err)
 	}
 	if resp.Error != nil {
+		// A modern-only upstream — one that dropped the legacy initialize branch
+		// — rejects our 2025-06-18 handshake with -32022
+		// (UnsupportedProtocolVersionError). The gateway still speaks legacy to
+		// upstreams in Stage 19 (see the plan §2.3), so this is a real
+		// incompatibility rather than a transient error; surface an actionable
+		// diagnosis (doctor prints it in the FAIL column) instead of the bare
+		// "initialize rejected". The generic path is kept for every other error.
+		if resp.Error.Code == mcp.CodeUnsupportedProtocolVersion {
+			return nil, fmt.Errorf("upstream %q speaks only MCP 2026-07-28+ "+
+				"(gateway talks 2025-06-18 to upstreams; see docs/plans/stage-19-mcp-spec-2026-07-28.md §2.3): %w",
+				c.Name(), resp.Error)
+		}
 		return nil, fmt.Errorf("upstream %q: initialize rejected: %w", c.Name(), resp.Error)
 	}
 

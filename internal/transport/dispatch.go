@@ -35,9 +35,26 @@ import (
 // listChanged:true. Since Round 12 the HTTP transport has one too — the GET
 // /mcp SSE stream (handleSSE) — so it also advertises listChanged:true; the
 // parameter stays so a future channel-less transport can still tell the truth.
-func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage {
+//
+// modern selects the era the capabilities are built for (Stage 19b). On the
+// modern (2026-07-28) branch:
+//   - logging is NOT declared: logging/setLevel is rejected -32601 on modern,
+//     and the gateway pushes no notifications/message to a modern client, so
+//     claiming the capability would be dishonest (logging is deprecated anyway);
+//   - tools.listChanged is forced false in 19b — the gateway has no channel to
+//     deliver a list_changed to a modern client yet (subscriptions/listen
+//     arrives in 19d, which flips this back to the transport's listChanged).
+//
+// The legacy branch (modern==false) is byte-for-byte the historical object —
+// the regression suite depends on it.
+func buildCapabilities(reg *registry.Registry, listChanged, modern bool) json.RawMessage {
+	toolsListChanged := listChanged
+	if modern {
+		// 19b: no modern list_changed delivery channel yet (see 19d).
+		toolsListChanged = false
+	}
 	caps := map[string]any{
-		"tools": map[string]any{"listChanged": listChanged},
+		"tools": map[string]any{"listChanged": toolsListChanged},
 	}
 	// nil reg: classification-only tests build a dispatcher without a registry;
 	// a gateway with no registry aggregates nothing, so no extra capabilities.
@@ -61,8 +78,10 @@ func buildCapabilities(reg *registry.Registry, listChanged bool) json.RawMessage
 	// logging (Round 3) is CONDITIONAL for the same honesty reason as prompts:
 	// declared only when at least one live upstream declared it — with zero
 	// logging-capable upstreams a logging/setLevel would be a silent no-op and
-	// no notifications/message could ever arrive.
-	if reg != nil && reg.HasUpstreamCapability("logging") {
+	// no notifications/message could ever arrive. Never declared on the modern
+	// branch: logging/setLevel is rejected there and no notifications/message
+	// is pushed to a modern client (logging is deprecated as of 2026-07-28).
+	if !modern && reg != nil && reg.HasUpstreamCapability("logging") {
 		caps["logging"] = map[string]any{}
 	}
 	b, err := json.Marshal(caps)
@@ -221,6 +240,16 @@ func (d *dispatcher) dispatch(ctx context.Context, msg *mcp.Message) *mcp.Messag
 			"message is not a valid request: missing method", nil)
 	}
 
+	// Era branch (Stage 19b): a request carrying io.modelcontextprotocol/
+	// protocolVersion in params._meta belongs to the modern (2026-07-28) era and
+	// is served by a separate, stateless path — the legacy switch below is left
+	// byte-for-byte untouched for every legacy request. Era is a property of the
+	// REQUEST, not the connection (dual-era server per versioning.mdx): the two
+	// eras coexist on the same dispatcher.
+	if meta := mcp.ParseRequestMeta(msg.Params); meta.Modern() {
+		return d.dispatchModern(ctx, msg, meta)
+	}
+
 	switch msg.Method {
 	case mcp.MethodPing:
 		// Liveness check, answered with an empty result — the one request the
@@ -289,14 +318,18 @@ func (d *dispatcher) handleInitialize(req *mcp.Message) *mcp.Message {
 	}
 	result := mcp.InitializeResult{
 		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    buildCapabilities(d.reg, d.listChanged),
-		ServerInfo: mcp.Implementation{
-			Name:    "aiMCPGate",
-			Version: d.version,
-		},
-		Instructions: d.reg.Instructions(),
+		Capabilities:    buildCapabilities(d.reg, d.listChanged, false /*legacy*/),
+		ServerInfo:      d.serverInfo(),
+		Instructions:    d.reg.Instructions(),
 	}
 	return mcp.NewResult(req.ID, mcp.MustParams(result))
+}
+
+// serverInfo is the gateway's own identity, echoed in initialize's serverInfo
+// (legacy) and stamped into every modern result's _meta[serverInfo] (Stage
+// 19b). Deduplicated here so the two eras cannot drift on the name/version.
+func (d *dispatcher) serverInfo() mcp.Implementation {
+	return mcp.Implementation{Name: "aiMCPGate", Version: d.version}
 }
 
 // clientString extracts the calling client's identity from initialize params

@@ -181,19 +181,18 @@ func startHTTPGateway(t *testing.T) string {
 }
 
 // connect dials the gateway with the official SDK client over Streamable HTTP
-// and returns an initialized session.
+// and returns a connected session.
 //
-// DisableStandaloneSSE: GET /mcp is a real server→client SSE stream since
-// Round 12, but this test has nothing server-initiated to observe, so the SDK's
-// optional standalone stream is switched off to keep the exchange down to the
-// request/response path under test (the stream itself is covered by
-// internal/transport/http_sse_test.go).
+// Since Stage 19b the default SDK client negotiates the MODERN era (it probes
+// server/discover, the gateway advertises 2026-07-28, and it stays modern), so
+// the exchange is stateless: no Mcp-Session-Id is minted or echoed. The client
+// is built with NO list-changed handler on purpose — the SDK opens a
+// subscriptions/listen stream only when one is set, and that arrives in Stage
+// 19d; without a handler the client stays on the plain request/response path
+// this stage implements (Stage 19 plan §14).
 //
-// No session bookkeeping appears here on purpose: the gateway issues a
-// server-side Mcp-Session-Id on initialize and requires it on every later
-// request (Stage 16), and the SDK's StreamableClientTransport captures and
-// echoes it by itself. That this test still passes UNTOUCHED is the external
-// evidence that the strict session gate is spec-conformant.
+// DisableStandaloneSSE keeps the SDK from opening its optional standalone
+// stream: this test has nothing server-initiated to observe.
 func connect(t *testing.T, ctx context.Context, endpoint string) *sdk.ClientSession {
 	t.Helper()
 	client := sdk.NewClient(&sdk.Implementation{Name: "interop-test-client", Version: "1.0.0"}, nil)
@@ -224,10 +223,24 @@ func textOf(t *testing.T, res *sdk.CallToolResult) string {
 	return tc.Text
 }
 
-// TestSDKClientOverHTTP drives the whole gateway through the official Go SDK:
-// initialize handshake, aggregated (namespaced) tool catalog, and tool calls
-// routed to the upstream and back.
-func TestSDKClientOverHTTP(t *testing.T) {
+// TestSDKModernClientOverHTTP drives the whole gateway through the official Go
+// SDK v1.7.0 as it behaves by DEFAULT: modern (2026-07-28) era. The SDK probes
+// server/discover first, sees the gateway advertise 2026-07-28, and stays
+// modern — so this exercises the Stage 19b modern path end to end: discover,
+// aggregated (namespaced) tools/list, and tools/call routed to the upstream.
+//
+// Why there is no companion TestSDKLegacyClientOverHTTP: the SDK's era pin
+// (ClientOptions.protocolVersion) is UNEXPORTED in v1.7.0 (a "for testing"
+// field with a standing TODO to export), so an external test cannot construct a
+// legacy-pinned SDK client. The plan (§5.6) anticipated this and prescribes the
+// fallback taken here — the legacy client-facing path is proven against the
+// gateway's own hand-rolled client throughout internal/transport/*_test.go
+// (TestStdioInitializeHandshake, the http_session_test.go suite, …); interop
+// covers the modern path, where the official client is the independent oracle.
+// TestSDKClientOverStdioFraming below still connects the SDK to the LEGACY demo
+// server, whose server/discover returns -32601, so that client falls back to a
+// legacy initialize — an independent check of the legacy handshake too.
+func TestSDKModernClientOverHTTP(t *testing.T) {
 	if testing.Short() {
 		t.Skip("interop test brings up a full in-process gateway; skipped with -short")
 	}
@@ -238,14 +251,14 @@ func TestSDKClientOverHTTP(t *testing.T) {
 
 	session := connect(t, ctx, endpoint)
 
-	// Initialize result: the SDK accepted the gateway's handshake; serverInfo
-	// must identify the gateway (not any upstream).
+	// The SDK negotiated the modern era against the dual-era gateway (via
+	// server/discover); serverInfo identifies the gateway, not any upstream.
 	init := session.InitializeResult()
 	if init.ServerInfo == nil || init.ServerInfo.Name != "aiMCPGate" || init.ServerInfo.Version != gatewayVersion {
 		t.Errorf("serverInfo = %+v, want aiMCPGate/%s", init.ServerInfo, gatewayVersion)
 	}
-	if init.ProtocolVersion != mcp.ProtocolVersion {
-		t.Errorf("negotiated protocolVersion = %q, want %q", init.ProtocolVersion, mcp.ProtocolVersion)
+	if init.ProtocolVersion != mcp.ProtocolVersionModern {
+		t.Errorf("negotiated protocolVersion = %q, want modern %q", init.ProtocolVersion, mcp.ProtocolVersionModern)
 	}
 
 	// tools/list: the upstream's tools appear under the aggregated namespace.
