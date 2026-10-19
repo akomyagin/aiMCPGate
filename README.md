@@ -34,7 +34,7 @@ one catalog, and **logs** every call.
 > usually owns; config parsing became strict (unknown/misspelled keys are
 > fatal). It also closes the client-facing half of the guard/truncation story:
 > a `tools/call` refused by the rate-limit or concurrency guard now returns
-> its own JSON-RPC error code `-32029` with machine-readable
+> its own JSON-RPC error code `-32009` with machine-readable
 > `data: {"retryable":true,"reason":...}` instead of an indistinguishable
 > `-32603`, and a non-text result that bypassed `max_result_bytes` carries a
 > `result._meta` marker (`content` stays byte-for-byte untouched). Finally,
@@ -557,7 +557,7 @@ log_file: ./logs/calls.jsonl
 #                                   # arguments AND results — can contain secrets
 # Optional global call limits (each can be overridden per upstream):
 # rate_limit: { rps: 5, burst: 2 }  # token bucket per upstream for tools/call
-#                                   # (refusal → client error -32029, retryable)
+#                                   # (refusal → client error -32009, retryable)
 # max_result_bytes: 65536           # truncate oversized textual results (0 = off;
 #                                   # non-text over-limit results get a _meta marker)
 # call_timeout: 30s                 # bounds one upstream request
@@ -594,9 +594,9 @@ upstreams:
     #   describe: { get_issue: "Fetch one issue." }   # replace wholesale
     # Optional per-upstream call limits (override the globals for this upstream):
     # rate_limit: { rps: 1, burst: 1 }  # rps: 0 disables the global limit here
-    #                                   # (refusal → client error -32029, retryable)
+    #                                   # (refusal → client error -32009, retryable)
     # max_concurrent: 4                 # cap on simultaneous in-flight calls
-    #                                   # (refusal → client error -32029, retryable)
+    #                                   # (refusal → client error -32009, retryable)
     # max_result_bytes: 32768           # 0 disables the global cap here
     # call_timeout: 120s                # this upstream is slow — give it longer
   - name: remote            # http upstream (Phase 2)
@@ -614,12 +614,12 @@ operator journal:
 - **Guard refusals (`rate_limit` / `max_concurrent`).** When the gateway turns a
   `tools/call` away because the per-upstream rate limiter or concurrency cap
   could not admit it, the client gets a JSON-RPC error with the gateway's own
-  code **`-32029`** and machine-readable
+  code **`-32009`** and machine-readable
   `data: {"retryable": true, "reason": "rate_limit" | "concurrency_limit"}`. The
   call never reached the upstream, so an agent may wait and retry without risking
   double execution. Ordinary transport/routing failures keep the historical
   `-32603`, and an error an *upstream* itself returns is forwarded verbatim,
-  code and data untouched — a `-32029` from an upstream is not a gateway signal.
+  code and data untouched — a `-32009` from an upstream is not a gateway signal.
 - **Oversized results that cannot be truncated (`max_result_bytes`).** Text
   results are shrunk with an in-content `[truncated by mcp-gate: …]` marker. A
   non-text / non-standard result that exceeds the limit but has no truncatable

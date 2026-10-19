@@ -208,6 +208,12 @@ type ToolsListResult struct {
 // through to the upstream verbatim — dropping it silently would break the
 // gateway's transparent-proxy contract (docs/MCP_NOTES.md §1). RawMessage with
 // omitempty: absent stays absent, present is forwarded byte for byte.
+//
+// Modern (2026-07-28) MRTR retry fields (inputResponses/requestState) are NOT
+// modeled here: they are extracted separately with ExtractMRTRRetry
+// (spec2026.go) so this struct's verbatim Arguments/Meta contract stays intact
+// — a modern tools/call retry reuses the same params shape plus those extra
+// keys, which the MRTR bridge (Stage 19c) reads without disturbing the proxy.
 type ToolsCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments,omitempty"`
