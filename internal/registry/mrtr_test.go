@@ -702,11 +702,18 @@ func TestMRTRDeliverAfterCallFinished(t *testing.T) {
 	}
 }
 
-// TestMRTRDeliverRootsAfterCallFinished is the same race on the roots path
-// (deliverMRTRRoots starts a single-flight, then trackOpens). A delivery losing
-// the race must unwind the single-flight it just started — clear rootsFetchID,
-// refuse the parked upstream, drop the pending entry — rather than wedge roots
-// for the connection.
+// TestMRTRDeliverRootsAfterCallFinished is the same race on the roots path.
+// NOTE (review N4): since the join-branch isClosed guard (p.2), a waiter that
+// is ALREADY closed is refused by that guard before a single-flight starts —
+// which is what this test now actually exercises (refusal without any foreign
+// flight, the complement of TestMRTRRootsJoinAfterCallFinished). The
+// starter-branch unwind arm (trackOpen false → rootsExpire clears rootsFetchID,
+// refuses parked waiters, drops the pending entry) is reachable only when the
+// waiter closes BETWEEN the isClosed check and trackOpen — a genuine race with
+// no deterministic hook; its behavior is pinned by the identical elicitation-
+// path arm in TestMRTRDeliverAfterCallFinished and the residual gap is a
+// tracked tech-debt line (docs/plans/fix-stage-19-debt.md «Правки по итогам
+// ревью»).
 func TestMRTRDeliverRootsAfterCallFinished(t *testing.T) {
 	r, fake := newMRTRTestRegistry(t, "web")
 
@@ -1027,8 +1034,9 @@ func TestMRTRRootsJoinAfterCallFinished(t *testing.T) {
 // before it, so the mutation is caught. Mutation-acceptance (run by the main
 // session, MEMORY.md policy): in reparkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
 // again (drop mrtrRemainingWindow) → the bounded wait below finds no decline →
-// this test goes RED. (If the machine stalls >80ms between the re-park and the
-// bounded wait, the old sweep may sneak in first — re-run the mutation.)
+// this test goes RED. (Review N1: the mutation-detection tolerance is only a
+// few tens of ms here — a long wall-clock stall could let the old sweep sneak
+// in first and mask the mutation; if the mutation run is green, repeat it.)
 func TestMRTRReparkKeepsOriginalDeadline(t *testing.T) {
 	r, fake := newMRTRTestRegistry(t, "web")
 	r.serverReqTimeout = 200 * time.Millisecond
@@ -1109,19 +1117,20 @@ func TestMRTRReparkKeepsOriginalDeadline(t *testing.T) {
 // TestMRTRSequentialRoundsShareDeadline is p.4's second half (variant A): the
 // shared chain deadline also covers SEQUENTIAL question rounds — a new question
 // after a resume re-parks on the window's remainder, not a fresh full
-// serverReqTimeout. Timeline (serverReqTimeout=300ms): t≈0 q1; t≈50ms the first
-// park (deadline t≈350ms); t≈250ms the retry answers q1 and the upstream asks
-// q2, which parks on the ~remainder (OLD code: a fresh 300ms → sweep t≈600ms);
-// t≈450ms q2 must be declined and a retry for it ErrUnknownRequestState — the
-// OLD code would still find a live park, route the answer and complete the call
-// with a Final.
+// serverReqTimeout. Timeline (serverReqTimeout=600ms — review N2 doubled the
+// margins, the flake tolerance against wall-clock stalls scales with them):
+// t≈0 q1; t≈50ms the first park (deadline t≈650ms); t≈450ms the retry answers
+// q1 and the upstream asks q2, which parks on the ~200ms remainder (OLD code:
+// a fresh 600ms → sweep t≈1050ms); t≈750ms q2 must be declined and a retry for
+// it ErrUnknownRequestState — the OLD code would still find a live park, route
+// the answer and complete the call with a Final.
 //
 // Mutation-acceptance (main session): in parkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
 // again → the bounded decline wait times out (and the late retry would return
 // Final/nil instead of ErrUnknownRequestState) → RED.
 func TestMRTRSequentialRoundsShareDeadline(t *testing.T) {
 	r, fake := newMRTRTestRegistry(t, "web")
-	r.serverReqTimeout = 300 * time.Millisecond
+	r.serverReqTimeout = 600 * time.Millisecond
 
 	fake.onCall = func(ctx context.Context, n int) *mcp.Message {
 		// Sequential questions, as TestMRTRSequentialQuestions.
@@ -1142,7 +1151,7 @@ func TestMRTRSequentialRoundsShareDeadline(t *testing.T) {
 	firstID := onlyKey(t, out.InputRequests)
 
 	// Burn two thirds of the chain's window before answering q1.
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	retry1 := mcp.MRTRRetry{RequestState: out.RequestState,
 		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
@@ -1158,7 +1167,7 @@ func TestMRTRSequentialRoundsShareDeadline(t *testing.T) {
 
 	// Past the ORIGINAL deadline: q2's park (armed with only the remainder)
 	// must have been swept.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	select {
 	case got := <-fake.responses:
