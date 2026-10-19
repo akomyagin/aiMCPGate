@@ -8,8 +8,8 @@ MCP server, while under the hood it **multiplexes** calls across several
 upstream MCP servers, **aggregates** their tools, prompts and resources into
 one catalog, and **logs** every call.
 
-> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–18 shipped, latest
-> release v0.5.0.** Phase 1 — multiplexing stdio upstreams behind a
+> Status: **MVP complete (Stages 0–6) + post-MVP Stages 7–19 shipped, latest
+> release v0.6.0.** Phase 1 — multiplexing stdio upstreams behind a
 > stdio endpoint with a call log; Phase 2 — HTTP/SSE client-facing transport,
 > HTTP upstreams, a CLI log viewer (`mcp-gate logs`); release pipeline
 > (`goreleaser`, cross-compiled for linux/darwin/windows × amd64/arm64, no
@@ -39,7 +39,48 @@ one catalog, and **logs** every call.
 > `-32603`, and a non-text result that bypassed `max_result_bytes` carries a
 > `result._meta` marker (`content` stays byte-for-byte untouched). Finally,
 > `auth_token` referencing an unset environment variable now refuses to start
-> the gateway instead of silently disabling HTTP authentication.
+> the gateway instead of silently disabling HTTP authentication. **v0.6.0**
+> makes the gateway dual-era: both MCP protocol revisions are served on the
+> same endpoints, chosen per request. A client on the 2026-07-28 spec gets the
+> modern stateless surface (`server/discover`, result decorations such as
+> `resultType`/`ttlMs`/`cacheScope`, HTTP `Mcp-Method`/`Mcp-Name`/
+> `MCP-Protocol-Version` header validation, removed methods rejected with
+> `-32601`); a legacy client keeps its v0.5.0 behaviour byte-for-byte. An MRTR
+> bridge lets a modern client answer an upstream's mid-call questions
+> (`elicitation/create`, `sampling/createMessage`, `roots/list`) by retrying
+> the call with `inputResponses` — the input window equals the upstream's
+> `call_timeout` (30 s by default). The release also lands a security batch:
+> opt-in `env_isolation: strict` for stdio upstreams, always-on scrubbing of
+> known secret values to `***` in crash logs and journal records, cleartext-HTTP
+> secret warnings in `serve`/`doctor`, weak file-permission warnings in
+> `doctor`, and a cap of 16 GET SSE streams per HTTP session. The toolchain
+> moved to Go 1.26.7, closing 34 reachable stdlib CVEs that sat in the published
+> v0.5.0 binaries, and release artifacts gained per-archive SBOMs (SPDX JSON)
+> plus cosign keyless signatures.
+>
+> **Upgrading to v0.6.0 — one contract change and two conditional ones:**
+> - **The gateway-busy error code is renumbered `-32029` → `-32009`.** The
+>   rate-limit / concurrency-guard refusal keeps its machine-readable
+>   `data: {"retryable":true,"reason":...}`, but anything that hard-coded the
+>   old numeric code must be updated: `-32029` fell inside the `-32020..-32099`
+>   band the 2026-07-28 spec reserves for protocol errors.
+> - **An HTTP session is now capped at 16 concurrent GET SSE streams.** A 17th
+>   attempt receives HTTP 503 before any response headers; open streams are
+>   never evicted, and closing one frees the slot. Only observable for clients
+>   that leak streams (e.g. reconnecting without closing the old one).
+> - **New opt-in config flag `env_isolation: "strict"`** (global). The default
+>   is unchanged — stdio upstreams still inherit the gateway's full
+>   environment. With `strict`, a child process gets only a minimal
+>   cross-platform base (`PATH`, `HOME`, `TMPDIR` on Unix; `SystemRoot`,
+>   `PATHEXT`, `TEMP`, `TMP`, … on Windows) plus its own `env:` block, so an
+>   upstream that relied on inherited variables must list them explicitly.
+> - Additive, no action needed: known secret values are scrubbed to `***` in
+>   the crash-log stderr tail, the journal `err` field and event details
+>   (always on; values shorter than 8 bytes are not scrubbed); `serve` and
+>   `doctor` warn about secrets travelling over cleartext HTTP; `doctor` warns
+>   when the config or `--env-file` is group- or world-readable. Legacy-era
+>   clients see no other behaviour change — byte-stability is pinned by a
+>   golden test.
 >
 > **Upgrading to v0.5.0 — three behaviour changes, none touch the config file
 > format itself:**
@@ -71,6 +112,10 @@ Cross-platform binaries are built via [`goreleaser`](https://goreleaser.com)
 (`.goreleaser.yaml`): `linux`/`darwin`/`windows` × `amd64`/`arm64`, no CGO,
 the version is baked in via `-ldflags -X main.version=...`, checksums land in
 `SHA256SUMS`. Local dry run: `goreleaser release --snapshot --clean`.
+Since v0.6.0 each archive also ships an SBOM (SPDX 2.3 JSON), and
+`SHA256SUMS` carries a cosign keyless signature (`.sig` + `.pem`); the
+ghcr.io image manifests are signed in the registry itself (no stored key —
+the identity is minted via GitHub Actions OIDC and recorded in Rekor).
 
 ## Install from MCP registry
 
