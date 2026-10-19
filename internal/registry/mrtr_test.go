@@ -702,11 +702,18 @@ func TestMRTRDeliverAfterCallFinished(t *testing.T) {
 	}
 }
 
-// TestMRTRDeliverRootsAfterCallFinished is the same race on the roots path
-// (deliverMRTRRoots starts a single-flight, then trackOpens). A delivery losing
-// the race must unwind the single-flight it just started — clear rootsFetchID,
-// refuse the parked upstream, drop the pending entry — rather than wedge roots
-// for the connection.
+// TestMRTRDeliverRootsAfterCallFinished is the same race on the roots path.
+// NOTE (review N4): since the join-branch isClosed guard (p.2), a waiter that
+// is ALREADY closed is refused by that guard before a single-flight starts —
+// which is what this test now actually exercises (refusal without any foreign
+// flight, the complement of TestMRTRRootsJoinAfterCallFinished). The
+// starter-branch unwind arm (trackOpen false → rootsExpire clears rootsFetchID,
+// refuses parked waiters, drops the pending entry) is reachable only when the
+// waiter closes BETWEEN the isClosed check and trackOpen — a genuine race with
+// no deterministic hook; its behavior is pinned by the identical elicitation-
+// path arm in TestMRTRDeliverAfterCallFinished and the residual gap is a
+// tracked tech-debt line (docs/plans/fix-stage-19-debt.md «Правки по итогам
+// ревью»).
 func TestMRTRDeliverRootsAfterCallFinished(t *testing.T) {
 	r, fake := newMRTRTestRegistry(t, "web")
 
@@ -909,5 +916,274 @@ func TestMRTRReadResourceRoundtrip(t *testing.T) {
 	}
 	if resumeOut.Final == nil || resumeOut.Final.Error != nil {
 		t.Fatalf("resources/read resume returned no clean final: %+v", resumeOut)
+	}
+}
+
+// TestMRTRRootsJoinAfterCallFinished is the p.2 regression (fix/stage-19-debt,
+// review finding 11): the closed-race check in deliverMRTRRoots' JOIN branch.
+// The starter branch was already guarded (trackOpen's closed arm,
+// TestMRTRDeliverRootsAfterCallFinished), but a delivery losing the race while
+// ANOTHER single-flight is in flight took the join path and parked the finished
+// call's upstream into the foreign rootsWaiters — self-healing eventually
+// (rootsDeliver/rootsExpire answer it), yet asymmetric. With the fix the loser
+// is refused in the roots shape (-32601) immediately and the foreign
+// single-flight is left untouched.
+//
+// Mutation-acceptance (run by the main session, MEMORY.md policy): remove the
+// w.isClosed() check in deliverMRTRRoots' join branch → nothing answers the
+// upstream → awaitMRTRResponse below times out → this test goes RED.
+func TestMRTRRootsJoinAfterCallFinished(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+
+	// Drive a call to completion through the real collector, so the waiter ends
+	// up in precisely the post-race state: closed (takeOpen ran) and deregistered.
+	waiter := &mrtrWaiter{
+		clientCaps: declaredCaps(mcp.CapRoots),
+		questions:  make(chan mrtrQuestion, 8),
+		open:       map[string]mrtrOpenQuestion{},
+	}
+	r.registerMRTRWaiter("web", waiter)
+	resultCh := make(chan mrtrCallResult, 1)
+	_, cancel := context.WithCancel(context.Background())
+	resultCh <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(1), json.RawMessage(`{"content":[]}`))}
+	if out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter, resultCh, cancel); err != nil || out.Final == nil {
+		t.Fatalf("collectMRTR = %+v, %v; want the final", out, err)
+	}
+
+	// Seed a FOREIGN in-flight single-flight deterministically (no second call
+	// needed): the late delivery must now take the JOIN branch.
+	r.rootsMu.Lock()
+	r.rootsFetchID = "roots-inflight"
+	r.rootsMu.Unlock()
+
+	before := pendingServerReqCount(r)
+	r.deliverMRTRRoots(waiter, "web", mcp.IntID(77))
+
+	// The upstream is refused in the roots shape (-32601) under its own id.
+	got := awaitMRTRResponse(t, fake, "the refusal for the late join-branch roots question")
+	if string(got.ID) != string(mcp.IntID(77)) {
+		t.Errorf("roots refusal went to id %s, want the upstream's own 77", got.ID)
+	}
+	if got.Error == nil || got.Error.Code != mcp.CodeMethodNotFound {
+		t.Errorf("late roots join = %+v, want a -32601 error", got.Error)
+	}
+	// The join did NOT happen, and the foreign single-flight is untouched —
+	// unlike the starter-branch race, this refusal must not unwind it.
+	r.rootsMu.Lock()
+	fetchID, waiters := r.rootsFetchID, len(r.rootsWaiters)
+	r.rootsMu.Unlock()
+	if waiters != 0 {
+		t.Errorf("the closed waiter joined the foreign single-flight: %d rootsWaiters, want 0", waiters)
+	}
+	if fetchID != "roots-inflight" {
+		t.Errorf("rootsFetchID = %q, want the foreign %q left untouched", fetchID, "roots-inflight")
+	}
+	if after := pendingServerReqCount(r); after != before {
+		t.Errorf("pendingServerReqs changed on the join-branch refusal: %d after, want %d", after, before)
+	}
+	select {
+	case stray := <-waiter.questions:
+		t.Errorf("a roots question was queued to a finished waiter's channel: %+v", stray)
+	default:
+	}
+
+	// Second half (intent documentation): the cache-hit branch is DELIBERATELY
+	// not closed-guarded — a cached answer is valid and safe regardless, so a
+	// fresh closed waiter with a warm cache still gets the cached RESULT, not a
+	// refusal.
+	waiter2 := &mrtrWaiter{
+		clientCaps: declaredCaps(mcp.CapRoots),
+		questions:  make(chan mrtrQuestion, 8),
+		open:       map[string]mrtrOpenQuestion{},
+	}
+	r.registerMRTRWaiter("web", waiter2)
+	resultCh2 := make(chan mrtrCallResult, 1)
+	_, cancel2 := context.WithCancel(context.Background())
+	resultCh2 <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(2), json.RawMessage(`{"content":[]}`))}
+	if out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter2, resultCh2, cancel2); err != nil || out.Final == nil {
+		t.Fatalf("second collectMRTR = %+v, %v; want the final", out, err)
+	}
+	const cached = `{"roots":[]}`
+	r.rootsMu.Lock()
+	r.rootsCache = json.RawMessage(cached)
+	r.rootsMu.Unlock()
+
+	r.deliverMRTRRoots(waiter2, "web", mcp.IntID(88))
+	got2 := awaitMRTRResponse(t, fake, "the cached roots answer for a closed waiter")
+	if got2.Error != nil {
+		t.Errorf("cache hit on a closed waiter was refused: %+v, want the cached RESULT", got2.Error)
+	}
+	if string(got2.Result) != cached {
+		t.Errorf("cache-hit result = %s, want the cached %s", got2.Result, cached)
+	}
+}
+
+// TestMRTRReparkKeepsOriginalDeadline is the p.4 regression (variant A, chosen
+// by the user 2026-10-19): a partial retry's re-park must NOT arm a fresh full
+// serverReqTimeout — the chain's deadline is fixed at the FIRST park and every
+// re-park gets only the remainder. Timeline (serverReqTimeout=200ms): t≈0 the
+// call, two back-to-back questions coalesced; t≈50ms the first park (deadline
+// t≈250ms); t≈170ms a partial retry re-parks the remaining question with ~80ms
+// left (the OLD code armed a full 200ms → deadline t≈370ms); t≈290ms the chain
+// must be dead: q2 declined, the re-park token unknown, no park record, no
+// pending leak.
+//
+// The decline is awaited under a SHORT bound (50ms) on purpose: an unbounded
+// awaitMRTRResponse would simply synchronize past the OLD code's late sweep
+// (t≈370ms) and every later assert would pass there too — the bound expires
+// before it, so the mutation is caught. Mutation-acceptance (run by the main
+// session, MEMORY.md policy): in reparkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
+// again (drop mrtrRemainingWindow) → the bounded wait below finds no decline →
+// this test goes RED. (Review N1: the mutation-detection tolerance is only a
+// few tens of ms here — a long wall-clock stall could let the old sweep sneak
+// in first and mask the mutation; if the mutation run is green, repeat it.)
+func TestMRTRReparkKeepsOriginalDeadline(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	r.serverReqTimeout = 200 * time.Millisecond
+
+	fake.onCall = func(ctx context.Context, n int) *mcp.Message {
+		// Both questions back-to-back so the collect window coalesces them
+		// (as TestMRTRPartialResponses).
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{"message":"q1"}`))
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(2), json.RawMessage(`{"message":"q2"}`))
+		<-fake.responses // the partial retry's answer to the first question
+		// Do NOT consume again: the deadline's decline for the second question
+		// goes to fake.responses and the test asserts on it. Block until the
+		// sweep cancels the detached call, as TestMRTRParkTimeout does.
+		<-ctx.Done()
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[]}`))
+	}
+
+	before := pendingServerReqCount(r)
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.CallToolModern(context.Background(), "web__tool", nil, nil, caps)
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	if len(out.InputRequests) != 2 {
+		t.Fatalf("coalesced batch surfaced %d input requests, want 2", len(out.InputRequests))
+	}
+
+	// Burn most of the chain's window before the partial retry.
+	time.Sleep(120 * time.Millisecond)
+
+	var firstID string
+	for id := range out.InputRequests {
+		firstID = id
+		break
+	}
+	retry := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps)
+	if err != nil {
+		t.Fatalf("partial ResumeToolModern: %v", err)
+	}
+	if out2.Final != nil || len(out2.InputRequests) != 1 {
+		t.Fatalf("partial retry want the remaining input_required, got %+v", out2)
+	}
+	secondToken := out2.RequestState
+	secondID := onlyKey(t, out2.InputRequests)
+
+	// Past the ORIGINAL chain deadline (first park + 200ms) the re-park must be
+	// swept even though it is itself younger than that.
+	time.Sleep(120 * time.Millisecond)
+
+	select {
+	case got := <-fake.responses:
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("the still-open question after the chain deadline = %+v / %s, want the decline RESULT", got.Error, got.Result)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("the re-park outlived the original chain deadline: no decline within the bound")
+	}
+
+	// A late retry with the re-park's token finds nothing.
+	late := mcp.MRTRRetry{RequestState: secondToken,
+		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, late, caps); !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("late retry after the chain deadline = %v, want ErrUnknownRequestState", err)
+	}
+	if after := pendingServerReqCount(r); after != before {
+		t.Errorf("pendingServerReqs leaked: %d after the chain sweep, want %d", after, before)
+	}
+	r.serverReqMu.Lock()
+	parked := len(r.mrtrParked)
+	r.serverReqMu.Unlock()
+	if parked != 0 {
+		t.Errorf("%d park records survived the chain deadline, want 0", parked)
+	}
+}
+
+// TestMRTRSequentialRoundsShareDeadline is p.4's second half (variant A): the
+// shared chain deadline also covers SEQUENTIAL question rounds — a new question
+// after a resume re-parks on the window's remainder, not a fresh full
+// serverReqTimeout. Timeline (serverReqTimeout=600ms — review N2 doubled the
+// margins, the flake tolerance against wall-clock stalls scales with them):
+// t≈0 q1; t≈50ms the first park (deadline t≈650ms); t≈450ms the retry answers
+// q1 and the upstream asks q2, which parks on the ~200ms remainder (OLD code:
+// a fresh 600ms → sweep t≈1050ms); t≈750ms q2 must be declined and a retry for
+// it ErrUnknownRequestState — the OLD code would still find a live park, route
+// the answer and complete the call with a Final.
+//
+// Mutation-acceptance (main session): in parkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
+// again → the bounded decline wait times out (and the late retry would return
+// Final/nil instead of ErrUnknownRequestState) → RED.
+func TestMRTRSequentialRoundsShareDeadline(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	r.serverReqTimeout = 600 * time.Millisecond
+
+	fake.onCall = func(ctx context.Context, n int) *mcp.Message {
+		// Sequential questions, as TestMRTRSequentialQuestions.
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{"message":"q1"}`))
+		<-fake.responses // answer to q1
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(2), json.RawMessage(`{"message":"q2"}`))
+		// Do NOT consume q2's response: its deadline decline must stay in
+		// fake.responses for the test. Block until the sweep cancels the call.
+		<-ctx.Done()
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[]}`))
+	}
+
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.CallToolModern(context.Background(), "web__tool", nil, nil, caps)
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	firstID := onlyKey(t, out.InputRequests)
+
+	// Burn two thirds of the chain's window before answering q1.
+	time.Sleep(400 * time.Millisecond)
+
+	retry1 := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry1, caps)
+	if err != nil {
+		t.Fatalf("ResumeToolModern(q1): %v", err)
+	}
+	if out2.Final != nil || len(out2.InputRequests) != 1 {
+		t.Fatalf("after answering q1 want q2's input_required, got %+v", out2)
+	}
+	secondToken := out2.RequestState
+	secondID := onlyKey(t, out2.InputRequests)
+
+	// Past the ORIGINAL deadline: q2's park (armed with only the remainder)
+	// must have been swept.
+	time.Sleep(300 * time.Millisecond)
+
+	select {
+	case got := <-fake.responses:
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("q2 after the chain deadline = %+v / %s, want the decline RESULT", got.Error, got.Result)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("the second round's park outlived the original chain deadline: no decline within the bound")
+	}
+
+	// The late retry finds no park. (Under the mutation it would instead route
+	// the answer and return the Final — the plan's discriminator.)
+	retry2 := mcp.MRTRRetry{RequestState: secondToken,
+		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
+	out3, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry2, caps)
+	if !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("retry after the chain deadline = %+v / %v, want ErrUnknownRequestState", out3, err)
 	}
 }

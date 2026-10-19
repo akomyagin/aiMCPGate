@@ -114,15 +114,25 @@ type mrtrWaiter struct {
 	// collector drains it.
 	questions chan mrtrQuestion
 
+	// parkDeadline is the ABSOLUTE deadline of this call's whole park chain:
+	// set once, at the first park (parkMRTR), and every later park of the same
+	// call — a partial retry's re-park or a new question round — arms its sweep
+	// timer with only the remainder (mrtrRemainingWindow), so neither retry path
+	// can extend the chain's life past one serverReqTimeout. Written and read
+	// ONLY under serverReqMu (both writers, parkMRTR/reparkMRTR, already hold
+	// it, and a waiter has a single active collector at a time) — deliberately
+	// NOT under mu below.
+	parkDeadline time.Time
+
 	// mu guards open and closed. open holds the gateway ids of questions HANDED
-	// OUT to the client and not yet answered or refused. The park's deadline is
-	// the SOLE deadline for these — a question intercepted for a modern call has
-	// NO per-question timer (unlike the legacy generic park), because a modern
-	// question's lifetime is the parked call's, arbitrated by the sweep/resume of
-	// that one park. On sweep or abandonment the still-open ones are refused; a
-	// resume removes the answered ones. mintServerReqID/RouteUpstreamResponse are
-	// still the id machinery, so RefusePendingServerReq stays the per-question
-	// arbiter.
+	// OUT to the client and not yet answered or refused. The park chain's
+	// deadline (parkDeadline, fixed at the FIRST park) is the SOLE deadline for
+	// these — a question intercepted for a modern call has NO per-question timer
+	// (unlike the legacy generic park), because a modern question's lifetime is
+	// the parked call's, arbitrated by the sweep/resume of that one park. On
+	// sweep or abandonment the still-open ones are refused; a resume removes the
+	// answered ones. mintServerReqID/RouteUpstreamResponse are still the id
+	// machinery, so RefusePendingServerReq stays the per-question arbiter.
 	mu sync.Mutex
 	// closed is set (under mu, by takeOpen) exactly once the waiter is done for
 	// good — the call finished (collectMRTR's resultCh branch) or its park was
@@ -171,7 +181,9 @@ type mrtrParkedCall struct {
 	// response on. Shared across resume rounds — the same CallTool runs until it
 	// returns.
 	result <-chan mrtrCallResult
-	// timer sweeps the park if the client never retries (defaultServerReqTimeout).
+	// timer sweeps the park at the chain's deadline if the client never retries
+	// — armed with the REMAINING window (mrtrRemainingWindow), never a fresh
+	// full serverReqTimeout, so re-parks cannot extend the chain's life.
 	timer *time.Timer
 	// cancel tears down the detached CallTool's context on a swept park.
 	cancel context.CancelFunc
@@ -326,7 +338,7 @@ func (r *Registry) ResumeToolModern(ctx context.Context, name, method string,
 	// on those very answers). The spec SHOULD-re-asks; this is that (plan §6.1).
 	if remaining := parked.waiter.stillOpen(); len(remaining) > 0 {
 		return r.reparkMRTR(parked.upstream, parked.method, parked.identity,
-			parked.waiter, parked.result, parked.cancel, remaining), nil
+			parked.waiter, parked.result, parked.cancel, remaining)
 	}
 
 	// Wait for the upstream's next move — final response, or another question.
@@ -351,12 +363,31 @@ func (r *Registry) mrtrParkMatches(token, method, identity string) bool {
 	return ok && parked.method == method && parked.identity == identity
 }
 
+// mrtrRemainingWindow returns how long the park chain may still live: the
+// deadline is set ONCE, at the first park, and every re-park of the same call
+// (partial retry or a new question round) gets only the remainder. <=0 means
+// the chain's window is exhausted. Called under serverReqMu — parkDeadline's
+// sole lock (see the field's godoc).
+func (r *Registry) mrtrRemainingWindow(w *mrtrWaiter) time.Duration {
+	if w.parkDeadline.IsZero() {
+		w.parkDeadline = time.Now().Add(r.serverReqTimeout)
+	}
+	return time.Until(w.parkDeadline)
+}
+
 // reparkMRTR re-parks a call whose client answered only some of its open
 // questions, re-surfacing the rest under a fresh token. The questions are
 // already tracked and already have pending entries (they never left); only the
 // park record and token are new.
+//
+// The re-park does NOT get a fresh deadline: the chain's window was fixed at
+// the first park (mrtrRemainingWindow) and only its remainder is armed, so a
+// client cannot extend the call's life by retrying. If the window is already
+// exhausted the park is not inserted at all, the call is torn down
+// (teardownMRTRWindow) and ErrUnknownRequestState is returned — the transport
+// maps it to -32602 "unknown or expired", semantically exact.
 func (r *Registry) reparkMRTR(upstream, method, identity string, waiter *mrtrWaiter,
-	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, remaining []mrtrOpenQuestion) MRTROutcome {
+	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, remaining []mrtrOpenQuestion) (MRTROutcome, error) {
 	token := newMRTRState()
 	inputRequests := make(map[string]json.RawMessage, len(remaining))
 	for _, q := range remaining {
@@ -365,12 +396,19 @@ func (r *Registry) reparkMRTR(upstream, method, identity string, waiter *mrtrWai
 	parked := &mrtrParkedCall{upstream: upstream, method: method, identity: identity,
 		waiter: waiter, result: resultCh, cancel: cancel}
 	// Insert FIRST, arm the sweep timer SECOND — both under serverReqMu (see
-	// parkMRTR for why the ordering and the lock matter).
+	// parkMRTR for why the ordering and the lock matter). The window check runs
+	// BEFORE the insert so an exhausted chain needs no rollback.
 	r.serverReqMu.Lock()
+	window := r.mrtrRemainingWindow(waiter)
+	if window <= 0 {
+		r.serverReqMu.Unlock()
+		r.teardownMRTRWindow(upstream, waiter, cancel)
+		return MRTROutcome{}, ErrUnknownRequestState
+	}
 	r.mrtrParked[token] = parked
-	parked.timer = time.AfterFunc(r.serverReqTimeout, func() { r.sweepMRTRParked(token) })
+	parked.timer = time.AfterFunc(window, func() { r.sweepMRTRParked(token) })
 	r.serverReqMu.Unlock()
-	return MRTROutcome{InputRequests: inputRequests, RequestState: token}
+	return MRTROutcome{InputRequests: inputRequests, RequestState: token}, nil
 }
 
 // collectMRTR is the shared wait loop of CallToolModern and ResumeToolModern:
@@ -417,7 +455,7 @@ func (r *Registry) collectMRTR(upstream, method, identity string, waiter *mrtrWa
 			// the client its InputRequiredResult. The waiter stays registered so
 			// a further question on this upstream (after the client answers these)
 			// is still intercepted for the SAME call.
-			return r.parkMRTR(upstream, method, identity, waiter, resultCh, cancel, questions), nil
+			return r.parkMRTR(upstream, method, identity, waiter, resultCh, cancel, questions)
 		}
 	}
 }
@@ -425,8 +463,14 @@ func (r *Registry) collectMRTR(upstream, method, identity string, waiter *mrtrWa
 // parkMRTR suspends the call under a fresh opaque token, arms its sweep
 // deadline, and returns the questions to the client. Called under no lock;
 // takes serverReqMu to record the park.
+//
+// The FIRST park of a call fixes the chain's absolute deadline; a later park
+// of the same call (a new question round after a resume) arms only the window's
+// remainder (mrtrRemainingWindow). An exhausted window means the client kept
+// the chain alive past its one serverReqTimeout: the park is not inserted, the
+// call is torn down (teardownMRTRWindow) and ErrUnknownRequestState is returned.
 func (r *Registry) parkMRTR(upstream, method, identity string, waiter *mrtrWaiter,
-	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, questions []mrtrQuestion) MRTROutcome {
+	resultCh <-chan mrtrCallResult, cancel context.CancelFunc, questions []mrtrQuestion) (MRTROutcome, error) {
 	token := newMRTRState()
 	inputRequests := make(map[string]json.RawMessage, len(questions))
 	for _, q := range questions {
@@ -441,15 +485,22 @@ func (r *Registry) parkMRTR(upstream, method, identity string, waiter *mrtrWaite
 	// park nobody ever sweeps. The callback itself takes serverReqMu, so it
 	// cannot run past this critical section either way, and takeMRTRParked reads
 	// parked.timer outside the lock — hence the assignment under it (a write
-	// after Unlock would be a data race).
+	// after Unlock would be a data race). The window check runs BEFORE the
+	// insert so an exhausted chain needs no rollback.
 	r.serverReqMu.Lock()
+	window := r.mrtrRemainingWindow(waiter)
+	if window <= 0 {
+		r.serverReqMu.Unlock()
+		r.teardownMRTRWindow(upstream, waiter, cancel)
+		return MRTROutcome{}, ErrUnknownRequestState
+	}
 	r.mrtrParked[token] = parked
-	parked.timer = time.AfterFunc(r.serverReqTimeout, func() {
+	parked.timer = time.AfterFunc(window, func() {
 		r.sweepMRTRParked(token)
 	})
 	r.serverReqMu.Unlock()
 
-	return MRTROutcome{InputRequests: inputRequests, RequestState: token}
+	return MRTROutcome{InputRequests: inputRequests, RequestState: token}, nil
 }
 
 // takeMRTRParked removes a parked call atomically and stops its sweep timer.
@@ -489,6 +540,20 @@ func (r *Registry) sweepMRTRParked(token string) {
 	r.deregisterMRTRWaiter(parked.upstream, parked.waiter)
 	refuseOpenMRTR(parked.waiter, "the modern client did not answer within "+r.serverReqTimeout.String())
 	parked.cancel()
+}
+
+// teardownMRTRWindow ends a call whose park chain ran out of window at a park
+// attempt (parkMRTR/reparkMRTR found no remaining time, so no park record was
+// inserted — or the resume had already taken it). A mirror of sweepMRTRParked
+// without the take: stop intercepting, refuse every still-open question in its
+// spec shape (RefusePendingServerReq arbitrates), and cancel the detached call.
+// Invoked OUTSIDE serverReqMu (deregister/refuse take registry locks, exactly
+// as the sweep does after its take).
+func (r *Registry) teardownMRTRWindow(upstream string, waiter *mrtrWaiter, cancel context.CancelFunc) {
+	r.log.Debug("MRTR park chain window exhausted before a re-park", "upstream", upstream)
+	r.deregisterMRTRWaiter(upstream, waiter)
+	refuseOpenMRTR(waiter, "the MRTR window expired before the client finished answering")
+	cancel()
 }
 
 // refuseOpenMRTR refuses every still-open question of a waiter — used by the
@@ -673,6 +738,20 @@ func (w *mrtrWaiter) takeOpen() []mrtrOpenQuestion {
 	return out
 }
 
+// isClosed reports whether the waiter is done for good (takeOpen ran).
+//
+// Lock-ordering note (invariant §12/§16): the only caller nesting is
+// rootsMu ⊃ w.mu (deliverMRTRRoots' join-branch check). The reverse edge does
+// not exist and must not be introduced: every w.mu holder
+// (trackOpen/forgetOpen/stillOpen/takeOpen/isClosed) takes NO registry lock —
+// refuse callbacks are always invoked outside w.mu — so w.mu stays the
+// innermost lock.
+func (w *mrtrWaiter) isClosed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
+}
+
 // handleMRTRIfWaiting is the interception hook onUpstreamRequest calls before
 // the legacy conveyor. It reports whether a modern call in flight on this
 // upstream CLAIMED the question — true means the legacy path must not run.
@@ -746,6 +825,25 @@ func (r *Registry) deliverMRTRRoots(w *mrtrWaiter, upstream string, originalID j
 		cached := r.rootsCache
 		r.rootsMu.Unlock()
 		r.writeUpstreamResponse(upstream, mcp.NewResult(originalID, cached))
+		return
+	}
+	// Closed-race check for the JOIN branch, mirroring the starter branch's
+	// trackOpen arm below: a waiter whose call already finished (takeOpen ran)
+	// must NOT park its upstream into somebody else's live single-flight — that
+	// upstream would sit in rootsWaiters until the other fetch's
+	// rootsDeliver/rootsExpire happens to answer it. Refuse in exactly the
+	// roots shape (rootsExpire's -32601) but WITHOUT unwinding the shared
+	// single-flight: rootsFetchID/rootsWaiters/the pending entry all belong to
+	// the live starter and are left untouched. The cache-hit branch above is
+	// deliberately NOT guarded: a cached answer is valid and safe regardless of
+	// closed (TestMRTRRootsJoinAfterCallFinished pins both halves). Lock order:
+	// rootsMu ⊃ w.mu, see isClosed.
+	if w.isClosed() {
+		r.rootsMu.Unlock()
+		go refuseMethodNotFound(r, upstream, originalID,
+			"the modern call finished before its roots/list question joined the single-flight")
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, mcp.MethodRootsList,
+			"the modern call finished before its roots/list question joined the single-flight; the upstream was refused on the modern client's behalf", 1)
 		return
 	}
 	r.rootsWaiters = append(r.rootsWaiters, rootsWaiter{upstream: upstream, originalID: originalID})
