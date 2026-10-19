@@ -1010,3 +1010,171 @@ func TestMRTRRootsJoinAfterCallFinished(t *testing.T) {
 		t.Errorf("cache-hit result = %s, want the cached %s", got2.Result, cached)
 	}
 }
+
+// TestMRTRReparkKeepsOriginalDeadline is the p.4 regression (variant A, chosen
+// by the user 2026-10-19): a partial retry's re-park must NOT arm a fresh full
+// serverReqTimeout — the chain's deadline is fixed at the FIRST park and every
+// re-park gets only the remainder. Timeline (serverReqTimeout=200ms): t≈0 the
+// call, two back-to-back questions coalesced; t≈50ms the first park (deadline
+// t≈250ms); t≈170ms a partial retry re-parks the remaining question with ~80ms
+// left (the OLD code armed a full 200ms → deadline t≈370ms); t≈290ms the chain
+// must be dead: q2 declined, the re-park token unknown, no park record, no
+// pending leak.
+//
+// The decline is awaited under a SHORT bound (50ms) on purpose: an unbounded
+// awaitMRTRResponse would simply synchronize past the OLD code's late sweep
+// (t≈370ms) and every later assert would pass there too — the bound expires
+// before it, so the mutation is caught. Mutation-acceptance (run by the main
+// session, MEMORY.md policy): in reparkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
+// again (drop mrtrRemainingWindow) → the bounded wait below finds no decline →
+// this test goes RED. (If the machine stalls >80ms between the re-park and the
+// bounded wait, the old sweep may sneak in first — re-run the mutation.)
+func TestMRTRReparkKeepsOriginalDeadline(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	r.serverReqTimeout = 200 * time.Millisecond
+
+	fake.onCall = func(ctx context.Context, n int) *mcp.Message {
+		// Both questions back-to-back so the collect window coalesces them
+		// (as TestMRTRPartialResponses).
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{"message":"q1"}`))
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(2), json.RawMessage(`{"message":"q2"}`))
+		<-fake.responses // the partial retry's answer to the first question
+		// Do NOT consume again: the deadline's decline for the second question
+		// goes to fake.responses and the test asserts on it. Block until the
+		// sweep cancels the detached call, as TestMRTRParkTimeout does.
+		<-ctx.Done()
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[]}`))
+	}
+
+	before := pendingServerReqCount(r)
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.CallToolModern(context.Background(), "web__tool", nil, nil, caps)
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	if len(out.InputRequests) != 2 {
+		t.Fatalf("coalesced batch surfaced %d input requests, want 2", len(out.InputRequests))
+	}
+
+	// Burn most of the chain's window before the partial retry.
+	time.Sleep(120 * time.Millisecond)
+
+	var firstID string
+	for id := range out.InputRequests {
+		firstID = id
+		break
+	}
+	retry := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry, caps)
+	if err != nil {
+		t.Fatalf("partial ResumeToolModern: %v", err)
+	}
+	if out2.Final != nil || len(out2.InputRequests) != 1 {
+		t.Fatalf("partial retry want the remaining input_required, got %+v", out2)
+	}
+	secondToken := out2.RequestState
+	secondID := onlyKey(t, out2.InputRequests)
+
+	// Past the ORIGINAL chain deadline (first park + 200ms) the re-park must be
+	// swept even though it is itself younger than that.
+	time.Sleep(120 * time.Millisecond)
+
+	select {
+	case got := <-fake.responses:
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("the still-open question after the chain deadline = %+v / %s, want the decline RESULT", got.Error, got.Result)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("the re-park outlived the original chain deadline: no decline within the bound")
+	}
+
+	// A late retry with the re-park's token finds nothing.
+	late := mcp.MRTRRetry{RequestState: secondToken,
+		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
+	if _, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, late, caps); !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("late retry after the chain deadline = %v, want ErrUnknownRequestState", err)
+	}
+	if after := pendingServerReqCount(r); after != before {
+		t.Errorf("pendingServerReqs leaked: %d after the chain sweep, want %d", after, before)
+	}
+	r.serverReqMu.Lock()
+	parked := len(r.mrtrParked)
+	r.serverReqMu.Unlock()
+	if parked != 0 {
+		t.Errorf("%d park records survived the chain deadline, want 0", parked)
+	}
+}
+
+// TestMRTRSequentialRoundsShareDeadline is p.4's second half (variant A): the
+// shared chain deadline also covers SEQUENTIAL question rounds — a new question
+// after a resume re-parks on the window's remainder, not a fresh full
+// serverReqTimeout. Timeline (serverReqTimeout=300ms): t≈0 q1; t≈50ms the first
+// park (deadline t≈350ms); t≈250ms the retry answers q1 and the upstream asks
+// q2, which parks on the ~remainder (OLD code: a fresh 300ms → sweep t≈600ms);
+// t≈450ms q2 must be declined and a retry for it ErrUnknownRequestState — the
+// OLD code would still find a live park, route the answer and complete the call
+// with a Final.
+//
+// Mutation-acceptance (main session): in parkMRTR arm time.AfterFunc(r.serverReqTimeout, …)
+// again → the bounded decline wait times out (and the late retry would return
+// Final/nil instead of ErrUnknownRequestState) → RED.
+func TestMRTRSequentialRoundsShareDeadline(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+	r.serverReqTimeout = 300 * time.Millisecond
+
+	fake.onCall = func(ctx context.Context, n int) *mcp.Message {
+		// Sequential questions, as TestMRTRSequentialQuestions.
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(1), json.RawMessage(`{"message":"q1"}`))
+		<-fake.responses // answer to q1
+		r.onUpstreamRequest("web", mcp.MethodElicitationCreate, mcp.IntID(2), json.RawMessage(`{"message":"q2"}`))
+		// Do NOT consume q2's response: its deadline decline must stay in
+		// fake.responses for the test. Block until the sweep cancels the call.
+		<-ctx.Done()
+		return mcp.NewResult(mcp.IntID(int64(n)), json.RawMessage(`{"content":[]}`))
+	}
+
+	caps := declaredCaps(mcp.CapElicitation)
+	out, err := r.CallToolModern(context.Background(), "web__tool", nil, nil, caps)
+	if err != nil {
+		t.Fatalf("CallToolModern: %v", err)
+	}
+	firstID := onlyKey(t, out.InputRequests)
+
+	// Burn two thirds of the chain's window before answering q1.
+	time.Sleep(200 * time.Millisecond)
+
+	retry1 := mcp.MRTRRetry{RequestState: out.RequestState,
+		InputResponses: map[string]json.RawMessage{firstID: json.RawMessage(`{"action":"accept"}`)}}
+	out2, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry1, caps)
+	if err != nil {
+		t.Fatalf("ResumeToolModern(q1): %v", err)
+	}
+	if out2.Final != nil || len(out2.InputRequests) != 1 {
+		t.Fatalf("after answering q1 want q2's input_required, got %+v", out2)
+	}
+	secondToken := out2.RequestState
+	secondID := onlyKey(t, out2.InputRequests)
+
+	// Past the ORIGINAL deadline: q2's park (armed with only the remainder)
+	// must have been swept.
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case got := <-fake.responses:
+		if string(got.Result) != `{"action":"decline"}` {
+			t.Errorf("q2 after the chain deadline = %+v / %s, want the decline RESULT", got.Error, got.Result)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("the second round's park outlived the original chain deadline: no decline within the bound")
+	}
+
+	// The late retry finds no park. (Under the mutation it would instead route
+	// the answer and return the Final — the plan's discriminator.)
+	retry2 := mcp.MRTRRetry{RequestState: secondToken,
+		InputResponses: map[string]json.RawMessage{secondID: json.RawMessage(`{"action":"accept"}`)}}
+	out3, err := r.ResumeToolModern(context.Background(), "web__tool", mcp.MethodToolsCall, retry2, caps)
+	if !errors.Is(err, ErrUnknownRequestState) {
+		t.Errorf("retry after the chain deadline = %+v / %v, want ErrUnknownRequestState", out3, err)
+	}
+}
