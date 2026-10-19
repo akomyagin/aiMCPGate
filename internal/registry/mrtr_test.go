@@ -911,3 +911,102 @@ func TestMRTRReadResourceRoundtrip(t *testing.T) {
 		t.Fatalf("resources/read resume returned no clean final: %+v", resumeOut)
 	}
 }
+
+// TestMRTRRootsJoinAfterCallFinished is the p.2 regression (fix/stage-19-debt,
+// review finding 11): the closed-race check in deliverMRTRRoots' JOIN branch.
+// The starter branch was already guarded (trackOpen's closed arm,
+// TestMRTRDeliverRootsAfterCallFinished), but a delivery losing the race while
+// ANOTHER single-flight is in flight took the join path and parked the finished
+// call's upstream into the foreign rootsWaiters — self-healing eventually
+// (rootsDeliver/rootsExpire answer it), yet asymmetric. With the fix the loser
+// is refused in the roots shape (-32601) immediately and the foreign
+// single-flight is left untouched.
+//
+// Mutation-acceptance (run by the main session, MEMORY.md policy): remove the
+// w.isClosed() check in deliverMRTRRoots' join branch → nothing answers the
+// upstream → awaitMRTRResponse below times out → this test goes RED.
+func TestMRTRRootsJoinAfterCallFinished(t *testing.T) {
+	r, fake := newMRTRTestRegistry(t, "web")
+
+	// Drive a call to completion through the real collector, so the waiter ends
+	// up in precisely the post-race state: closed (takeOpen ran) and deregistered.
+	waiter := &mrtrWaiter{
+		clientCaps: declaredCaps(mcp.CapRoots),
+		questions:  make(chan mrtrQuestion, 8),
+		open:       map[string]mrtrOpenQuestion{},
+	}
+	r.registerMRTRWaiter("web", waiter)
+	resultCh := make(chan mrtrCallResult, 1)
+	_, cancel := context.WithCancel(context.Background())
+	resultCh <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(1), json.RawMessage(`{"content":[]}`))}
+	if out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter, resultCh, cancel); err != nil || out.Final == nil {
+		t.Fatalf("collectMRTR = %+v, %v; want the final", out, err)
+	}
+
+	// Seed a FOREIGN in-flight single-flight deterministically (no second call
+	// needed): the late delivery must now take the JOIN branch.
+	r.rootsMu.Lock()
+	r.rootsFetchID = "roots-inflight"
+	r.rootsMu.Unlock()
+
+	before := pendingServerReqCount(r)
+	r.deliverMRTRRoots(waiter, "web", mcp.IntID(77))
+
+	// The upstream is refused in the roots shape (-32601) under its own id.
+	got := awaitMRTRResponse(t, fake, "the refusal for the late join-branch roots question")
+	if string(got.ID) != string(mcp.IntID(77)) {
+		t.Errorf("roots refusal went to id %s, want the upstream's own 77", got.ID)
+	}
+	if got.Error == nil || got.Error.Code != mcp.CodeMethodNotFound {
+		t.Errorf("late roots join = %+v, want a -32601 error", got.Error)
+	}
+	// The join did NOT happen, and the foreign single-flight is untouched —
+	// unlike the starter-branch race, this refusal must not unwind it.
+	r.rootsMu.Lock()
+	fetchID, waiters := r.rootsFetchID, len(r.rootsWaiters)
+	r.rootsMu.Unlock()
+	if waiters != 0 {
+		t.Errorf("the closed waiter joined the foreign single-flight: %d rootsWaiters, want 0", waiters)
+	}
+	if fetchID != "roots-inflight" {
+		t.Errorf("rootsFetchID = %q, want the foreign %q left untouched", fetchID, "roots-inflight")
+	}
+	if after := pendingServerReqCount(r); after != before {
+		t.Errorf("pendingServerReqs changed on the join-branch refusal: %d after, want %d", after, before)
+	}
+	select {
+	case stray := <-waiter.questions:
+		t.Errorf("a roots question was queued to a finished waiter's channel: %+v", stray)
+	default:
+	}
+
+	// Second half (intent documentation): the cache-hit branch is DELIBERATELY
+	// not closed-guarded — a cached answer is valid and safe regardless, so a
+	// fresh closed waiter with a warm cache still gets the cached RESULT, not a
+	// refusal.
+	waiter2 := &mrtrWaiter{
+		clientCaps: declaredCaps(mcp.CapRoots),
+		questions:  make(chan mrtrQuestion, 8),
+		open:       map[string]mrtrOpenQuestion{},
+	}
+	r.registerMRTRWaiter("web", waiter2)
+	resultCh2 := make(chan mrtrCallResult, 1)
+	_, cancel2 := context.WithCancel(context.Background())
+	resultCh2 <- mrtrCallResult{resp: mcp.NewResult(mcp.IntID(2), json.RawMessage(`{"content":[]}`))}
+	if out, err := r.collectMRTR("web", mcp.MethodToolsCall, "web__tool", waiter2, resultCh2, cancel2); err != nil || out.Final == nil {
+		t.Fatalf("second collectMRTR = %+v, %v; want the final", out, err)
+	}
+	const cached = `{"roots":[]}`
+	r.rootsMu.Lock()
+	r.rootsCache = json.RawMessage(cached)
+	r.rootsMu.Unlock()
+
+	r.deliverMRTRRoots(waiter2, "web", mcp.IntID(88))
+	got2 := awaitMRTRResponse(t, fake, "the cached roots answer for a closed waiter")
+	if got2.Error != nil {
+		t.Errorf("cache hit on a closed waiter was refused: %+v, want the cached RESULT", got2.Error)
+	}
+	if string(got2.Result) != cached {
+		t.Errorf("cache-hit result = %s, want the cached %s", got2.Result, cached)
+	}
+}

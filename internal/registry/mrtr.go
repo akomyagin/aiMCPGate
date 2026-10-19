@@ -673,6 +673,20 @@ func (w *mrtrWaiter) takeOpen() []mrtrOpenQuestion {
 	return out
 }
 
+// isClosed reports whether the waiter is done for good (takeOpen ran).
+//
+// Lock-ordering note (invariant §12/§16): the only caller nesting is
+// rootsMu ⊃ w.mu (deliverMRTRRoots' join-branch check). The reverse edge does
+// not exist and must not be introduced: every w.mu holder
+// (trackOpen/forgetOpen/stillOpen/takeOpen/isClosed) takes NO registry lock —
+// refuse callbacks are always invoked outside w.mu — so w.mu stays the
+// innermost lock.
+func (w *mrtrWaiter) isClosed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
+}
+
 // handleMRTRIfWaiting is the interception hook onUpstreamRequest calls before
 // the legacy conveyor. It reports whether a modern call in flight on this
 // upstream CLAIMED the question — true means the legacy path must not run.
@@ -746,6 +760,25 @@ func (r *Registry) deliverMRTRRoots(w *mrtrWaiter, upstream string, originalID j
 		cached := r.rootsCache
 		r.rootsMu.Unlock()
 		r.writeUpstreamResponse(upstream, mcp.NewResult(originalID, cached))
+		return
+	}
+	// Closed-race check for the JOIN branch, mirroring the starter branch's
+	// trackOpen arm below: a waiter whose call already finished (takeOpen ran)
+	// must NOT park its upstream into somebody else's live single-flight — that
+	// upstream would sit in rootsWaiters until the other fetch's
+	// rootsDeliver/rootsExpire happens to answer it. Refuse in exactly the
+	// roots shape (rootsExpire's -32601) but WITHOUT unwinding the shared
+	// single-flight: rootsFetchID/rootsWaiters/the pending entry all belong to
+	// the live starter and are left untouched. The cache-hit branch above is
+	// deliberately NOT guarded: a cached answer is valid and safe regardless of
+	// closed (TestMRTRRootsJoinAfterCallFinished pins both halves). Lock order:
+	// rootsMu ⊃ w.mu, see isClosed.
+	if w.isClosed() {
+		r.rootsMu.Unlock()
+		go refuseMethodNotFound(r, upstream, originalID,
+			"the modern call finished before its roots/list question joined the single-flight")
+		r.noteThrottled(logging.EventServerRequestDropped, upstream, mcp.MethodRootsList,
+			"the modern call finished before its roots/list question joined the single-flight; the upstream was refused on the modern client's behalf", 1)
 		return
 	}
 	r.rootsWaiters = append(r.rootsWaiters, rootsWaiter{upstream: upstream, originalID: originalID})
